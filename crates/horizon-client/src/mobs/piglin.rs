@@ -237,8 +237,12 @@ fn hoglin_repellent(m: &mut Mob, w: &MobWorld) {
     if m.age.wrapping_add(m.id).is_multiple_of(20) {
         m.extra.repellent = find_hoglin_repellent(m, w);
     }
-    if m.extra.ints[0] <= 0 && m.extra.repellent.is_some() {
-        m.extra.ints[0] = 200;
+    if m.extra.repellent.is_some() {
+        // `BecomePassiveIfMemoryPresent` runs every brain tick while not
+        // pacified, so a target set by retaliation is erased the next tick too.
+        if m.extra.ints[0] <= 0 {
+            m.extra.ints[0] = 200;
+        }
         m.ai.target = None;
     }
 }
