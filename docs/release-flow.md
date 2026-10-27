@@ -415,7 +415,17 @@ launcher and the website read: both then look the newest launcher tags up one by
 reviewed fixes before they are released (#2681). It builds the newest `union/<agent>-<name>` branch on origin (main
 plus the pull requests the contribution gate proved together in one wave) when that union is newer than main's head
 and holds something main lacks, otherwise main (`tools/ci/nightly.py pick`). A night with nothing new publishes
-nothing. Only proven unions are pushed to origin, so nothing unreviewed ships.
+nothing. Only proven unions and the trusted reviewers' builds (below) are pushed to origin.
+
+- **Trusted reviewers.** The logins in `.github/nightly-reviewers` (the maintainers edit it) can start a nightly
+  without a maintainer, with a comment on any issue or pull request (`tools/ci/nightly.py compose`):
+  `/nightly 2640 2642` builds main plus those open pull requests, merged in order; `/nightly user:branch 2640` starts
+  from that reviewer's branch in their fork instead (where they fix conflicts between pull requests); `/nightly`
+  alone builds tonight's pick now. A pull request that conflicts is left out. The result is pushed as
+  `union/reviewers`, so the night's pick sees it too, and goes through the same build, signature, smoke test and
+  publish. The workflow still runs from main (issue_comment always does); the merges run in a separate worktree with
+  git only, and the bot answers in the thread with what went in. Every other comment starts a run that skips at
+  once, in its own concurrency group.
 
 - **Jobs.** `pick` chooses the commit and writes the notes (the open pull requests it holds beyond main). `build` is
   `game-build.yml`, the same builds and smoke test as a release, with the version `nightly-<date>` and
@@ -438,6 +448,7 @@ nothing. Only proven unions are pushed to origin, so nothing unreviewed ships.
 gh workflow run "nightly build"                  # now; skips when the pick is the commit already published
 gh workflow run "nightly build" -f force=true    # build and publish anyway
 gh workflow run "nightly build" -f dry_run=true  # build and sign with a throwaway key, publish nothing
+/nightly 2640 2642                               # a comment from a trusted reviewer: main plus those pull requests
 ```
 
 ## Nightly audit

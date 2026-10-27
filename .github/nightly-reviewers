@@ -1,0 +1,5 @@
+# Who can start a nightly with a /nightly comment (tools/ci/nightly.py compose, docs/release-flow.md
+# "Nightly channel"), one GitHub login per line. The maintainers edit this list.
+kacpherek
+levzzz5154
+rdbtCVS

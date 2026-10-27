@@ -15,12 +15,18 @@ name: nightly build
 #   names the channel ("horizon release nightly"), so a nightly's signature can't pass for a release's.
 # - `publish` verifies the signature with main's horizon-release-sign, checks the smoke test, and only then moves
 #   the tag. Like sign, it never executes what build produced.
+# - A `/nightly` comment from a reviewer in .github/nightly-reviewers runs this file from main too (issue_comment
+#   always does). Its merges run in a separate worktree with git only; the build then goes through the same jobs.
+#   /nightly 2640 2642 | /nightly user:branch 2640 | /nightly    (tools/ci/nightly.py compose)
 #   gh workflow run "nightly build"                     # now (skips when the pick is the same commit as last night's)
 #   gh workflow run "nightly build" -f force=true       # build and publish even if unchanged
 #   gh workflow run "nightly build" -f dry_run=true     # build and sign with a throwaway key, publish nothing
 on:
   schedule:
     - cron: '17 20 * * *'  # 20:17 UTC: after the day's waves, before the 03:07 Paris parity audit takes the Mac mini
+  # A trusted reviewer's `/nightly` comment on an issue or pull request.
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       force:
@@ -34,12 +40,20 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: nightly-build
+  # Every other comment starts a run too, which skips at once: it gets its own group, so it never replaces a nightly
+  # waiting in this one.
+  group: nightly-build${{ github.event_name == 'issue_comment' && !startsWith(github.event.comment.body, '/nightly') && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: false
 jobs:
   pick:
+    if: github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/nightly')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      # A reviewers' nightly pushes union/reviewers and answers in the thread.
+      contents: write
+      issues: write
+      pull-requests: write
     outputs:
       build: ${{ steps.pick.outputs.build }}
       sha: ${{ steps.pick.outputs.sha }}
@@ -60,10 +74,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ (inputs.force || steps.mode.outputs.dry_run == 'true') && 'yes' || '' }}
+          # A comment's text and author reach the script as variables, never inside the shell line.
+          AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT: ${{ github.event.comment.body }}
+          ISSUE: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python3 tools/ci/nightly.py pick ${FORCE:+--force} | tee -a "$GITHUB_STEP_SUMMARY"
-          { echo; cat nightly-notes.md; } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == issue_comment ]]; then
+            python3 tools/ci/nightly.py compose | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            python3 tools/ci/nightly.py pick ${FORCE:+--force} | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          [[ -f nightly-notes.md ]] && { echo; cat nightly-notes.md; } >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v4
+        if: steps.pick.outputs.build == 'true'
         with:
           name: nightly-notes
           path: nightly-notes.md
