@@ -1817,6 +1817,29 @@ impl Game<'_> {
                 // `Level.setBlockAndUpdate`: neighbour and shape updates, so a crop
                 // above trampled farmland breaks and drops.
                 MobEvent::SetBlock { pos, state } => self.level_set(pos, state)?,
+                MobEvent::CrackTurtleEgg { pos } => {
+                    let state = self.world.block(pos[0], pos[1], pos[2]);
+                    let eggs = self
+                        .pack
+                        .assets
+                        .registry
+                        .state(state)
+                        .filter(|s| s.name == "minecraft:turtle_egg")
+                        .and_then(|s| s.properties.get("eggs"))
+                        .and_then(|e| e.parse::<i32>().ok());
+                    if let Some(eggs) = eggs {
+                        let at = BlockPos::new(pos[0], pos[1], pos[2]);
+                        // decreaseEggs: the break sound and the remaining
+                        // eggs (a stack of one is destroyed after it).
+                        self.with_level(|b, level, ticks| {
+                            b.turtle_egg_destroyed_by_player(level, ticks, at, state);
+                            if eggs <= 1 {
+                                b.destroy_block(level, ticks, at, false);
+                            }
+                        });
+                        self.process_level_events()?;
+                    }
+                }
                 MobEvent::BedOccupied { pos, occupied } => self.set_bed_occupied(pos, occupied),
                 MobEvent::SetDoorOpen { pos, open } => {
                     let pos = BlockPos::new(pos[0], pos[1], pos[2]);

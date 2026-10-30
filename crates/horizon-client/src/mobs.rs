@@ -1430,6 +1430,12 @@ pub enum MobEvent {
         pos: [i32; 3],
         state: horizon_world::registry::BlockStateId,
     },
+    /// `TurtleEggBlock.decreaseEggs` after a mob's step won its 1 in 100: the
+    /// break sound, then one egg fewer, or the block destroyed when it was
+    /// the last.
+    CrackTurtleEgg {
+        pos: [i32; 3],
+    },
     /// `LivingEntity.startSleeping` / `stopSleeping`: the bed head at `pos`
     /// gets `occupied` (`setBlockAndUpdate`; the foot follows it).
     BedOccupied {
