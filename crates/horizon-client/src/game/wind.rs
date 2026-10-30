@@ -559,6 +559,15 @@ impl Game<'_> {
         if prop(self, "powered").as_deref() == Some("true") && &*name != "minecraft:lever" {
             return Ok(());
         }
+        // FenceGateBlock.onExplosionHit toggles the gate without turning it
+        // towards anyone, as a click would.
+        if name.ends_with("_fence_gate") {
+            self.with_level(|b, level, ticks| {
+                b.fence_gate_exploded(level, ticks, BlockPos::new(pos[0], pos[1], pos[2]))
+            });
+            self.process_level_events()?;
+            return Ok(());
+        }
         let at = Vec3::new(
             f64::from(pos[0]) + 0.5,
             f64::from(pos[1]) + 0.5,
