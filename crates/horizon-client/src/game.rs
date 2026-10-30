@@ -11796,6 +11796,7 @@ impl Game<'_> {
             on_ground: false,
             count: 1,
             ticks: 0,
+            health: 5,
         });
     }
     fn can_place_used_fire(&mut self, target: [i32; 3]) -> bool {
