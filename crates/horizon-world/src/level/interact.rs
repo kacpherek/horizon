@@ -92,6 +92,9 @@ pub enum PlayerEffect {
     Sleep,
     /// Respawn anchor: set the respawn point (or explode outside the Nether).
     RespawnAnchor,
+    /// `FlowerPotBlock.useItemOn`: the plant went into the pot, so the held
+    /// stack shrinks by one and the `pot_flower` statistic counts.
+    PotFlower,
 }
 
 impl<L: LevelAccess + ?Sized> Sim<'_, L> {
@@ -827,6 +830,28 @@ impl Behaviours {
             });
             return InteractionResult::Success;
         }
+        // FlowerPotBlock.useItemOn: a block item with a potted variant fills an
+        // empty pot (`POTTED_BY_CONTENT`) and does nothing to a full one
+        // (CONSUME); anything else tries the empty hand.
+        if self.data(state).chain.contains(&Class::FlowerPot)
+            && let Some(full) = item
+                .and_then(|i| self.item_binding(i))
+                .and_then(|binding| self.full_pot(binding.block))
+        {
+            if !self
+                .data(state)
+                .link
+                .is_some_and(|potted| self.is_air(self.default_of(potted)))
+            {
+                return InteractionResult::Consume;
+            }
+            let next = self.default_of(full);
+            let mut sim = self.sim(level, ticks);
+            sim.set_block_and_update(pos, next);
+            sim.game_event(pos, "minecraft:block_change");
+            sim.player_effect(pos, state, PlayerEffect::PotFlower);
+            return InteractionResult::Success;
+        }
         self.use_without_item(level, ticks, pos, face, hit, player)
     }
 
@@ -846,6 +871,17 @@ impl Behaviours {
         let candle = item?.strip_suffix("candle")?;
         let id = self.table.block_by_name(&format!("{candle}candle_cake"))?;
         Some(self.default_of(id))
+    }
+
+    /// `FlowerPotBlock.getFullPot` (`POTTED_BY_CONTENT`): the pot that holds
+    /// `plant`, if any.
+    fn full_pot(&self, plant: super::states::BlockId) -> Option<super::states::BlockId> {
+        (0..self.table.block_count())
+            .map(|i| super::states::BlockId(i as u16))
+            .find(|&block| {
+                let data = self.block_data(block);
+                data.chain.contains(&Class::FlowerPot) && data.link == Some(plant)
+            })
     }
 
     /// `CopperGolemStatueBlock.useItemOn` (and its weathering subclass's): anything but an axe

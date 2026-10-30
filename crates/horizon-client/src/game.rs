@@ -4343,6 +4343,19 @@ impl Game<'_> {
                         self.respawn_anchor_used([pos.x, pos.y, pos.z])?
                     }
                     PlayerEffect::InteractLoot(_) => {}
+                    PlayerEffect::PotFlower => {
+                        // FlowerPotBlock.useItemOn: the statistic, the criterion
+                        // with the stack as it was, then `itemStack.consume(1)`.
+                        self.stats.custom("pot_flower", 1);
+                        if let Some(stack) = self.held().cloned() {
+                            self.trigger_block(
+                                "minecraft:item_used_on_block",
+                                [pos.x, pos.y, pos.z],
+                                &stack,
+                            );
+                        }
+                        self.consume_held();
+                    }
                 },
                 LevelEvent::PrimeTnt { pos, rot } => self.add_primed_tnt(pos, rot, 80),
                 LevelEvent::BlockEvent {
