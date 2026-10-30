@@ -2,6 +2,7 @@
 //! cannot build, spectators fly through blocks and only watch.
 use super::{Game, Screen};
 use horizon_client::command::args::GameMode;
+use horizon_core::geometry::{Aabb, Vec3};
 
 pub(super) fn mode_id_of(mode: GameMode) -> i32 {
     match mode {
@@ -33,9 +34,41 @@ impl Game<'_> {
     pub(super) fn set_mode_id(&mut self, id: i32) {
         self.set_mode(mode_from_id(id));
     }
+    /// `ServerPlayerGameMode.isInRangeOfGround`: no block collides with the
+    /// player's box and `Entity.getAvailableSpaceBelow(1.0)` is under one
+    /// block, so there is ground within a block below. Boats and the world
+    /// border, which `collectAllColliders` also gathers, are not looked at.
+    fn in_range_of_ground(&self) -> bool {
+        let Some(p) = self.player.as_ref() else {
+            return false;
+        };
+        let bounds = p.bounds();
+        let mut scene = horizon_client::collisions::SceneCollisions {
+            world: &self.world,
+            binding: self.collision,
+            subject: None,
+        };
+        // Resting on the floor is not a collision.
+        let (lo, hi) = (bounds.min_position(), bounds.max_position());
+        let e = 1.0e-7;
+        let inside = Aabb::new(
+            Vec3::new(lo.x + e, lo.y + e, lo.z + e),
+            Vec3::new(hi.x - e, hi.y - e, hi.z - e),
+        );
+        if !scene.unobstructed(inside).unwrap_or(false) {
+            return false;
+        }
+        // The empty case of `getAvailableSpaceBelow` is the whole distance.
+        scene
+            .resolve(bounds, Vec3::new(0.0, -1.0, 0.0), 0.0, false)
+            .is_ok_and(|moved| -moved.y < 1.0)
+    }
     /// `ServerPlayer.setGameMode` and `GameType.updatePlayerAbilities`.
     pub(super) fn set_mode(&mut self, mode: GameMode) {
         let was_spectator = self.spectator();
+        // `ServerPlayerGameMode.changeGameModeForPlayer`: a flying player
+        // leaving spectator mode drops to the ground when it is that close.
+        let grounded = was_spectator && mode != GameMode::Spectator && self.in_range_of_ground();
         // MultiPlayerGameMode.setLocalMode: the mode it leaves.
         if mode != self.mode {
             self.previous_mode = Some(self.mode);
@@ -61,7 +94,7 @@ impl Game<'_> {
             if was_spectator {
                 p.flying_speed = 0.05;
             }
-            if !self.creative {
+            if !self.creative || grounded {
                 p.flying = false;
             } else if was_spectator {
                 p.flying = true;
