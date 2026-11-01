@@ -6322,7 +6322,15 @@ impl Renderer {
         // Two solid passes only where a discard costs the GPU its hidden surface
         // removal: Apple's tiled GPUs, behind Metal. Elsewhere the second pass
         // would double the solid draw calls and vertex work for nothing.
-        let split_solid = self.info.backend == wgpu::Backend::Metal;
+        // `HORIZON_SOLID_SPLIT=1` (or `0`) forces it on (or off) anywhere, to measure it.
+        static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        let forced =
+            *FORCED.get_or_init(|| match std::env::var("HORIZON_SOLID_SPLIT").as_deref() {
+                Ok("1") => Some(true),
+                Ok("0") => Some(false),
+                _ => None,
+            });
+        let split_solid = forced.unwrap_or(self.info.backend == wgpu::Backend::Metal);
         let translucent_pipeline = material.map_or(&self.translucent, |(m, _)| &m.translucent);
         let pack_flat = material.and_then(|(m, _)| m.flat.as_ref());
         // A material stage's translucent pass reads a copy of the depth the solid terrain
