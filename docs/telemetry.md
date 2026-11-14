@@ -109,10 +109,16 @@ The launcher reads the count when it opens and every minute after, and shows "N 
 
 ## Bug reports from the game
 
-The pause menu's Report Bugs opens Horizon's report screen instead of Mojang's bug tracker (the screen comes in a
-later pull request; this is the server's side). It is not data collection: nothing is kept on the machine or sent
-in the background, and no switch above covers it. The player picks "Something works wrong" or "Performance",
-writes a sentence, sees the whole issue as it will be posted, and clicking Send is the consent for that one report.
+The pause menu's Report Bugs opens Horizon's report form (`crates/horizon-bug-report`) instead of Mojang's bug
+tracker. It is not data collection: nothing is sent in the background, and no switch above covers it. The player
+writes what happened in a sentence or two and picks the area; Preview shows the issue's title and saves everything
+Send would send to `bug-report.json` in the game folder, and clicking Send is the consent for that one report.
+Performance reports, with their measurement, come in a later pull request.
+
+The form fills in the rest itself: the build, the machine as `horizon-system` reads it (system and version, CPU,
+cores and clocks, memory, drive, laptop or desktop and power), the graphics adapter with its backend and driver,
+the render settings, resource packs and native mods (`horizon_platform::details`), and the last 200 lines of
+`logs/latest.log` without the chat lines.
 
 The game fills in the technical part itself, scrubbed as the rest of this page says (`scrub::Scrubber`): no
 account, UUID, install ID, server address, world name or coordinates. `POST /v1/report` on the telemetry server

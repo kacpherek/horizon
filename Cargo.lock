@@ -1488,6 +1488,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-bug-report"
+version = "0.1.0"
+dependencies = [
+ "horizon-platform",
+ "horizon-telemetry",
+ "log",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "horizon-chat-filter"
 version = "0.1.0"
 dependencies = [
@@ -1880,6 +1891,7 @@ dependencies = [
 name = "horizon-official"
 version = "0.1.0"
 dependencies = [
+ "horizon-bug-report",
  "horizon-discord",
  "horizon-friends",
  "horizon-game",
