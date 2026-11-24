@@ -2,7 +2,7 @@
 use super::{DecodeError, Object, optional, required};
 use horizon_core::random::java_string_hash;
 use serde_json::value::RawValue;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagEntry {
@@ -47,20 +47,38 @@ impl TagEntry {
 pub struct TagFile {
     pub entries: Vec<TagEntry>,
     pub replace: bool,
+    /// NeoForge's `TagFile.remove`: entries taken out after this file's `entries`.
+    pub remove: Vec<TagEntry>,
+    entry_removals: Vec<bool>,
 }
 impl TagFile {
     pub fn from_json(json: &str) -> Result<Self, DecodeError> {
         let object: Object = serde_json::from_str(json)?;
-        let values: Vec<Box<RawValue>> = serde_json::from_str(required(&object, "values")?.get())?;
-        let entries = values
+        let list = |raw: &RawValue| -> Result<Vec<TagEntry>, DecodeError> {
+            let values: Vec<Box<RawValue>> = serde_json::from_str(raw.get())?;
+            values
+                .iter()
+                .map(|v| TagEntry::from_json(v.get()))
+                .collect()
+        };
+        let raw_entries: Vec<serde_json::Value> =
+            serde_json::from_str(required(&object, "values")?.get())?;
+        let entry_removals = raw_entries
             .iter()
-            .map(|v| TagEntry::from_json(v.get()))
-            .collect::<Result<_, _>>()?;
+            .map(|entry| entry.get("remove").and_then(serde_json::Value::as_bool) == Some(true))
+            .collect();
+        let entries = list(required(&object, "values")?)?;
         let replace = optional(&object, "replace")
             .map(|v| serde_json::from_str(v.get()))
             .transpose()?
             .unwrap_or(false);
-        Ok(Self { entries, replace })
+        let remove = optional(&object, "remove").map(list).transpose()?;
+        Ok(Self {
+            entries,
+            replace,
+            remove: remove.unwrap_or_default(),
+            entry_removals,
+        })
     }
 }
 // Identifier.CODEC permits the empty path as well as an omitted namespace.
@@ -83,6 +101,8 @@ pub(crate) fn identifier(name: &str) -> Result<String, DecodeError> {
 pub struct TagEntryWithSource {
     pub entry: TagEntry,
     pub source: String,
+    /// A `remove` entry (NeoForge's `TagLoader.EntryWithSource.remove`).
+    pub remove: bool,
 }
 #[derive(Clone, Debug, Default)]
 pub struct TagDefinitions {
@@ -104,9 +124,7 @@ impl std::fmt::Display for TagBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::TooManyTags => "tag definitions exceed 8192 entries",
-            Self::DependencyDepth => {
-                "tag dependency depth exceeds 256 or cyclic reachability does not terminate"
-            }
+            Self::DependencyDepth => "tag dependency depth exceeds 256",
             Self::HashTreeBucket => "tag identifiers require an unsupported Java hash tree bucket",
         })
     }
@@ -124,9 +142,26 @@ impl TagDefinitions {
         if file.replace {
             entries.clear();
         }
-        entries.extend(file.entries.into_iter().map(|entry| TagEntryWithSource {
-            entry,
+        entries.extend(file.entries.into_iter().zip(file.entry_removals).map(
+            |(mut entry, remove)| {
+                if remove {
+                    entry.required = false;
+                }
+                TagEntryWithSource {
+                    entry,
+                    source: source.into(),
+                    remove,
+                }
+            },
+        ));
+        // Removals are optional: a missing id or tag removes nothing.
+        entries.extend(file.remove.into_iter().map(|entry| TagEntryWithSource {
+            entry: TagEntry {
+                required: false,
+                ..entry
+            },
             source: source.into(),
+            remove: true,
         }));
         Ok(())
     }
@@ -160,12 +195,12 @@ impl TagDefinitions {
         // that map with put (tail insertion), retaining the reversed order of
         // colliding resource keys. Resizing preserves each split chain's order.
         let order = java_bucket_order(self.insertion_order.iter().rev().map(String::as_str), 16)?;
-        let mut edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
         for mandatory in [true, false] {
             for &name in &order {
                 for entry in &self.entries[name] {
                     let e = &entry.entry;
-                    if e.tag && e.required == mandatory && !reaches(&edges, &e.id, name, 0)? {
+                    if e.tag && e.required == mandatory && !reaches(&edges, &e.id, name) {
                         let children = edges.entry(name).or_default();
                         if !children.contains(&e.id.as_str()) {
                             children.push(&e.id);
@@ -201,17 +236,13 @@ impl TagDefinitions {
                 if entry.tag {
                     if let Some(children) = result.tags.get(&entry.id) {
                         for value in children {
-                            if seen.insert(value.clone()) {
-                                values.push(value.clone());
-                            }
+                            apply(&mut values, &mut seen, value, sourced.remove);
                         }
                     } else if entry.required {
                         missing.push(sourced.clone());
                     }
                 } else if let Some(value) = lookup(&entry.id, entry.required) {
-                    if seen.insert(value.clone()) {
-                        values.push(value);
-                    }
+                    apply(&mut values, &mut seen, &value, sourced.remove);
                 } else if entry.required {
                     missing.push(sourced.clone());
                 }
@@ -225,26 +256,35 @@ impl TagDefinitions {
         Ok(result)
     }
 }
-fn reaches(
-    edges: &BTreeMap<&str, Vec<&str>>,
-    from: &str,
-    target: &str,
-    depth: usize,
-) -> Result<bool, TagBuildError> {
-    if depth > 256 {
-        return Err(TagBuildError::DependencyDepth);
-    }
-    if let Some(children) = edges.get(from) {
-        if children.contains(&target) {
-            return Ok(true);
+/// One entry's value into a tag being built: added at the end, or removed
+/// (`values::add` or NeoForge's `values::remove` on the tag's ordered set).
+fn apply<T: Clone + Ord>(values: &mut Vec<T>, seen: &mut BTreeSet<T>, value: &T, remove: bool) {
+    if !remove {
+        if seen.insert(value.clone()) {
+            values.push(value.clone());
         }
-        for child in children {
-            if reaches(edges, child, target, depth + 1)? {
-                return Ok(true);
+    } else if seen.remove(value) {
+        values.retain(|v| v != value);
+    }
+}
+fn reaches<'a>(edges: &HashMap<&'a str, Vec<&'a str>>, from: &'a str, target: &str) -> bool {
+    let mut visited = HashSet::from([from]);
+    let mut pending = vec![from];
+    while let Some(tag) = pending.pop() {
+        #[cfg(test)]
+        crate::tag_layers::work_budget::check_step();
+        if let Some(children) = edges.get(tag) {
+            for &child in children {
+                if child == target {
+                    return true;
+                }
+                if visited.insert(child) {
+                    pending.push(child);
+                }
             }
         }
     }
-    Ok(false)
+    false
 }
 fn visit<'a>(
     name: &'a str,
@@ -305,6 +345,42 @@ fn java_bucket_order<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tag_layers::work_budget;
+    use serde_json::json;
+
+    #[test]
+    fn optional_edge_into_deep_diamond_visits_shared_descendants_once_per_search() {
+        let mut definitions = TagDefinitions::default();
+        let mut add = |name: &str, definition: serde_json::Value| {
+            definitions
+                .apply_json(name, "fixture", &definition.to_string())
+                .unwrap();
+        };
+        for depth in 0..40 {
+            for side in ["left", "right"] {
+                add(
+                    &format!("test:{side}/{depth}"),
+                    json!({"values": [format!("#test:join/{}", depth + 1)]}),
+                );
+            }
+            add(
+                &format!("test:join/{depth}"),
+                json!({"values": [format!("#test:left/{depth}"), format!("#test:right/{depth}")]}),
+            );
+        }
+        add("test:join/40", json!({"values": ["test:damage"]}));
+        add(
+            "test:probe",
+            json!({"values": [{"id": "#test:join/0", "required": false}]}),
+        );
+
+        let built =
+            work_budget::with_limit(25_000, || definitions.build(|id, _| Some(id.to_owned())))
+                .unwrap();
+        assert_eq!(built.tags["test:probe"], ["test:damage"]);
+        assert!(built.missing.is_empty());
+    }
+
     #[test]
     fn invalid_replacement_keeps_entries_and_codec_error_can_create_empty_tag() {
         let mut definitions = TagDefinitions::default();
@@ -335,6 +411,37 @@ mod tests {
         let built = definitions.build(|id, _| Some(id.to_owned())).unwrap();
         assert_eq!(built.tags["minecraft:a"], vec!["minecraft:three"]);
     }
+    #[test]
+    fn a_higher_packs_remove_takes_entries_and_tag_members_out() {
+        let mut definitions = TagDefinitions::default();
+        for (name, source, json) in [
+            ("things", "a", r##"{"values":["stone","dirt","#other"]}"##),
+            ("other", "a", r##"{"values":["sand"]}"##),
+            (
+                "things",
+                "b",
+                r##"{"values":[],"remove":["dirt","#other",{"id":"absent","required":true}]}"##,
+            ),
+        ] {
+            definitions.apply_json(name, source, json).unwrap();
+        }
+        let built = definitions
+            .build(|id, _| (!id.ends_with("absent")).then(|| id.to_owned()))
+            .unwrap();
+        assert_eq!(built.tags["minecraft:things"], vec!["minecraft:stone"]);
+        assert!(built.missing.is_empty());
+    }
+    #[test]
+    fn ordered_removal_objects_survive_the_worldgen_codec() {
+        let mut definitions = TagDefinitions::default();
+        definitions.apply_json("things", "fixture", r##"{"values":["stone", {"id":"stone","remove":true}, "stone", {"id":"stone","remove":true}, {"id":"absent","remove":true}]}"##).unwrap();
+        let built = definitions
+            .build(|id, _| (!id.ends_with("absent")).then(|| id.to_owned()))
+            .unwrap();
+        assert!(built.tags["minecraft:things"].is_empty());
+        assert!(built.missing.is_empty());
+    }
+
     #[test]
     fn required_edges_precede_optional_edges_and_missing_tags_do_not_poison_siblings() {
         let mut definitions = TagDefinitions::default();

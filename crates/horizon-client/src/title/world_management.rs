@@ -1,7 +1,7 @@
 //! World-list operations. Metadata edits preserve every other NBT field;
 //! backups use vanilla's ZIP layout and never include the session lock.
 use crate::save::{read_dat, write_dat};
-use horizon_world::nbt::Tag;
+use horizon_core::nbt::Tag;
 use std::{
     fs,
     io::{self, Seek, Write},
@@ -54,7 +54,10 @@ pub fn rename(saves: &Path, folder: &str, name: &str) -> crate::Result<()> {
     let Some(Tag::Compound(data)) = root.get_mut("Data") else {
         return Err("Missing level data".into());
     };
-    data.insert("LevelName".into(), Tag::String(name.trim().into()));
+    data.insert(
+        "LevelName".into(),
+        Tag::String(horizon_core::java_character::trim(name).into()),
+    );
     write_dat(&path, root)
 }
 
@@ -122,7 +125,8 @@ pub(super) fn open_folder(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-pub fn backup(saves: &Path, folder: &str) -> crate::Result<u64> {
+/// A zip of the whole world folder in the backups folder: where it is, and its size.
+pub fn backup(saves: &Path, folder: &str) -> crate::Result<(PathBuf, u64)> {
     let world = world_path(saves, folder)?;
     let backups = backups_path(saves);
     fs::create_dir_all(&backups)?;
@@ -149,15 +153,18 @@ pub fn backup(saves: &Path, folder: &str) -> crate::Result<u64> {
             Err(e) => return Err(e.into()),
         }
     };
-    let result = (|| {
+    let result: crate::Result<u64> = (|| {
         let mut zip = zip::ZipWriter::new(file);
         write_tree(&mut zip, &world, &world, folder)?;
         Ok(zip.finish()?.metadata()?.len())
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(path);
+    match result {
+        Ok(bytes) => Ok((path, bytes)),
+        Err(e) => {
+            let _ = fs::remove_file(path);
+            Err(e)
+        }
     }
-    result
 }
 
 fn write_tree<W: Write + Seek>(

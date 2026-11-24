@@ -1,4 +1,4 @@
-use crate::gamerules::GameRules as Rules;
+use crate::gamerules::{GameRules as Rules, vanilla};
 use horizon_perf_format::Gauges;
 use horizon_perf_format::v1::{Build, GameRules, HorizonOptions, Machine, Settings};
 
@@ -28,7 +28,7 @@ impl SystemProbe {
         let stat = std::fs::read_to_string("/proc/stat")
             .ok()
             .and_then(|s| parse_cpu_stat(&s));
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+        let threads = horizon_threads::available_parallelism().map_or(1, |n| n.get()) as f64;
         let mut g = Gauges {
             rss_mb: horizon_bench::rss_bytes(pid).map_or(0.0, |b| (b >> 20) as f32),
             players: counts.players,
@@ -167,7 +167,7 @@ pub fn machine(hardware: Option<&horizon_bench::Hardware>) -> Machine {
     let mut m = Machine {
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
-        cpu_threads: std::thread::available_parallelism().map_or(0, |n| n.get() as u32),
+        cpu_threads: horizon_threads::available_parallelism().map_or(0, |n| n.get() as u32),
         cgroup_cpu_cores: cgroup("cpu.max").and_then(|t| parse_cgroup_cpu(&t)),
         cgroup_memory_mb: cgroup("memory.max").and_then(|t| parse_cgroup_memory(&t)),
         ..Machine::default()
@@ -209,14 +209,16 @@ pub fn settings(view: u32, simulation: u32, max_players: u32, compression: i32) 
 /// The game rules a capture records: the typed allowlist, nothing else from the world's rule set.
 pub fn game_rules(rules: &Rules) -> GameRules {
     GameRules {
-        random_tick_speed: Some(rules.int("random_tick_speed")),
-        max_entity_cramming: Some(rules.int("max_entity_cramming")),
-        fire_spread_radius_around_player: Some(rules.int("fire_spread_radius_around_player")),
-        advance_time: Some(rules.bool("advance_time")),
-        mob_griefing: Some(rules.bool("mob_griefing")),
-        spawn_mobs: Some(rules.bool("spawn_mobs")),
-        spawn_monsters: Some(rules.bool("spawn_monsters")),
-        spawner_blocks_work: Some(rules.bool("spawner_blocks_work")),
+        random_tick_speed: Some(rules.int_at(vanilla::RANDOM_TICK_SPEED)),
+        max_entity_cramming: Some(rules.int_at(vanilla::MAX_ENTITY_CRAMMING)),
+        fire_spread_radius_around_player: Some(
+            rules.int_at(vanilla::FIRE_SPREAD_RADIUS_AROUND_PLAYER),
+        ),
+        advance_time: Some(rules.bool_at(vanilla::ADVANCE_TIME)),
+        mob_griefing: Some(rules.bool_at(vanilla::MOB_GRIEFING)),
+        spawn_mobs: Some(rules.bool_at(vanilla::SPAWN_MOBS)),
+        spawn_monsters: Some(rules.bool_at(vanilla::SPAWN_MONSTERS)),
+        spawner_blocks_work: Some(rules.bool_at(vanilla::SPAWNER_BLOCKS_WORK)),
     }
 }
 

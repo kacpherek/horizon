@@ -10,7 +10,7 @@ use crate::{
     ui,
 };
 use horizon_assets::item_model::{DisplayContext, ItemEnv};
-use horizon_world::nbt::Tag;
+use horizon_core::nbt::Tag;
 use serde_json::Value;
 use std::{collections::BTreeSet, path::Path};
 
@@ -40,7 +40,8 @@ pub struct FlatSettings {
     pub features: bool,
     pub lakes: bool,
     pub layers: Vec<FlatLayer>,
-    pub structure_overrides: Vec<String>,
+    /// None uses every structure set; an empty list disables all of them.
+    pub structure_overrides: Option<Vec<String>>,
 }
 impl Default for FlatSettings {
     fn default() -> Self {
@@ -63,7 +64,10 @@ impl Default for FlatSettings {
                     height: 1,
                 },
             ],
-            structure_overrides: vec!["minecraft:strongholds".into(), "minecraft:villages".into()],
+            structure_overrides: Some(vec![
+                "minecraft:strongholds".into(),
+                "minecraft:villages".into(),
+            ]),
         }
     }
 }
@@ -102,14 +106,14 @@ impl FlatSettings {
         let flag = |key: &str, default: bool| {
             crate::save::number(tag.get(key)).map_or(default, |value| value != 0)
         };
-        let structure_overrides = match tag.get("structure_overrides") {
-            Some(Tag::String(text)) => vec![text.to_string_lossy()],
-            Some(Tag::List(list)) => list
+        let structure_overrides = tag.get("structure_overrides").map(|value| match value {
+            Tag::String(text) => vec![text.to_string_lossy()],
+            Tag::List(list) => list
                 .iter()
                 .filter_map(|value| crate::save::text(Some(value)))
                 .collect(),
             _ => Vec::new(),
-        };
+        });
         Some(Self {
             biome: crate::save::text(tag.get("biome")).unwrap_or_else(|| "minecraft:plains".into()),
             features: flag("features", false),
@@ -121,7 +125,7 @@ impl FlatSettings {
     /// FlatLevelGeneratorSettings.CODEC, as world_gen_settings stores it.
     pub fn to_tag(&self) -> Tag {
         let string = |text: &str| Tag::String(text.into());
-        Tag::compound([
+        let fields = [
             ("biome", string(&self.biome)),
             ("features", Tag::Byte(i8::from(self.features))),
             ("lakes", Tag::Byte(i8::from(self.lakes))),
@@ -139,16 +143,17 @@ impl FlatSettings {
                         .collect(),
                 ),
             ),
-            (
-                "structure_overrides",
-                Tag::List(
-                    self.structure_overrides
-                        .iter()
-                        .map(|id| string(id))
-                        .collect(),
-                ),
-            ),
-        ])
+        ];
+        Tag::compound(
+            fields
+                .into_iter()
+                .chain(self.structure_overrides.as_ref().map(|ids| {
+                    (
+                        "structure_overrides",
+                        Tag::List(ids.iter().map(|id| string(id)).collect()),
+                    )
+                })),
+        )
     }
     /// `CreateFlatWorldScreen.save`: the text the preset screen shows.
     pub fn to_share(&self) -> String {
@@ -340,10 +345,27 @@ fn load(root: &Path) -> (Vec<Preset>, BTreeSet<String>, BTreeSet<String>) {
     let tag_path =
         root.join("data/minecraft/tags/worldgen/flat_level_generator_preset/visible.json");
     if let Ok(text) = std::fs::read_to_string(tag_path)
-        && let Ok(Value::Object(tag)) = serde_json::from_str(&text)
-        && let Some(Value::Array(ids)) = tag.get("values")
+        && let Ok(tag) = serde_json::from_str::<Value>(&text)
     {
-        for id in ids.iter().filter_map(Value::as_str) {
+        fn members(root: &Path, tag: &Value, active: &mut BTreeSet<String>) -> Vec<String> {
+            horizon_world::tag_layers::TagLayers::from_file(tag).build(|id| {
+                if !active.insert(id.to_owned()) {
+                    return Vec::new();
+                }
+                let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
+                let file = root.join(format!(
+                    "data/{namespace}/tags/worldgen/flat_level_generator_preset/{path}.json"
+                ));
+                let out = std::fs::read(file)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                    .map(|v| members(root, &v, active))
+                    .unwrap_or_default();
+                active.remove(id);
+                out
+            })
+        }
+        for id in members(root, &tag, &mut BTreeSet::new()) {
             let Some((namespace, path)) = id.split_once(':') else {
                 continue;
             };
@@ -389,15 +411,17 @@ fn preset_settings(value: &Value) -> Option<FlatSettings> {
     if layers.is_empty() {
         return None;
     }
-    let structure_overrides = match settings.get("structure_overrides") {
-        Some(Value::String(id)) => vec![id.clone()],
-        Some(Value::Array(ids)) => ids
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
-        _ => Vec::new(),
-    };
+    let structure_overrides = settings
+        .get("structure_overrides")
+        .map(|value| match value {
+            Value::String(id) => vec![id.clone()],
+            Value::Array(ids) => ids
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        });
     Some(FlatSettings {
         biome: settings
             .get("biome")
@@ -467,6 +491,7 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
         label: lang::get_or(key, fallback),
         enabled,
         id,
+        agent_id: None,
         icon: None,
         trailing: None,
         action: None,
@@ -483,7 +508,8 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
                     "Remove Layer",
                     state.selected.is_some(),
                     70,
-                ),
+                )
+                .identified("remove-layer"),
                 b(
                     x + 158.0,
                     h - 52.0,
@@ -492,10 +518,13 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
                     "Presets",
                     true,
                     71,
-                ),
+                )
+                .identified("presets"),
                 b(x, h - 28.0, 150.0, "gui.done", "Done", true, 72)
+                    .identified("done")
                     .does(crate::widgets::Action::Done),
                 b(x + 158.0, h - 28.0, 150.0, "gui.cancel", "Cancel", true, 73)
+                    .identified("cancel")
                     .does(crate::widgets::Action::Cancel),
             ]
         }
@@ -508,7 +537,8 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
                 "Select",
                 state.selecting().is_some() || state.share.len() > 1,
                 74,
-            ),
+            )
+            .identified("use-preset"),
             b(
                 w / 2.0 + 5.0,
                 h - 28.0,
@@ -518,6 +548,7 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
                 true,
                 75,
             )
+            .identified("cancel")
             .does(crate::widgets::Action::Cancel),
         ],
     }
@@ -634,9 +665,11 @@ pub(super) fn draw(
     batch: &mut HudBatch,
     cursor: (f32, f32),
     state: &State,
+    phases: &mut dyn FnMut(crate::screen_draw::RenderPhase, &mut HudBatch),
 ) {
     let (w, h) = (batch.width.ceil(), batch.height.ceil());
     ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+    phases(crate::screen_draw::RenderPhase::Background, batch);
     match state.page {
         Page::Layers => draw_layers(title, atlas, items, batch, cursor, state, (w, h)),
         Page::Presets => draw_presets(title, atlas, items, batch, cursor, state, (w, h)),
@@ -951,7 +984,7 @@ fn layer_state(renderer: &ItemRenderer, id: &str) -> ItemRenderState {
     )
 }
 /// The 18x18 slot behind a layer's item icon (`container/slot`), then the item
-/// (`GuiGraphics.renderItem`): its GUI model, so a block shows as the isometric
+/// (`GuiGraphicsExtractor.item`): its GUI model, so a block shows as the isometric
 /// block. Without item models, or for an id with none, the flat sprite stands in.
 fn slot(
     atlas: &HudAtlas,
@@ -1128,7 +1161,16 @@ mod tests {
         if !root.join("entity-models.json").exists() {
             return;
         }
-        let renderer = ItemRenderer::load(&root).unwrap();
+        let data = crate::test_resources::item_data(
+            &root,
+            horizon_world::native_load_context::DataLoadOrigin::ClientPreload,
+        )
+        .unwrap();
+        let renderer = ItemRenderer::load(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+            &data,
+        )
+        .unwrap();
         let tinted: Vec<i32> = super::layer_state(&renderer, "minecraft:grass_block")
             .layers
             .iter()

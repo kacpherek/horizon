@@ -28,6 +28,27 @@ impl Plays {
         }
     }
 
+    /// Change only the game's metadata so the dialog can save it together with the version pin.
+    pub fn apply_to(self, meta: &mut Meta) {
+        match self {
+            Plays::Horizon => {
+                if let Some(java) = meta.java.take() {
+                    meta.java_kept = Some(java);
+                }
+            }
+            Plays::Java { minecraft, loader } => {
+                let mut java = meta
+                    .java
+                    .take()
+                    .or_else(|| meta.java_kept.take())
+                    .unwrap_or_default();
+                java.minecraft = minecraft;
+                java.loader = loader;
+                meta.java = Some(java);
+            }
+        }
+    }
+
     /// The Minecraft version its worlds are saved by; `horizon` is the one Horizon plays.
     fn minecraft<'a>(&'a self, horizon: &'a str) -> &'a str {
         match self {
@@ -106,7 +127,7 @@ pub fn unkept(instance: &Instance, to: &Plays, horizon: &str) -> Vec<Unkept> {
     out
 }
 
-/// The mods in `home`: a Horizon instance's content mods (`mods/*.hmod`) and native mods, a Java
+/// The mods in `home`: a Horizon instance's content and native `.hmod` packages, a Java
 /// one's jars, on or off.
 fn mod_files(home: &Path, horizon: bool) -> usize {
     let count = |dir: &str, ext: &dyn Fn(&str) -> bool| {
@@ -118,10 +139,8 @@ fn mod_files(home: &Path, horizon: bool) -> usize {
         })
     };
     if horizon {
-        count("mods", &|n| n.ends_with(".hmod"))
-            + count(crate::native_mods::INSTALLED, &|n| {
-                n.ends_with(".hnmod") || n.ends_with(".hmod")
-            })
+        count(crate::browser::java::MODS_DIR, &|n| n.ends_with(".hmod"))
+            + count(crate::native_mods::INSTALLED, &|n| n.ends_with(".hmod"))
     } else {
         count("mods", &|n| {
             n.ends_with(".jar") || n.ends_with(".jar.disabled")
@@ -154,21 +173,5 @@ pub(super) fn switch_in(
     if instance.kind != Kind::Own {
         return Err(format!("{} plays what it was made with.", instance.name));
     }
-    edit_in(game_home, data, query, |m| match to {
-        Plays::Horizon => {
-            if let Some(java) = m.java.take() {
-                m.java_kept = Some(java);
-            }
-        }
-        Plays::Java { minecraft, loader } => {
-            let mut java = m
-                .java
-                .take()
-                .or_else(|| m.java_kept.take())
-                .unwrap_or_default();
-            java.minecraft = minecraft;
-            java.loader = loader;
-            m.java = Some(java);
-        }
-    })
+    edit_in(game_home, data, query, |meta| to.apply_to(meta))
 }

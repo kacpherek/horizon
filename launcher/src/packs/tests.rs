@@ -31,9 +31,10 @@ const SHADER_META: &str = "schema = 1\nid = \"warm\"\nname = \"Warm Light\"\nver
 fn home(name: &str) -> PathBuf {
     let home = scratch(name);
     let rp = home.join("resourcepacks");
+    let picture = crate::test_support::png(64, 64);
     zip_file(
         &rp.join("Glass.zip"),
-        &[("pack.mcmeta", META), ("pack.png", b"png")],
+        &[("pack.mcmeta", META), ("pack.png", &picture)],
     );
     zip_file(&rp.join("Broken.zip"), &[("readme.txt", b"no meta")]);
     fs::create_dir_all(rp.join("Folder Pack")).unwrap();
@@ -77,11 +78,34 @@ fn lists_what_the_game_reads_and_which_are_on() {
     );
     let glass = &rp[1];
     assert_eq!(glass.description, "Smooth glass and more");
-    assert_eq!(glass.icon.as_deref(), Some(&b"png"[..]));
+    let icon = glass.icon.as_deref().unwrap();
+    assert_eq!(crate::test_support::dimensions(icon), (64, 64));
     let sp = list(&home, Kind::Shader);
     let names: Vec<&str> = sp.iter().map(|p| p.title.as_str()).collect();
     assert_eq!(names, ["Classic.zip", "Warm Light"]);
     assert!(list(&home.join("none"), Kind::Shader).is_empty());
+    fs::remove_dir_all(&home).unwrap();
+}
+
+/// A pack's picture reaches the list made small, and one wider than any GPU's texture limit
+/// (20000 × 1, under a kilobyte) not at all: GPUI's atlas added a max-size texture for it on
+/// every frame.
+#[test]
+fn a_pack_picture_reaches_the_list_small_or_not_at_all() {
+    let home = scratch("pictures");
+    let rp = home.join("resourcepacks");
+    for (name, picture) in [("x", (20000, 1)), ("y", (1024, 1024))] {
+        let pack = rp.join(name);
+        fs::create_dir_all(&pack).unwrap();
+        fs::write(pack.join("pack.mcmeta"), META).unwrap();
+        let (w, h) = picture;
+        fs::write(pack.join("pack.png"), crate::test_support::png(w, h)).unwrap();
+    }
+    let packs = list(&home, Kind::Resource);
+    assert_eq!(packs[0].file, "x");
+    assert_eq!(packs[0].icon, None);
+    let icon = packs[1].icon.as_deref().unwrap();
+    assert_eq!(crate::test_support::dimensions(icon), (128, 128));
     fs::remove_dir_all(&home).unwrap();
 }
 
@@ -150,7 +174,14 @@ fn a_dropped_file_goes_to_its_folder_under_a_free_name() {
     let drops = scratch("drops");
     zip_file(&drops.join("Zed.zip"), &[("pack.mcmeta", META)]);
     zip_file(&drops.join("Shiny.zip"), &[("shaders/composite.fsh", b"")]);
-    fs::write(drops.join("glow.hshader"), b"PK").unwrap();
+    zip_file(
+        &drops.join("glow.hshader"),
+        &[
+            (SHADER_MANIFEST, SHADER_META.as_bytes()),
+            ("post.wgsl", b""),
+        ],
+    );
+    fs::write(drops.join("broken.hshader"), b"PK").unwrap();
     zip_file(&drops.join("random.zip"), &[("a.txt", b"")]);
     fs::write(drops.join("picture.png"), b"").unwrap();
 
@@ -165,6 +196,7 @@ fn a_dropped_file_goes_to_its_folder_under_a_free_name() {
     );
     assert!(home.join("shaderpacks/Shiny.zip").is_file());
     assert_eq!(kind_of(&drops.join("glow.hshader")).unwrap(), Kind::Shader);
+    assert!(add(&home, &drops.join("broken.hshader")).is_err());
     assert!(add(&home, &drops.join("random.zip")).is_err());
     assert!(add(&home, &drops.join("picture.png")).is_err());
     fs::remove_dir_all(&home).unwrap();

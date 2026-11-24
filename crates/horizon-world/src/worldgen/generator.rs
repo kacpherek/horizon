@@ -15,9 +15,11 @@ use super::{
         NoiseBasedAquifer, RegistryAquiferBlockStates,
     },
     biome::BiomeId,
-    biome_chunk::{BiomeChunk, BiomeRegion},
+    biome_chunk::{BiomeChunk, BiomeRegionError},
     biome_chunks::BiomeChunks,
-    biome_source::{BiomeSourceCatalog, ResolvedBiomeSource},
+    biome_source::{
+        BiomeSourceCatalog, BiomeSourceDefinition, ResolvedBiomeSource, regions::RegionLayout,
+    },
     biome_temperature::{BiomeTemperature, BiomeTemperatureSettings},
     carver::{CarverCatalog, WorldCarver, generate_carving_mask},
     carving::{CarvingBlocks, apply_carving_mask_shared},
@@ -32,7 +34,6 @@ use super::{
     material_extensions::{ExtensionBlocks, ExtensionNoises, MaterialExtensions},
     material_stage::{SurfaceInputs, TopMaterialInputs, build_surface_shared},
     material_surface::{ClayBandBlocks, MaterialSurface},
-    native_generate::{NativeGenerate, NativeProtoChunk, far_column, native_chunk_generate},
     overrides::{self, WorldgenOverrides},
     router::{NoiseRouter, RouterField, RouterSamplers},
     settings::NoiseSettings,
@@ -47,6 +48,7 @@ use crate::{
 use horizon_core::{
     biome::{BiomeZoom, obfuscate_seed},
     density::{DensitySampler, LatticeSamples, SamplerContext},
+    fast_hash::FxHashMap,
     noise::{DensityVolume, Noise},
     position::{BlockPos, ChunkPos},
     random::{LegacyRandom, PositionalRandom, RandomSource, XoroshiroRandom},
@@ -54,10 +56,10 @@ use horizon_core::{
 use serde_json::Value;
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
 #[derive(Debug)]
@@ -143,150 +145,13 @@ impl TerrainBlockStates for GenBlockStates {
     }
 }
 
-/// Feature resources for the FEATURES status, keyed by resource identifier.
-pub(super) struct FeatureResources {
-    pub(super) features: BTreeMap<String, String>,
-    pub(super) placed: BTreeMap<String, String>,
-    pub(super) feature_tags: BTreeMap<String, String>,
-    pub(super) fluid_tags: BTreeMap<String, Vec<String>>,
-    pub(super) state_providers: BTreeMap<String, String>,
-    /// Block properties, support, collision and survival for placement checks.
-    pub(super) blocks: Option<super::generator_blocks::BlockBehavior>,
-}
-
-/// Raw structure, structure-set and template-pool resources.
-pub(super) struct StructureBundles {
-    pub(super) structures: BTreeMap<String, String>,
-    pub(super) sets: BTreeMap<String, String>,
-    pub(super) pools: BTreeMap<String, String>,
-}
-
-/// Seed-independent generation resources, loaded once and shared by every
-/// generator. Biome identities are indices into the sorted biome registry.
-pub struct GeneratorData {
-    registry: &'static BlockRegistry,
-    states: GenBlockStates,
-    integers: BTreeSet<(String, String)>,
-    noises: BTreeMap<String, String>,
-    densities: BTreeMap<String, String>,
-    rules: BTreeMap<String, String>,
-    settings: BTreeMap<String, String>,
-    presets: BTreeMap<String, String>,
-    world_presets: BTreeMap<String, String>,
-    /// Data packs' level stems (`dimension/<id>.json`), by dimension id:
-    /// they replace the world preset's.
-    dimensions: BTreeMap<String, String>,
-    /// Data packs' dimension types (`dimension_type/<id>.json`), by id:
-    /// they replace the vanilla ones' build ranges.
-    dimension_types: BTreeMap<String, String>,
-    /// What loading the data packs' entries left out, for the log.
-    warnings: Vec<String>,
-    conditions: MaterialConditionRegistry,
-    source_catalog: BiomeSourceCatalog,
-    biome_names: Vec<Arc<str>>,
-    biome_ids: BTreeMap<String, BiomeId>,
-    biome_json: Vec<String>,
-    temperatures: Vec<BiomeTemperatureSettings>,
-    biome_carvers: Vec<Vec<Arc<WorldCarver>>>,
-    carving_blocks: CarvingBlocks,
-    pub(super) block_tags: BTreeMap<String, Vec<String>>,
-    /// `block_tags` bound to block states, once for the feature bindings of
-    /// decoration, structures and live features (`feature_block_bindings`).
-    bound_block_tags: std::sync::OnceLock<super::block_feature::BoundBlockTags>,
-    pub(super) biome_tags: BTreeMap<String, Vec<String>>,
-    pub(super) feature_resources: Option<FeatureResources>,
-    /// Templates, processor lists and per-state template transforms.
-    pub(super) structures: Option<Arc<super::structure::StructureResources>>,
-    pub(super) structure_resources: Option<StructureBundles>,
-    /// Block shape-update behaviour (`block-behaviours.json` next to the
-    /// worldgen directory) for template placement's neighbor updates.
-    pub(super) behaviours: Option<Arc<crate::level::Behaviours>>,
-    /// Concentric ring positions by seed and dimension generator (see
-    /// `rings_for`), most recent last.
-    ring_cache: Mutex<Vec<RingCacheEntry>>,
-    /// Placed-feature decoration by biome source (see `decoration_for`),
-    /// most recent last.
-    decorations: Mutex<Vec<(String, DecorationSlot)>>,
-    /// What `BlendingData` asks of the blocks of an old chunk, by state.
-    old_chunk_facts: OnceLock<OldChunkFacts>,
-}
-/// `BlendingData.isGround` and `SURFACE_BLOCKS`, by block state id.
-struct OldChunkFacts {
-    ground: Vec<bool>,
-    surface: Vec<bool>,
-}
-type RingCacheEntry = ((i64, String), Arc<OnceLock<super::structure::start::Rings>>);
-/// Generators whose ring positions are kept: the dimensions of a few worlds.
-const RING_CACHE_LIMIT: usize = 8;
-type DecorationSlot =
-    Arc<OnceLock<Result<Option<Arc<super::generator_decoration::Decoration>>, String>>>;
-/// Biome sources whose decoration is kept: the three dimensions and a spare.
-const DECORATION_CACHE_LIMIT: usize = 4;
-type Bundle = BTreeMap<String, String>;
-/// The bundle `name` with the data packs' entries over it.
-fn read_bundle(
-    dir: &Path,
-    overrides: &WorldgenOverrides,
-    name: &str,
-) -> Result<Bundle, GeneratorError> {
-    let path = dir.join(format!("{name}.json"));
-    let text =
-        fs::read_to_string(&path).map_err(|e| resource(format!("{}: {e}", path.display())))?;
-    Ok(overrides.apply(name, serde_json::from_str(&text)?))
-}
-fn read_optional_bundle(
-    dir: &Path,
-    overrides: &WorldgenOverrides,
-    name: &str,
-) -> Result<Option<Bundle>, GeneratorError> {
-    if dir.join(format!("{name}.json")).exists() {
-        read_bundle(dir, overrides, name).map(Some)
-    } else {
-        Ok(None)
-    }
-}
-/// The tags of the bundle `name`, the data packs' tag files after the
-/// prepared ones. A tag naming what is not there fails on its own, as
-/// vanilla's TagLoader leaves it out. Without packs the prepared tags must
-/// all resolve; with them (a pack's tag can also break a prepared tag that
-/// includes it), each failed tag goes into `dropped` for the log.
-fn build_tags(
-    raw: &Bundle,
-    overrides: &WorldgenOverrides,
-    name: &str,
-    dropped: &mut Vec<String>,
-    known: impl Fn(&str) -> bool,
-) -> Result<BTreeMap<String, Vec<String>>, GeneratorError> {
-    let mut definitions = TagDefinitions::default();
-    for (name, json) in raw {
-        definitions.apply_json(name, "vanilla", json)?;
-    }
-    for (id, pack, json) in overrides.tags(name) {
-        definitions
-            .apply_json(id, pack, json)
-            .map_err(|e| resource(format!("{pack}: tag {id}: {e}")))?;
-    }
-    let built = definitions
-        .build(|id, _| known(id).then(|| id.to_owned()))
-        .map_err(|e| resource(format!("tags: {e:?}")))?;
-    if overrides.tags(name).next().is_none() && !built.missing.is_empty() {
-        return Err(resource(format!(
-            "unresolved tag entries in {:?}",
-            built.missing.keys().collect::<Vec<_>>()
-        )));
-    }
-    for (tag, entries) in &built.missing {
-        dropped.push(format!(
-            "{name}: tag {tag} names what is missing: {}",
-            entries
-                .iter()
-                .map(|e| format!("{:?} ({})", e.entry, e.source))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    Ok(built.tags)
-}
+/// The seed-independent resources, at the path the internals list names.
+pub mod data;
+pub use data::GeneratorData;
+#[cfg(test)]
+use data::{RING_CACHE_LIMIT, build_tags};
+mod noise_settings;
+use noise_settings::DecodedNoiseSettings;
 /// Convert a data-generator `biome_parameters` report into the quantized
 /// preset table format, using vanilla's float `quantizeCoord`.
 pub(crate) fn quantize_parameter_report(json: &str) -> Result<String, GeneratorError> {
@@ -346,437 +211,6 @@ fn joined<T>(thread: std::thread::JoinHandle<T>) -> T {
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
-impl GeneratorData {
-    /// Load a worldgen bundle directory. Required files are JSON objects mapping
-    /// resource identifiers to the resource's JSON text: `noises`, `densities`,
-    /// `rules` (material rules), `conditions` (material conditions), `settings`
-    /// (noise settings), `carvers`, `biomes`, `biome_tags`, `block_tags`,
-    /// `world_presets`; `block_flags.json` is an array of `[is_air, has_fluid]`
-    /// per registry state. Multi-noise tables come from `presets.json`
-    /// (quantized) or `biome_parameters/<name>.json` data-generator reports.
-    /// Optional decoration inputs: `features`, `placed_features`,
-    /// `feature_tags`, `fluid_tags`, `state_providers` and the Java-exported
-    /// block behavior files in `blocks/` (see `generator_blocks`). Integer block properties are derived from
-    /// the registry: properties whose every value is a decimal integer.
-    pub fn load(dir: &Path, registry: &'static BlockRegistry) -> Result<Arc<Self>, GeneratorError> {
-        Self::load_with(dir, registry, &WorldgenOverrides::default())
-    }
-    /// `load` with a world's data packs over the bundles (see `overrides`).
-    pub fn load_with(
-        dir: &Path,
-        registry: &'static BlockRegistry,
-        ov: &WorldgenOverrides,
-    ) -> Result<Arc<Self>, GeneratorError> {
-        let mut warnings = Vec::new();
-        let flags: Vec<(bool, bool)> =
-            serde_json::from_str(&fs::read_to_string(dir.join("block_flags.json"))?)?;
-        if flags.len() != registry.len() {
-            return Err(resource("block_flags.json does not match the registry"));
-        }
-        let block_tags = build_tags(
-            &read_bundle(dir, ov, "block_tags")?,
-            ov,
-            "block_tags",
-            &mut warnings,
-            |id| registry.default_state(id).is_some(),
-        )?;
-        let fluid_tags = match read_optional_bundle(dir, ov, "fluid_tags")? {
-            Some(raw) => build_tags(&raw, ov, "fluid_tags", &mut warnings, |id| {
-                matches!(
-                    id,
-                    "minecraft:water"
-                        | "minecraft:flowing_water"
-                        | "minecraft:lava"
-                        | "minecraft:flowing_lava"
-                        | "minecraft:empty"
-                )
-            })?,
-            None => BTreeMap::new(),
-        };
-        // The three biggest reads (the block tables, the structure templates
-        // and the block behaviours) need only the tags: they run on threads of
-        // their own while this one reads the rest. A new world's first chunks
-        // wait for all of it, with the chunk workers idle.
-        let blocks = loading({
-            let (dir, tags, fluids) = (dir.join("blocks"), block_tags.clone(), fluid_tags.clone());
-            move || super::generator_blocks::BlockBehavior::load(&dir, registry, &tags, &fluids)
-        })?;
-        let structures = loading({
-            let (dir, tags, ov) = (dir.to_owned(), block_tags.clone(), ov.clone());
-            move || -> Result<_, GeneratorError> {
-                let Ok(json) = fs::read_to_string(dir.join("blocks/structure-blocks.json")) else {
-                    return Ok(None);
-                };
-                Ok(Some(Arc::new(
-                    super::structure::StructureResources::new(
-                        registry,
-                        super::structure::StateTransforms::from_json(&json, registry.len())?,
-                        &dir.join("structure"),
-                        read_optional_bundle(&dir, &ov, "processor_lists")?.unwrap_or_default(),
-                        &tags,
-                    )
-                    .with_pack_templates(ov.templates().clone()),
-                )))
-            }
-        })?;
-        let behaviours = loading({
-            let root = dir.parent().map(Path::to_owned);
-            move || {
-                root.filter(|root| root.join("block-behaviours.json").exists())
-                    .and_then(|root| crate::level::Behaviours::load(registry, &root).ok())
-                    .map(Arc::new)
-            }
-        })?;
-        let tag_set = |name: &str| -> Result<BTreeSet<&str>, GeneratorError> {
-            Ok(block_tags
-                .get(name)
-                .ok_or_else(|| resource(format!("missing block tag {name}")))?
-                .iter()
-                .map(String::as_str)
-                .collect())
-        };
-        let motion = tag_set("minecraft:blocks_motion_in_heightmap")?;
-        let no_leaves = tag_set("minecraft:blocks_motion_in_heightmap_no_leaves")?;
-        let states = (0..registry.len())
-            .map(|i| {
-                let state = registry.state(BlockStateId(i as u32)).unwrap();
-                GenBlockState {
-                    air: flags[i].0,
-                    air_block: state.name == "minecraft:air",
-                    fluid: flags[i].1,
-                    motion: motion.contains(state.name.as_str()),
-                    no_leaves: no_leaves.contains(state.name.as_str()),
-                }
-            })
-            .collect::<Vec<_>>();
-        let integers = super::block_feature::integer_properties(registry);
-        let biomes = read_bundle(dir, ov, "biomes")?;
-        let biome_tags = build_tags(
-            &read_bundle(dir, ov, "biome_tags")?,
-            ov,
-            "biome_tags",
-            &mut warnings,
-            |id| biomes.contains_key(id),
-        )?;
-        let biome_set = biomes.keys().cloned().collect::<BTreeSet<_>>();
-        let conditions = MaterialConditionRegistry::from_json_with_biome_tags(
-            &read_bundle(dir, ov, "conditions")?,
-            &biome_set,
-            &biome_tags,
-        )?;
-        let mut presets = read_optional_bundle(dir, ov, "presets")?.unwrap_or_default();
-        let reports = dir.join("biome_parameters");
-        if reports.is_dir() {
-            for entry in fs::read_dir(&reports)? {
-                let path = entry?.path();
-                let Some(stem) = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .filter(|_| path.extension().is_some_and(|e| e == "json"))
-                else {
-                    continue;
-                };
-                presets
-                    .entry(format!("minecraft:{stem}"))
-                    .or_insert(quantize_parameter_report(&fs::read_to_string(&path)?)?);
-            }
-        }
-        let source_catalog =
-            BiomeSourceCatalog::new(&biome_set, &biome_tags, &presets.keys().cloned().collect())?;
-        let carvers = CarverCatalog::from_json(&read_bundle(dir, ov, "carvers")?)?;
-        let mut biome_names = Vec::new();
-        let mut biome_ids = BTreeMap::new();
-        let mut biome_json = Vec::new();
-        let mut temperatures = Vec::new();
-        let mut biome_carvers = Vec::new();
-        for (name, json) in &biomes {
-            biome_ids.insert(name.clone(), BiomeId(biome_names.len() as u32));
-            biome_names.push(Arc::<str>::from(name.as_str()));
-            temperatures.push(BiomeTemperatureSettings::from_json(json)?);
-            let value: Value = serde_json::from_str(json)?;
-            biome_carvers.push(carvers.decode_set(&value["carvers"].to_string())?);
-            biome_json.push(json.clone());
-        }
-        let carving_blocks = CarvingBlocks::from_registry(
-            registry,
-            &tag_set("minecraft:uncarvable")?
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-        )
-        .map_err(|e| resource(format!("carving blocks: {e}")))?;
-        let feature_resources = match (
-            read_optional_bundle(dir, ov, "features")?,
-            read_optional_bundle(dir, ov, "placed_features")?,
-        ) {
-            (Some(features), Some(placed)) => Some(FeatureResources {
-                features,
-                placed,
-                feature_tags: read_optional_bundle(dir, ov, "feature_tags")?.unwrap_or_default(),
-                blocks: joined(blocks)?,
-                fluid_tags,
-                state_providers: read_optional_bundle(dir, ov, "state_providers")?
-                    .unwrap_or_default(),
-            }),
-            _ => None,
-        };
-        let structures = joined(structures)?;
-        let structure_resources = match (
-            read_optional_bundle(dir, ov, "structures")?,
-            read_optional_bundle(dir, ov, "structure_sets")?,
-            read_optional_bundle(dir, ov, "template_pools")?,
-        ) {
-            (Some(structures), Some(sets), Some(pools)) => Some(StructureBundles {
-                structures,
-                sets,
-                pools,
-            }),
-            _ => None,
-        };
-        let behaviours = joined(behaviours);
-        Ok(Arc::new(Self {
-            behaviours,
-            structure_resources,
-            structures,
-            registry,
-            states: GenBlockStates(states.into()),
-            integers,
-            noises: read_bundle(dir, ov, "noises")?,
-            densities: read_bundle(dir, ov, "densities")?,
-            rules: read_bundle(dir, ov, "rules")?,
-            settings: read_bundle(dir, ov, "settings")?,
-            world_presets: read_bundle(dir, ov, "world_presets")?,
-            dimensions: ov.apply(overrides::DIMENSIONS, BTreeMap::new()),
-            dimension_types: ov.apply(overrides::DIMENSION_TYPES, BTreeMap::new()),
-            warnings,
-            presets,
-            conditions,
-            source_catalog,
-            biome_names,
-            biome_ids,
-            biome_json,
-            temperatures,
-            biome_carvers,
-            carving_blocks,
-            block_tags,
-            biome_tags,
-            feature_resources,
-            ring_cache: Mutex::new(Vec::new()),
-            decorations: Mutex::new(Vec::new()),
-            old_chunk_facts: OnceLock::new(),
-            bound_block_tags: std::sync::OnceLock::new(),
-        }))
-    }
-    /// The concentric ring positions (strongholds) of the generator for
-    /// `seed` and the dimension `generator` definition, shared by every
-    /// generator built for them. They depend on nothing else, so returning
-    /// to a dimension, which builds its generator again, finds them done.
-    pub(super) fn rings_for(
-        &self,
-        seed: i64,
-        generator: &Value,
-    ) -> Arc<OnceLock<super::structure::start::Rings>> {
-        let key = (seed, generator.to_string());
-        let mut cache = self.ring_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let rings = match cache.iter().position(|(k, _)| *k == key) {
-            Some(i) => cache.remove(i).1,
-            None => Arc::new(OnceLock::new()),
-        };
-        if cache.len() >= RING_CACHE_LIMIT {
-            cache.remove(0);
-        }
-        cache.push((key, rings.clone()));
-        rings
-    }
-    /// The placed-feature decoration of the biome source `source_json`
-    /// (resolved: `source`), shared by every generator that uses it. It
-    /// depends on these resources and the source alone, not on the seed, and
-    /// building it (decoding the placed features of every biome the source
-    /// can place) took about 140 ms of each world opening. A caller that
-    /// arrives while another builds it waits for that build.
-    pub(super) fn decoration_for(
-        self: &Arc<Self>,
-        source_json: &str,
-        source: &ResolvedBiomeSource,
-    ) -> Result<Option<Arc<super::generator_decoration::Decoration>>, GeneratorError> {
-        let slot = {
-            let mut cache = self.decorations.lock().unwrap_or_else(|e| e.into_inner());
-            let slot = match cache.iter().position(|(k, _)| k == source_json) {
-                Some(i) => cache.remove(i).1,
-                None => Arc::new(OnceLock::new()),
-            };
-            if cache.len() >= DECORATION_CACHE_LIMIT {
-                cache.remove(0);
-            }
-            cache.push((source_json.to_owned(), slot.clone()));
-            slot
-        };
-        slot.get_or_init(|| {
-            super::generator_decoration::Decoration::new(self, source)
-                .map(|d| d.map(Arc::new))
-                .map_err(|e| e.to_string())
-        })
-        .clone()
-        .map_err(resource)
-    }
-    /// Builds the decoration of `preset`'s `dimension` generator before a
-    /// world needs it (the world screens' preload), so opening the world
-    /// finds it ready.
-    pub fn prepare_decoration(
-        self: &Arc<Self>,
-        preset: &str,
-        dimension: &str,
-    ) -> Result<(), GeneratorError> {
-        let preset_json: Value = serde_json::from_str(
-            self.world_presets
-                .get(preset)
-                .ok_or_else(|| resource(format!("missing world preset {preset}")))?,
-        )?;
-        let source_json =
-            preset_json["dimensions"][dimension]["generator"]["biome_source"].to_string();
-        let source = self
-            .source_catalog
-            .decode(&source_json)?
-            .resolve(&self.presets)
-            .map_err(|e| resource(format!("biome source: {e}")))?;
-        self.decoration_for(&source_json, &source).map(drop)
-    }
-    pub fn registry(&self) -> &'static BlockRegistry {
-        self.registry
-    }
-    /// What loading the data packs' entries left out (tags naming what is
-    /// missing), for the log.
-    pub fn warnings(&self) -> &[String] {
-        &self.warnings
-    }
-    pub fn block_states(&self) -> &GenBlockStates {
-        &self.states
-    }
-    /// Biome identifiers in registry (identifier-sorted) order.
-    pub fn configured_feature_json(&self, name: &str) -> Option<&str> {
-        self.feature_resources
-            .as_ref()?
-            .features
-            .get(name)
-            .map(String::as_str)
-    }
-    pub fn placed_feature_json(&self, name: &str) -> Option<&str> {
-        self.feature_resources
-            .as_ref()?
-            .placed
-            .get(name)
-            .map(String::as_str)
-    }
-    pub fn biome_names(&self) -> &[Arc<str>] {
-        &self.biome_names
-    }
-    fn old_chunk_facts(&self) -> &OldChunkFacts {
-        self.old_chunk_facts.get_or_init(|| {
-            let members = |tag: &str| -> std::collections::HashSet<&str> {
-                self.block_tags
-                    .get(tag)
-                    .into_iter()
-                    .flatten()
-                    .map(String::as_str)
-                    .collect()
-            };
-            let (leaves, logs) = (members("minecraft:leaves"), members("minecraft:logs"));
-            let collision = self
-                .feature_resources
-                .as_ref()
-                .and_then(|resources| resources.blocks.as_ref())
-                .map(|blocks| &blocks.collision);
-            let surface_names = [
-                "minecraft:podzol",
-                "minecraft:gravel",
-                "minecraft:grass_block",
-                "minecraft:stone",
-                "minecraft:coarse_dirt",
-                "minecraft:sand",
-                "minecraft:red_sand",
-                "minecraft:mycelium",
-                "minecraft:snow_block",
-                "minecraft:terracotta",
-                "minecraft:dirt",
-            ];
-            let (mut ground, mut surface) = (Vec::new(), Vec::new());
-            for index in 0..self.registry.len() {
-                let id = BlockStateId(index as u32);
-                let name = self.registry.state(id).map_or("", |s| s.name.as_str());
-                surface.push(surface_names.contains(&name));
-                // An empty collision shape: air, the liquids (no entity stands
-                // on them), powder snow and the like; and leaves, logs and
-                // huge mushrooms, which `isGround` leaves out.
-                let excluded = self.states.get(id).air
-                    || leaves.contains(name)
-                    || logs.contains(name)
-                    || matches!(
-                        name,
-                        "minecraft:brown_mushroom_block"
-                            | "minecraft:red_mushroom_block"
-                            | "minecraft:water"
-                            | "minecraft:lava"
-                            | "minecraft:powder_snow"
-                    );
-                ground.push(
-                    !excluded
-                        && match collision {
-                            Some(registry) => registry
-                                .collision_block(id)
-                                .map_or(true, |block| !block.empty_shape),
-                            None => self.states.get(id).motion,
-                        },
-                );
-            }
-            OldChunkFacts { ground, surface }
-        })
-    }
-    /// `BlendingData.isGround` of a block state of an old chunk.
-    pub fn is_old_chunk_ground(&self, state: BlockStateId) -> bool {
-        self.old_chunk_facts()
-            .ground
-            .get(state.0 as usize)
-            .copied()
-            .unwrap_or(false)
-    }
-    /// Whether the block state is one of `BlendingData.SURFACE_BLOCKS`.
-    pub fn is_old_chunk_surface(&self, state: BlockStateId) -> bool {
-        self.old_chunk_facts()
-            .surface
-            .get(state.0 as usize)
-            .copied()
-            .unwrap_or(false)
-    }
-    pub fn biome_name(&self, id: BiomeId) -> &str {
-        &self.biome_names[id.0 as usize]
-    }
-    pub fn biome_id(&self, name: &str) -> Option<BiomeId> {
-        self.biome_ids.get(name).copied()
-    }
-    /// The biome's resource JSON (climate, effects such as water/sky/foliage
-    /// colors, attributes, carvers and features).
-    pub fn biome_json(&self, id: BiomeId) -> &str {
-        &self.biome_json[id.0 as usize]
-    }
-    pub(super) fn integers(&self) -> &BTreeSet<(String, String)> {
-        &self.integers
-    }
-    /// Feature block bindings over this data's blocks and block tags. The tags'
-    /// state sets are bound once and shared: each binding held 5 MB of them.
-    pub(super) fn feature_block_bindings(
-        &self,
-    ) -> Result<super::block_feature::FeatureBlockBindings<'static>, DecodeError> {
-        use super::block_feature::FeatureBlockBindings;
-        let bound = match self.bound_block_tags.get() {
-            Some(bound) => bound.clone(),
-            None => {
-                let bound = FeatureBlockBindings::bind_tags(self.registry, &self.block_tags)?;
-                self.bound_block_tags.get_or_init(|| bound).clone()
-            }
-        };
-        FeatureBlockBindings::with_bound_tags(self.registry, self.integers.clone(), bound)
-    }
-}
 
 /// A generated chunk with its quart biomes. Blocks and heightmaps live in
 /// `terrain`; after `generate_proto` it is at the TERRAIN status with the
@@ -785,12 +219,12 @@ impl GeneratorData {
 /// `terrain.postprocessing()`.
 pub struct ProtoChunk {
     pub terrain: TerrainChunk<'static, GenBlockStates>,
-    biomes: BiomeChunk<BiomeId>,
+    biomes: Arc<BiomeChunk<BiomeId>>,
     data: Arc<GeneratorData>,
     decorated: bool,
     /// Block-entity data placed by structures and template features, in
     /// placement order (positions are absolute block coordinates).
-    pub block_entities: Vec<([i32; 3], crate::nbt::Compound)>,
+    pub block_entities: Vec<([i32; 3], horizon_core::nbt::Compound)>,
     /// Structure starts referencing this chunk (STRUCTURE_REFERENCES).
     pub(super) structure_starts: Vec<Arc<super::structure::start::StructureStart>>,
     /// The starts made in this chunk (STRUCTURE_STARTS), also those none of
@@ -798,14 +232,9 @@ pub struct ProtoChunk {
     own_starts: Starts,
     /// Entities placed by structures (`ProtoChunk.addEntity`), as NBT with
     /// absolute `Pos`.
-    pub entities: Vec<crate::nbt::Compound>,
-    /// False when a native mod's generator turned decoration's placed
-    /// features off for this chunk (`native_chunk_generate`).
-    pub(super) features: bool,
-    /// A full chunk standing in a decoration region (`ImposterProtoChunk`
-    /// with `allowWrites` false): features read it, their ordinary writes
-    /// leave it as it is, and only section writes (`BulkSectionAccess`)
-    /// change it. Not saved.
+    pub entities: Vec<horizon_core::nbt::Compound>,
+    /// Unmodelled root keys retained from a saved proto chunk.
+    pub saved_root: horizon_core::nbt::Compound,
     full: bool,
 }
 impl ProtoChunk {
@@ -822,9 +251,9 @@ impl ProtoChunk {
             self.biomes.heap_bytes(),
             std::mem::size_of::<Self>()
                 + self.block_entities.capacity()
-                    * std::mem::size_of::<([i32; 3], crate::nbt::Compound)>()
+                    * std::mem::size_of::<([i32; 3], horizon_core::nbt::Compound)>()
                 + self.structure_starts.capacity() * std::mem::size_of::<usize>()
-                + self.entities.capacity() * std::mem::size_of::<crate::nbt::Compound>(),
+                + self.entities.capacity() * std::mem::size_of::<horizon_core::nbt::Compound>(),
         ]
     }
     pub fn position(&self) -> ChunkPos {
@@ -941,7 +370,7 @@ struct Pipeline<R: RandomSource> {
     /// sampled, for the noise fill of this chunk and its -X/-Z neighbours.
     lattice_cache: LatticeCache,
     biome_work: ChunkWork,
-    carver_cache: Mutex<HashMap<(i32, i32), BiomeId>>,
+    carver_cache: CarverCache,
     pub(super) decoration: Option<Arc<super::generator_decoration::Decoration>>,
     pub(super) structures: Option<super::generator_structures::StructureState>,
     /// Definitions for explicit placement when automatic structure starts are off.
@@ -955,32 +384,8 @@ struct Pipeline<R: RandomSource> {
     spawn_position: std::sync::OnceLock<[i32; 2]>,
     /// A superflat world: its layers stand where the noise terrain would.
     flat: Option<FlatLayers>,
-    /// The dimension it generates, as native mods are told.
-    dimension: String,
-}
-/// `FlatLevelGeneratorSettings.getLayers` as `FlatLevelSource` reads them: the states from the
-/// level's minimum Y up, with the layers `adjustGenerationSettings` replaced by `null`
-/// (not opaque to `MOTION_BLOCKING`: a feature fills them later) marked.
-struct FlatLayers {
-    min_y: i32,
-    states: Vec<BlockStateId>,
-    /// `layers.get(i) == null`: `getBaseHeight` skips it, `getBaseColumn` reads it as air, and
-    /// `buildTerrain` leaves it for the `FillLayerFeature` that runs after the structures.
-    null: Vec<bool>,
-}
-/// A superflat world's generator settings (`FlatLevelGeneratorSettings`).
-#[derive(Clone, Debug)]
-pub struct FlatSettings {
-    /// The layers, bottom up: block id and height.
-    pub layers: Vec<(String, i32)>,
-    /// The biome the whole world is.
-    pub biome: String,
-    /// `structure_overrides`: the structure sets that may generate (all of them when `None`).
-    pub structure_overrides: Option<Vec<String>>,
-    /// `features`: the biome's own placed features decorate the world.
-    pub features: bool,
-    /// `lakes`: the lava lakes (`createLakesList`) take the biome's lakes step.
-    pub lakes: bool,
+    /// A mod's chunk generator: its terrain stands where the noise would.
+    mod_terrain: Option<mod_terrain::ModTerrain>,
 }
 /// Carver origins whose biome is kept.
 const CARVER_CACHE_LIMIT: usize = 65536;
@@ -1000,7 +405,7 @@ pub struct CacheCensus {
 /// computed values across eviction or explicit invalidation. Only one work
 /// lock may be held at a time; finish shared prerequisites before acquiring it.
 /// Sharded by key: every worker asks for the locks of the same neighbourhoods.
-pub(super) struct ChunkWork(Box<[Mutex<HashMap<(i32, i32), std::sync::Weak<Mutex<()>>>>]>);
+pub(super) struct ChunkWork(Box<[Mutex<FxHashMap<(i32, i32), std::sync::Weak<Mutex<()>>>>]>);
 const WORK_SHARDS: usize = 64;
 /// The shard of `key` among `shards` (a power of two).
 pub(super) fn shard_of(key: (i32, i32), shards: usize) -> usize {
@@ -1027,10 +432,185 @@ impl ChunkWork {
     }
 }
 
-type BiomeCache = Mutex<BiomeChunks>;
-type LatticeCache = Mutex<HashMap<(i32, i32), Arc<Vec<LatticeSamples>>>>;
+const CACHE_SHARDS: usize = 64;
 /// ~33 KB a chunk in To The Max; misses only resample.
 const LATTICE_CACHE_LIMIT: usize = 1024;
+
+struct BiomeCache(Box<[RwLock<BiomeChunks>]>);
+impl BiomeCache {
+    fn new() -> Self {
+        let per = (super::biome_chunks::CACHE_LIMIT / CACHE_SHARDS).max(2);
+        Self(
+            (0..CACHE_SHARDS)
+                .map(|_| RwLock::new(BiomeChunks::with_limit(per)))
+                .collect(),
+        )
+    }
+    fn get(&self, key: &(i32, i32)) -> Option<Arc<BiomeChunk<BiomeId>>> {
+        let shard = &self.0[shard_of(*key, CACHE_SHARDS)];
+        {
+            let read = shard.read().unwrap();
+            if let Some(chunk) = read.get_now(key) {
+                return Some(chunk.clone());
+            }
+            if !read.has_old(key) {
+                return None;
+            }
+        }
+        shard.write().unwrap().get(key).cloned()
+    }
+    fn insert(&self, key: (i32, i32), chunk: Arc<BiomeChunk<BiomeId>>) {
+        self.0[shard_of(key, CACHE_SHARDS)]
+            .write()
+            .unwrap()
+            .insert(key, chunk);
+    }
+    fn clear(&self) {
+        let mut dropped = Vec::with_capacity(CACHE_SHARDS);
+        for shard in &self.0 {
+            let mut guard = shard.write().unwrap();
+            let old = std::mem::replace(
+                &mut *guard,
+                BiomeChunks::with_limit((super::biome_chunks::CACHE_LIMIT / CACHE_SHARDS).max(2)),
+            );
+            dropped.push(old);
+        }
+        drop(dropped);
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.iter().map(|shard| shard.read().unwrap().len()).sum()
+    }
+    fn census(&self) -> (usize, usize) {
+        let mut chunks = 0;
+        let mut bytes = 0;
+        for shard in &self.0 {
+            let guard = shard.read().unwrap();
+            chunks += guard.len();
+            bytes += guard
+                .values()
+                .map(|b| std::mem::size_of::<BiomeChunk<BiomeId>>() + b.heap_bytes())
+                .sum::<usize>()
+                + guard.capacity() * std::mem::size_of::<((i32, i32), usize)>();
+        }
+        (chunks, bytes)
+    }
+}
+
+struct LatticeCache(Box<[RwLock<FxHashMap<(i32, i32), Arc<Vec<LatticeSamples>>>>]>);
+impl LatticeCache {
+    fn new() -> Self {
+        Self((0..CACHE_SHARDS).map(|_| RwLock::default()).collect())
+    }
+    fn get(&self, key: &(i32, i32)) -> Option<Arc<Vec<LatticeSamples>>> {
+        self.0[shard_of(*key, CACHE_SHARDS)]
+            .read()
+            .unwrap()
+            .get(key)
+            .cloned()
+    }
+    fn insert(&self, key: (i32, i32), value: Arc<Vec<LatticeSamples>>) {
+        let mut shard = self.0[shard_of(key, CACHE_SHARDS)].write().unwrap();
+        if shard.len() >= (LATTICE_CACHE_LIMIT / CACHE_SHARDS).max(1) {
+            shard.clear();
+        }
+        shard.insert(key, value);
+    }
+    fn clear(&self) {
+        let mut dropped = Vec::with_capacity(CACHE_SHARDS);
+        for shard in &self.0 {
+            let old = std::mem::take(&mut *shard.write().unwrap());
+            dropped.push(old);
+        }
+        drop(dropped);
+    }
+}
+
+struct CarverCache(Box<[RwLock<FxHashMap<(i32, i32), BiomeId>>]>);
+impl CarverCache {
+    fn new() -> Self {
+        Self((0..CACHE_SHARDS).map(|_| RwLock::default()).collect())
+    }
+    fn get(&self, key: &(i32, i32)) -> Option<BiomeId> {
+        self.0[shard_of(*key, CACHE_SHARDS)]
+            .read()
+            .unwrap()
+            .get(key)
+            .copied()
+    }
+    fn insert(&self, key: (i32, i32), value: BiomeId) {
+        let mut shard = self.0[shard_of(key, CACHE_SHARDS)].write().unwrap();
+        if shard.len() >= (CARVER_CACHE_LIMIT / CACHE_SHARDS).max(1) {
+            shard.clear();
+        }
+        shard.insert(key, value);
+    }
+    fn clear(&self) {
+        let mut dropped = Vec::with_capacity(CACHE_SHARDS);
+        for shard in &self.0 {
+            let old = std::mem::take(&mut *shard.write().unwrap());
+            dropped.push(old);
+        }
+        drop(dropped);
+    }
+    fn len(&self) -> usize {
+        self.0.iter().map(|shard| shard.read().unwrap().len()).sum()
+    }
+}
+
+/// Zero-copy 3x3 chunk biome neighborhood backed directly by shared `Arc<BiomeChunk>`.
+pub(super) struct SurfaceBiomeRegion {
+    center: ChunkPos,
+    chunks: [Arc<BiomeChunk<BiomeId>>; 9],
+    zoom: BiomeZoom,
+}
+impl SurfaceBiomeRegion {
+    pub(super) fn new(
+        center: ChunkPos,
+        chunks: [Arc<BiomeChunk<BiomeId>>; 9],
+        zoom: BiomeZoom,
+    ) -> Result<Self, BiomeRegionError> {
+        let min_y = chunks[4].min_y();
+        let height = chunks[4].height();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let expected = ChunkPos::new(
+                center.x.wrapping_add((i % 3) as i32 - 1),
+                center.z.wrapping_add((i / 3) as i32 - 1),
+            );
+            if chunk.position() != expected || chunk.min_y() != min_y || chunk.height() != height {
+                return Err(BiomeRegionError::InvalidChunks);
+            }
+        }
+        Ok(Self {
+            center,
+            chunks,
+            zoom,
+        })
+    }
+    #[inline]
+    pub(super) fn chunk(&self, pos: ChunkPos) -> Option<&BiomeChunk<BiomeId>> {
+        let dx = pos.x.wrapping_sub(self.center.x).wrapping_add(1) as u32;
+        let dz = pos.z.wrapping_sub(self.center.z).wrapping_add(1) as u32;
+        if dx >= 3 || dz >= 3 {
+            return None;
+        }
+        let chunk = &self.chunks[(dz * 3 + dx) as usize];
+        (chunk.position() == pos).then_some(chunk.as_ref())
+    }
+    #[inline]
+    pub(super) fn noise_biome(&self, quart: [i32; 3]) -> Option<BiomeId> {
+        let chunk = self.chunk(ChunkPos::new(quart[0] >> 2, quart[2] >> 2))?;
+        Some(*chunk.noise_biome(quart))
+    }
+    #[inline]
+    pub(super) fn biome(&self, pos: BlockPos) -> Option<BiomeId> {
+        self.noise_biome(self.zoom.quart_at_block(pos))
+    }
+    #[inline]
+    pub(super) fn zoom(&self) -> BiomeZoom {
+        self.zoom
+    }
+}
 
 /// `NoiseGeneratorSettings`' `default_block` and `default_fluid`: a block state
 /// in 26.3's form, the id alone or `{"id", "properties"}`.
@@ -1055,116 +635,39 @@ where
         settings_json: &Value,
         with_structures: bool,
         level: Option<(i32, i32)>,
+        regions: Option<&RegionLayout>,
     ) -> Result<Self, GeneratorError> {
         let registry = data.registry;
-        let noise = &settings_json["noise"];
-        let min_y = noise["min_y"]
-            .as_i64()
-            .ok_or_else(|| resource("noise min_y"))? as i32;
-        let height = noise["height"]
-            .as_i64()
-            .ok_or_else(|| resource("noise height"))? as i32;
-        let (level_min_y, level_height) = level.unwrap_or((min_y, height));
-        if min_y < level_min_y || min_y + height > level_min_y + level_height {
-            return Err(resource("noise range outside the dimension's build height"));
-        }
-        let codec = crate::registry::BlockStateJsonCodec::new(registry, data.integers.clone())
-            .map_err(|e| resource(e.to_string()))?;
-        let settings = Settings {
-            noise_min_y: min_y,
-            noise_height: height,
-            level_min_y,
-            level_height,
-            sea_level: settings_json["sea_level"]
-                .as_i64()
-                .ok_or_else(|| resource("sea_level"))? as i32,
-            default_block: state(&codec, &settings_json["default_block"])?,
-            default_fluid: state(&codec, &settings_json["default_fluid"])?,
-            legacy: settings_json["legacy_random_source"]
-                .as_bool()
-                .unwrap_or(false),
-            disable_mob_generation: settings_json["disable_mob_generation"]
-                .as_bool()
-                .unwrap_or(false),
-        };
         let root = random.fork_positional();
-        let mut densities = DensityRegistry::from_json(&data.noises, &data.densities)?;
-        let router =
-            NoiseRouter::from_json(&settings_json["noise_router"].to_string(), &mut densities)?;
-        // NoiseGeneratorSettings.debugFunctions: a registered density or an
-        // inline one, each with its label.
-        let debug_functions = settings_json
-            .get("debug_functions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(|entry| {
-                let label = entry["label"]
-                    .as_str()
-                    .ok_or_else(|| resource("debug label"))?;
-                let id = match &entry["function"] {
-                    Value::String(name) => densities
-                        .reference(name)
-                        .ok_or_else(|| resource(format!("debug function {name}")))?,
-                    inline => densities.decode_functions(&[&inline.to_string()])?[0],
-                };
-                Ok((label.to_owned(), id))
-            })
-            .collect::<Result<Vec<_>, GeneratorError>>()?;
-        let aquifers = settings_json
-            .get("aquifers")
-            .filter(|v| !v.is_null())
-            .map(|v| AquiferConfig::from_json(&v.to_string(), &mut densities))
-            .transpose()?;
-        let mut library = MaterialRuleLibrary::from_json(
-            &data.rules,
-            &data.conditions,
-            &codec,
-            densities,
-            seed,
-            settings.legacy,
-        )?;
-        let router = library.compile_router(router)?;
-        let debug_density = debug_functions
-            .into_iter()
-            .map(|(label, id)| Ok((label, library.function_sampler(id)?)))
-            .collect::<Result<Vec<_>, GeneratorError>>()?;
-        let aquifer = aquifers
-            .map(|config| library.compile_aquifer(config))
-            .transpose()?
-            .map(|samplers| AquiferField::ALL.map(|field| samplers.get(field).clone()));
-        let rule_name = settings_json["material_rule"]
-            .as_str()
-            .ok_or_else(|| resource("material_rule"))?;
-        let rule = library.rule(rule_name)?;
+        let DecodedNoiseSettings {
+            settings,
+            router,
+            debug_density,
+            aquifer,
+            rule,
+            spawn_target,
+        } = data.decode_noise_settings(settings_json, seed, level)?;
         let preliminary = router.get(RouterField::ChunkSurfaceLevel).clone();
-        let spawn_target = match settings_json.get("spawn_target") {
-            Some(Value::Array(points)) => points
-                .iter()
-                .map(|point| {
-                    let Value::Object(fields) = point else {
-                        return Err(resource("spawn_target point"));
-                    };
-                    let parameters = fields
-                        .iter()
-                        .map(|(name, interval)| {
-                            Ok((
-                                library.named_density(name)?,
-                                decode_parameter(&interval.to_string())?,
-                            ))
-                        })
-                        .collect::<Result<_, GeneratorError>>()?;
-                    Ok(SpawnTargetPoint { parameters })
-                })
-                .collect::<Result<_, GeneratorError>>()?,
-            _ => Vec::new(),
-        };
-        let source_json = generator["biome_source"].to_string();
-        let source = data
-            .source_catalog
-            .decode(&source_json)?
-            .resolve(&data.presets)
+        let mut source_json = generator["biome_source"].to_string();
+        let definition = data.source_catalog.decode(&source_json)?;
+        let source = definition
+            .resolve(&data.presets, seed)
             .map_err(|e| resource(format!("biome source: {e}")))?;
+        // Only the multi-noise presets (Overworld, Nether) take regions, not inline point lists.
+        let source = if matches!(definition, BiomeSourceDefinition::Preset { .. }) {
+            source
+                .with_regions(regions, &root)
+                .map_err(|e| resource(format!("biome regions: {e}")))?
+        } else {
+            source
+        };
+        // Regions add biomes, so their decoration is cached apart from the bare preset's.
+        if let ResolvedBiomeSource::Regions(layered) = &source {
+            for biome in layered.biomes() {
+                source_json.push(' ');
+                source_json.push_str(biome);
+            }
+        }
         let climate = router.climate_sampler();
         let mut noises = BTreeMap::new();
         for (name, json) in &data.noises {
@@ -1233,10 +736,10 @@ where
             noises,
             extensions,
             picker,
-            biome_cache: Mutex::new(BiomeChunks::default()),
-            lattice_cache: Mutex::new(HashMap::new()),
+            biome_cache: BiomeCache::new(),
+            lattice_cache: LatticeCache::new(),
             biome_work: ChunkWork::new(),
-            carver_cache: Mutex::new(HashMap::new()),
+            carver_cache: CarverCache::new(),
             decoration: None,
             structures: None,
             manual_structures: std::sync::OnceLock::new(),
@@ -1245,7 +748,7 @@ where
             debug_density,
             spawn_position: std::sync::OnceLock::new(),
             flat: None,
-            dimension: "minecraft:overworld".to_owned(),
+            mod_terrain: None,
         };
         pipeline.decoration = pipeline
             .data
@@ -1279,11 +782,6 @@ where
             }
         }
         Ok(pipeline)
-    }
-    /// The pipeline of the dimension `dimension` (the Overworld by default).
-    fn in_dimension(mut self, dimension: &str) -> Self {
-        dimension.clone_into(&mut self.dimension);
-        self
     }
     /// `NoiseBasedChunkGenerator.getOrigin`'s spawn column: the
     /// NoiseSpawnFinder position, or 0 0 when the noise settings have no
@@ -1373,8 +871,8 @@ where
         pos: ChunkPos,
         wait: bool,
     ) -> Result<Option<Arc<BiomeChunk<BiomeId>>>, GeneratorError> {
-        if let Some(chunk) = self.biome_cache.lock().unwrap().get(&(pos.x, pos.z)) {
-            return Ok(Some(chunk.clone()));
+        if let Some(chunk) = self.biome_cache.get(&(pos.x, pos.z)) {
+            return Ok(Some(chunk));
         }
         // An old chunk keeps the biomes it was saved with.
         if let Some(old) = self
@@ -1394,8 +892,8 @@ where
                 Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
             }
         };
-        if let Some(chunk) = self.biome_cache.lock().unwrap().get(&(pos.x, pos.z)) {
-            return Ok(Some(chunk.clone()));
+        if let Some(chunk) = self.biome_cache.get(&(pos.x, pos.z)) {
+            return Ok(Some(chunk));
         }
         let (min, height) = (self.settings.level_min_y, self.settings.level_height);
         let mut chunk = BiomeChunk::new(pos, min, height, BiomeId(0)).map_err(stage("biomes"))?;
@@ -1404,8 +902,9 @@ where
             self.router.get(RouterField::Erosion).as_ref(),
         );
         let context = &mut worker.biome_context;
+        let climate_buffers = &mut worker.climate_buffers;
         context.capture_lattice();
-        let volume = resolver.prepare_volume(
+        let volume = resolver.prepare_volume_with_buffers(
             context,
             [
                 pos.x.wrapping_shl(4) >> 2,
@@ -1413,45 +912,43 @@ where
                 pos.z.wrapping_shl(4) >> 2,
             ],
             [4, height >> 2, 4],
+            climate_buffers,
         );
         let lattice = context.take_lattice_capture();
         let volume = volume.map_err(stage("biomes"))?;
         if !lattice.is_empty() {
-            let mut cache = self.lattice_cache.lock().unwrap();
-            if cache.len() >= LATTICE_CACHE_LIMIT {
-                cache.clear();
-            }
-            cache.insert((pos.x, pos.z), Arc::new(lattice));
+            self.lattice_cache.insert((pos.x, pos.z), Arc::new(lattice));
         }
         let ids = &self.data.biome_ids;
         let blender = self.blender_at(pos);
         // Names point into the source's parameter list: neighbouring quarts
         // mostly resolve to the same entry, so skip the map lookup for it.
         let mut last: Option<(*const str, BiomeId)> = None;
-        chunk
-            .fill(min, min + height - 1, |quart| -> Result<BiomeId, String> {
-                // `Blender.getBiomeResolver`: an old chunk's biome near it.
-                if !blender.is_empty()
-                    && let Some(old) = blender.blend_biome(quart[0], quart[1], quart[2])
-                {
-                    return Ok(old);
-                }
-                let name = resolver
-                    .sample_prepared(context, volume.as_ref(), quart)
-                    .map_err(|e| e.to_string())?;
-                if let Some((pointer, id)) = last
-                    && std::ptr::eq(pointer, name)
-                {
-                    return Ok(id);
-                }
-                let id = ids.get(name).copied().ok_or_else(|| name.to_owned())?;
-                last = Some((name as *const str, id));
-                Ok(id)
-            })
-            .map_err(stage("biomes"))?;
+        let fill_result = chunk.fill(min, min + height - 1, |quart| -> Result<BiomeId, String> {
+            // `Blender.getBiomeResolver`: an old chunk's biome near it.
+            if !blender.is_empty()
+                && let Some(old) = blender.blend_biome(quart[0], quart[1], quart[2])
+            {
+                return Ok(old);
+            }
+            let name = resolver
+                .sample_prepared(context, volume.as_ref(), quart)
+                .map_err(|e| e.to_string())?;
+            if let Some((pointer, id)) = last
+                && std::ptr::eq(pointer, name)
+            {
+                return Ok(id);
+            }
+            let id = ids.get(name).copied().ok_or_else(|| name.to_owned())?;
+            last = Some((name as *const str, id));
+            Ok(id)
+        });
+        if let Some(volume) = volume {
+            volume.recycle(climate_buffers);
+        }
+        fill_result.map_err(stage("biomes"))?;
         let chunk = Arc::new(chunk);
-        let mut cache = self.biome_cache.lock().unwrap();
-        cache.insert((pos.x, pos.z), chunk.clone());
+        self.biome_cache.insert((pos.x, pos.z), chunk.clone());
         Ok(Some(chunk))
     }
     fn carver_biome(&self, worker: &mut WorkerState, origin: ChunkPos) -> Result<BiomeId, String> {
@@ -1462,9 +959,9 @@ where
         if worker.carver_biomes.len() >= 4096 {
             worker.carver_biomes.clear();
         }
-        if let Some(id) = self.carver_cache.lock().unwrap().get(&key) {
-            worker.carver_biomes.insert(key, *id);
-            return Ok(*id);
+        if let Some(id) = self.carver_cache.get(&key) {
+            worker.carver_biomes.insert(key, id);
+            return Ok(id);
         }
         let mut resolver = self.source.resolver(
             &self.climate,
@@ -1479,11 +976,7 @@ where
             .sample(&mut worker.carver_context, quart)
             .map_err(|e| e.to_string())?;
         let id = self.data.biome_id(name).ok_or_else(|| name.to_owned())?;
-        let mut cache = self.carver_cache.lock().unwrap();
-        if cache.len() >= CARVER_CACHE_LIMIT {
-            cache.clear();
-        }
-        cache.insert(key, id);
+        self.carver_cache.insert(key, id);
         worker.carver_biomes.insert(key, id);
         Ok(id)
     }
@@ -1505,7 +998,9 @@ where
     /// with the state it already has. Check their imported material flags too.
     /// Noise filling already built the WG maps; these writes add no fluid marks.
     fn identity_end_surface(&self, pos: ChunkPos) -> bool {
-        if !matches!(self.source, ResolvedBiomeSource::End(_))
+        // A mod's terrain is not the noise's default block.
+        if self.mod_terrain.is_some()
+            || !matches!(self.source, ResolvedBiomeSource::End(_))
             // At wrapped block coordinates the ordinary biome-region lookup
             // can fail; retain that lookup and its error outside this range.
             || ![pos.x, pos.z].into_iter().all(|c| {
@@ -1552,7 +1047,6 @@ where
             self.settings.sea_level,
         );
         let mut clock = std::time::Instant::now();
-        let mut neighbors = Vec::with_capacity(9);
         // The biome ids present, as a bitset: ascending like a sorted set. The
         // registry's ordinary ids fit in the stack array; retain a spill only
         // for unusually large modded registries.
@@ -1566,54 +1060,45 @@ where
         for (i, slot) in ready.iter_mut().enumerate() {
             *slot = self.biome_chunk_or_busy(worker, around(i as i32), false)?;
         }
+        let mut neighbors_opt: [Option<Arc<BiomeChunk<BiomeId>>>; 9] = Default::default();
         for (i, slot) in ready.iter_mut().enumerate() {
             let chunk = match slot.take() {
                 Some(chunk) => chunk,
                 None => self.biome_chunk(worker, around(i as i32))?,
             };
-            {
-                let mut section = 0;
-                let mut last = None;
-                while let Some(biomes) = chunk.section(section) {
-                    for &id in biomes {
-                        if last == Some(id) {
-                            continue;
-                        }
-                        last = Some(id);
-                        let word = id.0 as usize / 64;
-                        if let Some(bits) = seen.get_mut(word) {
-                            *bits |= 1 << (id.0 % 64);
-                        } else {
-                            let spill_word = word - seen.len();
-                            if seen_spill.len() <= spill_word {
-                                seen_spill.resize(spill_word + 1, 0);
-                            }
-                            seen_spill[spill_word] |= 1 << (id.0 % 64);
-                        }
+            let mut section = 0;
+            let mut last = None;
+            while let Some(biomes) = chunk.section(section) {
+                for &id in biomes {
+                    if last == Some(id) {
+                        continue;
                     }
-                    section += 1;
+                    last = Some(id);
+                    let word = id.0 as usize / 64;
+                    if let Some(bits) = seen.get_mut(word) {
+                        *bits |= 1 << (id.0 % 64);
+                    } else {
+                        let spill_word = word - seen.len();
+                        if seen_spill.len() <= spill_word {
+                            seen_spill.resize(spill_word + 1, 0);
+                        }
+                        seen_spill[spill_word] |= 1 << (id.0 % 64);
+                    }
                 }
-                neighbors.push((*chunk).clone());
+                section += 1;
             }
+            neighbors_opt[i] = Some(chunk);
         }
-        let possible =
-            seen.iter()
-                .chain(seen_spill.iter())
-                .enumerate()
-                .flat_map(|(word, &bits)| {
-                    let mut bits = bits;
-                    std::iter::from_fn(move || {
-                        (bits != 0).then(|| {
-                            let bit = bits.trailing_zeros();
-                            bits &= bits - 1;
-                            BiomeId(word as u32 * 64 + bit)
-                        })
-                    })
-                });
-        let mut center = neighbors[4].clone();
-        let biomes =
-            BiomeRegion::new(neighbors, obfuscate_seed(self.seed)).map_err(stage("biomes"))?;
-        let possible = possible.map(|id| data.biome_name(id).to_owned()).collect();
+        let possible_ids_spill: Vec<u64>;
+        let possible_ids: &[u64] = if seen_spill.is_empty() {
+            &seen
+        } else {
+            possible_ids_spill = seen.iter().copied().chain(seen_spill).collect();
+            &possible_ids_spill
+        };
+        let neighbors = neighbors_opt.map(Option::unwrap);
+        let center = Arc::clone(&neighbors[4]);
+        let biomes = SurfaceBiomeRegion::new(pos, neighbors, self.zoom).map_err(stage("biomes"))?;
         worker.timings.biomes += lap(&mut clock);
         let mut chunk = TerrainChunk::new(
             pos,
@@ -1624,7 +1109,7 @@ where
         )
         .map_err(stage("noise"))?;
         chunk.set_generation_stage(PreLightChunkStage::Biomes);
-        let (mut references, mut own_starts) = match &self.structures {
+        let (references, own_starts) = match &self.structures {
             Some(structures) => {
                 let mut queries = StructureQueries {
                     pipeline: self,
@@ -1638,41 +1123,8 @@ where
             }
             None => (Vec::new(), Starts::default()),
         };
-        // A native mod may build the chunk's terrain itself.
-        let mut generate = NativeGenerate::Vanilla;
-        native_chunk_generate(
-            &self.dimension,
-            [pos.x, pos.z],
-            self.seed,
-            self.flat.is_some(),
-            &mut NativeProtoChunk {
-                terrain: &mut chunk,
-                biomes: &mut center,
-                data,
-                references: &mut references,
-                own_starts: &mut own_starts,
-            },
-            &mut generate,
-        );
-        let (native, run_surface, run_carvers, features) = match generate {
-            NativeGenerate::Vanilla => (false, true, true, true),
-            NativeGenerate::Replaced {
-                surface,
-                carvers,
-                structures,
-                decorations,
-            } => {
-                if !structures {
-                    references.clear();
-                    own_starts = Starts::default();
-                }
-                (true, surface, carvers, decorations)
-            }
-        };
         // `FlatLevelSource.buildTerrain`: the layers, and nothing else (no noise, surface or carvers).
-        if let Some(flat) = &self.flat
-            && !native
-        {
+        if let Some(flat) = &self.flat {
             for (i, &state) in flat.states.iter().enumerate() {
                 let y = flat.min_y + i as i32;
                 if y >= self.settings.level_min_y + self.settings.level_height {
@@ -1714,7 +1166,7 @@ where
                 structure_starts: references,
                 own_starts,
                 entities: Vec::new(),
-                features,
+                saved_root: Default::default(),
                 full: false,
             });
         }
@@ -1777,37 +1229,31 @@ where
             )),
         };
         worker.timings.noise += lap(&mut clock);
-        if native {
-            // The mod's blocks stand where the noise's would: the surface rule
-            // reads the heightmaps noise filling builds.
-            chunk
-                .prime_heightmaps(&[HeightmapType::OceanFloorWg, HeightmapType::WorldSurfaceWg])
-                .map_err(stage("heightmaps"))?;
-        } else {
-            // The density cells this fill needs are mostly in the climate volumes
-            // of this chunk and its +X/+Z neighbours, sampled for their biomes.
-            let lattice = {
-                let cache = self.lattice_cache.lock().unwrap();
-                [(0, 0), (1, 0), (0, 1), (1, 1)]
-                    .into_iter()
-                    .filter_map(|(dx, dz)| {
-                        cache.get(&(pos.x.wrapping_add(dx), pos.z.wrapping_add(dz)))
-                    })
-                    .flat_map(|samples| samples.iter().cloned())
-                    .collect()
-            };
-            context.set_lattice(lattice);
-            let filled = fill_noise(
+        // The density cells this fill needs are mostly in the climate volumes
+        // of this chunk and its +X/+Z neighbours, sampled for their biomes.
+        let mut lattice = Vec::new();
+        for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            if let Some(samples) = self
+                .lattice_cache
+                .get(&(pos.x.wrapping_add(dx), pos.z.wrapping_add(dz)))
+            {
+                lattice.extend(samples.iter().cloned());
+            }
+        }
+        context.set_lattice(lattice);
+        let filled = match &self.mod_terrain {
+            Some(terrain) => terrain.fill(&mut chunk, data.registry, self.seed, [min, height]),
+            None => fill_noise(
                 &mut chunk,
                 volume,
                 self.router.get(RouterField::FinalDensity).as_ref(),
                 context,
                 aquifer.as_mut(),
                 self.settings.default_block,
-            );
-            context.clear_lattice();
-            filled.map_err(stage("noise"))?;
-        }
+            ),
+        };
+        context.clear_lattice();
+        filled.map_err(stage("noise"))?;
         let generation = self.generation();
         worker.timings.noise += lap(&mut clock);
         // The surface rule, compiled by this worker's first chunk.
@@ -1816,7 +1262,11 @@ where
             .take()
             .and_then(|cache| cache.downcast::<CompiledSurfaceRule<R>>().ok())
             .map(|cache| *cache);
-        if run_surface && !self.identity_end_surface(pos) {
+        let stages = self.mod_terrain.as_ref().map(|terrain| terrain.stages);
+        if stages.is_none_or(|stages| stages.surface) && !self.identity_end_surface(pos) {
+            worker
+                .uniform_biomes
+                .reset(pos, self.settings.level_min_y, self.settings.level_height);
             build_surface_shared(
                 &mut chunk,
                 &self.rule,
@@ -1829,12 +1279,8 @@ where
                         pipeline: self,
                         temperatures: &mut worker.temperatures,
                         biome: Biomes::Region(&biomes),
-                        uniform_biomes: Some(UniformSurfaceBiomes::new(
-                            pos,
-                            self.settings.level_min_y,
-                            self.settings.level_height,
-                        )),
-                        possible: Some(possible),
+                        uniform_biomes: Some(&mut worker.uniform_biomes),
+                        possible_ids: Some(possible_ids),
                     },
                     preliminary_surface: self.preliminary.clone(),
                     density_context: context,
@@ -1846,44 +1292,46 @@ where
             .map_err(stage("surface"))?;
         }
         worker.timings.surface += lap(&mut clock);
-        if run_carvers {
-            let carvers = &data.biome_carvers;
-            let mask = generate_carving_mask(self.seed, pos, generation, false, |origin| {
-                self.carver_biome(worker, origin)
-                    .map(|id| carvers[id.0 as usize].as_slice())
-            })
-            .map_err(stage("carvers"))?;
-            worker.timings.carvers += lap(&mut clock);
-            if !mask.is_empty() {
-                let mut resolver = self.source.resolver(
-                    &self.climate,
-                    self.router.get(RouterField::Erosion).as_ref(),
-                );
-                let mut biome_context = SamplerContext::default();
-                apply_carving_mask_shared(
-                    &mut chunk,
-                    &mask,
-                    &self.rule,
-                    &mut shared,
-                    TopMaterialInputs::<R, _> {
-                        generation,
-                        root: self.root.clone(),
-                        surface: SurfaceQueries {
-                            pipeline: self,
-                            temperatures: &mut worker.temperatures,
-                            biome: Biomes::Resolver(&mut resolver, &mut biome_context),
-                            uniform_biomes: None,
-                            possible: None,
-                        },
-                        preliminary_surface: self.preliminary.clone(),
-                        density_context: context,
-                    },
-                    aquifer.as_mut(),
-                    &data.carving_blocks,
-                    |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
-                )
-                .map_err(stage("carvers"))?;
+        let carvers = &data.biome_carvers;
+        let carves = stages.is_none_or(|stages| stages.carvers);
+        let mask = generate_carving_mask(self.seed, pos, generation, false, |origin| {
+            if !carves {
+                return Ok(&[][..]);
             }
+            self.carver_biome(worker, origin)
+                .map(|id| carvers[id.0 as usize].as_slice())
+        })
+        .map_err(stage("carvers"))?;
+        worker.timings.carvers += lap(&mut clock);
+        if !mask.is_empty() {
+            let mut resolver = self.source.resolver(
+                &self.climate,
+                self.router.get(RouterField::Erosion).as_ref(),
+            );
+            let mut biome_context = SamplerContext::default();
+            apply_carving_mask_shared(
+                &mut chunk,
+                &mask,
+                &self.rule,
+                &mut shared,
+                TopMaterialInputs::<R, _> {
+                    generation,
+                    root: self.root.clone(),
+                    surface: SurfaceQueries {
+                        pipeline: self,
+                        temperatures: &mut worker.temperatures,
+                        biome: Biomes::Resolver(&mut resolver, &mut biome_context),
+                        uniform_biomes: None,
+                        possible_ids: None,
+                    },
+                    preliminary_surface: self.preliminary.clone(),
+                    density_context: context,
+                },
+                aquifer.as_mut(),
+                &data.carving_blocks,
+                |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
+            )
+            .map_err(stage("carvers"))?;
         }
         worker.surface_rule = shared.map(|rule| Box::new(rule) as Box<dyn Any + Send>);
         worker.timings.carvers += lap(&mut clock);
@@ -1906,7 +1354,7 @@ where
             structure_starts: references,
             own_starts,
             entities: Vec::new(),
-            features,
+            saved_root: Default::default(),
             full: false,
         })
     }
@@ -1938,10 +1386,10 @@ where
     }
     /// ChunkGenerator.getBaseHeight: the first free Y above the noise column
     /// (with aquifers, without terrain adaptation) for a heightmap type.
-    fn base_height(&self, x: i32, z: i32, kind: HeightmapType) -> i32 {
+    fn base_height(&self, worker: &mut WorkerState, x: i32, z: i32, kind: HeightmapType) -> i32 {
         let (min, _) = self.column_range();
         let mut found = min;
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(worker, x, z, &mut |y, state| {
             if kind.is_opaque(self.data.states.get(state)) {
                 found = y + 1;
                 return true;
@@ -1952,17 +1400,32 @@ where
     }
     /// ChunkGenerator.getBaseColumn: opacity of each noise-column state for
     /// a heightmap type, indexed from the minimum Y.
-    fn base_column(&self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.base_columns(x, z, &[kind]).pop().unwrap_or_default()
+    fn base_column(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        kind: HeightmapType,
+    ) -> Vec<bool> {
+        self.base_columns_by(worker, x, z, 1, &|_| kind)
+            .pop()
+            .unwrap_or_default()
     }
     /// One noise-column pass, as opacities for each heightmap kind.
-    fn base_columns(&self, x: i32, z: i32, kinds: &[HeightmapType]) -> Vec<Vec<bool>> {
+    fn base_columns_by(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        count: usize,
+        kind: &dyn Fn(usize) -> HeightmapType,
+    ) -> Vec<Vec<bool>> {
         let (min, height) = self.column_range();
-        let mut columns = vec![vec![false; height as usize]; kinds.len()];
-        self.noise_column(x, z, &mut |y, state| {
+        let mut columns = vec![vec![false; height as usize]; count];
+        self.noise_column(worker, x, z, &mut |y, state| {
             let state = self.data.states.get(state);
-            for (column, kind) in columns.iter_mut().zip(kinds) {
-                column[(y - min) as usize] = kind.is_opaque(state);
+            for (index, column) in columns.iter_mut().enumerate() {
+                column[(y - min) as usize] = kind(index).is_opaque(state);
             }
             false
         });
@@ -1971,14 +1434,20 @@ where
     /// ChunkGenerator.getBaseColumn's blocks, by what structures test
     /// (BlockState.isSolid is blocksMotion for the noise's blocks, which
     /// are never cobwebs or bamboo saplings).
-    fn noise_blocks(&self, x: i32, z: i32) -> super::structure::start::NoiseColumn {
-        use super::structure::start::{NoiseBlock, NoiseColumn};
+    fn noise_blocks_into(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        column: &mut dyn super::structure::start::NoiseColumnTarget,
+    ) {
+        use super::structure::start::NoiseBlock;
         let (min, height) = self.column_range();
-        let mut blocks = vec![NoiseBlock::Air; height as usize];
+        column.resize(min, height as usize);
         let registry = self.data.registry;
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(worker, x, z, &mut |y, state| {
             let props = self.data.states.get(state);
-            blocks[(y - min) as usize] = if props.is_air() {
+            let block = if props.is_air() {
                 NoiseBlock::Air
             } else {
                 match registry.state(state).map(|s| s.name.as_str()) {
@@ -1988,12 +1457,18 @@ where
                     _ => NoiseBlock::Other,
                 }
             };
+            column.set((y - min) as usize, block);
             false
         });
-        NoiseColumn { min, blocks }
     }
     /// iterateNoiseColumn from the top down until `visit` returns true.
-    fn noise_column(&self, x: i32, z: i32, visit: &mut dyn FnMut(i32, BlockStateId) -> bool) {
+    fn noise_column(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        visit: &mut dyn FnMut(i32, BlockStateId) -> bool,
+    ) {
         // `FlatLevelSource.getBaseHeight` and `getBaseColumn`: the layers, and air above them.
         if let Some(flat) = &self.flat {
             let air = self.data.registry.default_state("minecraft:air");
@@ -2017,7 +1492,8 @@ where
         let Ok(volume) = DensityVolume::new([1, height, 1], [x, min, z], [1; 3]) else {
             return;
         };
-        let mut context = SamplerContext::cached();
+        let context = &mut worker.column_context;
+        context.reset();
         let mut aquifer: Box<dyn TerrainAquifer> = match &self.aquifer {
             Some(samplers) => match RegistryAquiferBlockStates::new(self.data.registry)
                 .ok()
@@ -2030,41 +1506,42 @@ where
                             .fork_positional(),
                         blocks,
                         volume,
-                        &mut context,
+                        context,
                     )
                     .ok()
                 }) {
                 Some(aquifer) => Box::new(aquifer),
-                None => return,
+                None => {
+                    context.reset();
+                    return;
+                }
             },
             None => Box::new(DisabledAquifer::new(
                 self.picker,
                 self.data.registry.default_state("minecraft:air").unwrap(),
             )),
         };
-        let mut density = vec![0.; height as usize];
+        let density = &mut worker.column_density;
+        density.clear();
+        density.resize(height as usize, 0.0);
         if self
             .router
             .get(RouterField::FinalDensity)
-            .sample_volume(&mut context, &mut density, volume)
-            .is_err()
+            .sample_volume(context, density, volume)
+            .is_ok()
         {
-            return;
-        }
-        for y in (0..height).rev() {
-            let state = aquifer
-                .compute_substance(
-                    &mut context,
-                    [x, min + y, z],
-                    f64::from(density[y as usize]),
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(self.settings.default_block);
-            if visit(min + y, state) {
-                return;
+            for y in (0..height).rev() {
+                let state = aquifer
+                    .compute_substance(context, [x, min + y, z], f64::from(density[y as usize]))
+                    .ok()
+                    .flatten()
+                    .unwrap_or(self.settings.default_block);
+                if visit(min + y, state) {
+                    break;
+                }
             }
         }
+        context.reset();
     }
 }
 /// Biome and height queries for structure generation on one worker.
@@ -2088,7 +1565,7 @@ where
         if let Some(h) = self.worker.heights.get(&(x, z, kind as u8)) {
             return *h;
         }
-        let h = self.pipeline.base_height(x, z, kind);
+        let h = self.pipeline.base_height(self.worker, x, z, kind);
         if self.worker.heights.len() > 65536 {
             self.worker.heights.clear();
         }
@@ -2112,18 +1589,28 @@ where
             pipeline.router.get(RouterField::Erosion).as_ref(),
         );
         let context = &mut self.worker.biome_context;
+        let climate_buffers = &mut self.worker.climate_buffers;
         let volume = resolver
-            .prepare_volume(context, [qx, qmin, qz], [1, qmax - qmin + 1, 1])
+            .prepare_volume_with_buffers(
+                context,
+                [qx, qmin, qz],
+                [1, qmax - qmin + 1, 1],
+                climate_buffers,
+            )
             .ok()
             .flatten();
-        (qmin..=qmax).any(|qy| {
+        let found = (qmin..=qmax).any(|qy| {
             let id = resolver
                 .sample_prepared(context, volume.as_ref(), [qx, qy, qz])
                 .ok()
                 .and_then(|name| pipeline.data.biome_id(name))
                 .unwrap_or(BiomeId(0));
             self.valid.contains(&id)
-        })
+        });
+        if let Some(volume) = volume {
+            volume.recycle(climate_buffers);
+        }
+        found
     }
 }
 impl<R: RandomSource + 'static> super::structure::start::StartContext for StructureQueries<'_, R>
@@ -2157,13 +1644,25 @@ where
         }
     }
     fn base_column(&mut self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.pipeline.base_column(x, z, kind)
+        self.pipeline.base_column(self.worker, x, z, kind)
     }
-    fn base_columns(&mut self, x: i32, z: i32, kinds: &[HeightmapType]) -> Vec<Vec<bool>> {
-        self.pipeline.base_columns(x, z, kinds)
+    fn base_columns_by(
+        &mut self,
+        x: i32,
+        z: i32,
+        count: usize,
+        kind: &dyn Fn(usize) -> HeightmapType,
+    ) -> Vec<Vec<bool>> {
+        self.pipeline
+            .base_columns_by(self.worker, x, z, count, kind)
     }
-    fn noise_column(&mut self, x: i32, z: i32) -> super::structure::start::NoiseColumn {
-        self.pipeline.noise_blocks(x, z)
+    fn noise_column_into(
+        &mut self,
+        x: i32,
+        z: i32,
+        column: &mut dyn super::structure::start::NoiseColumnTarget,
+    ) {
+        self.pipeline.noise_blocks_into(self.worker, x, z, column)
     }
     fn cold_enough_to_snow(&mut self, biome: BiomeId, pos: [i32; 3]) -> bool {
         let sea = self.pipeline.settings.sea_level;
@@ -2213,7 +1712,7 @@ where
 }
 
 enum Biomes<'a, 'b> {
-    Region(&'a BiomeRegion<BiomeId>),
+    Region(&'a SurfaceBiomeRegion),
     Resolver(
         &'a mut super::biome_source::BiomeSourceResolver<'b>,
         &'a mut SamplerContext,
@@ -2229,7 +1728,7 @@ enum Biomes<'a, 'b> {
 }
 /// Resolved biomes by quart (`Biomes::Memo`).
 struct BiomeMemo {
-    biomes: HashMap<[i32; 3], BiomeId>,
+    biomes: FxHashMap<[i32; 3], BiomeId>,
     /// Quarts per side of the columns sharing one biome, the first one asked
     /// (its surface's); 0 for one per quart. Far cells wider than a quart
     /// don't show a biome change a few blocks down, and climate changes over
@@ -2281,6 +1780,30 @@ struct MixedCell {
     jitter: [[f64; 3]; 8],
     biomes: [BiomeId; 8],
 }
+trait BiomeGrid {
+    fn noise_biome_opt(&self, quart: [i32; 3]) -> Option<BiomeId>;
+    fn zoom(&self) -> BiomeZoom;
+}
+impl BiomeGrid for SurfaceBiomeRegion {
+    #[inline]
+    fn noise_biome_opt(&self, quart: [i32; 3]) -> Option<BiomeId> {
+        self.noise_biome(quart)
+    }
+    #[inline]
+    fn zoom(&self) -> BiomeZoom {
+        SurfaceBiomeRegion::zoom(self)
+    }
+}
+#[cfg(test)]
+impl BiomeGrid for super::biome_chunk::BiomeRegion<BiomeId> {
+    fn noise_biome_opt(&self, quart: [i32; 3]) -> Option<BiomeId> {
+        self.noise_biome(quart).ok().copied()
+    }
+    fn zoom(&self) -> BiomeZoom {
+        super::biome_chunk::BiomeRegion::zoom(self)
+    }
+}
+
 struct UniformSurfaceBiomes {
     origin: [i32; 3],
     height: i32,
@@ -2290,22 +1813,37 @@ struct UniformSurfaceBiomes {
     last: ([i32; 3], SurfaceCell),
 }
 impl UniformSurfaceBiomes {
-    fn new(pos: ChunkPos, min_y: i32, height: i32) -> Self {
-        let height = (height >> 2) + 1;
+    fn empty() -> Self {
         Self {
-            origin: [
-                pos.x.wrapping_shl(4).wrapping_sub(2) >> 2,
-                min_y.wrapping_sub(2) >> 2,
-                pos.z.wrapping_shl(4).wrapping_sub(2) >> 2,
-            ],
-            height,
-            cells: vec![SurfaceCell::Unknown; 25 * height as usize],
+            origin: [0; 3],
+            height: 0,
+            cells: Vec::new(),
             mixed: Vec::new(),
             last: ([0; 3], SurfaceCell::Unknown),
         }
     }
+    #[cfg(test)]
+    fn new(pos: ChunkPos, min_y: i32, height: i32) -> Self {
+        let mut cache = Self::empty();
+        cache.reset(pos, min_y, height);
+        cache
+    }
+    fn reset(&mut self, pos: ChunkPos, min_y: i32, height: i32) {
+        let height = (height >> 2) + 1;
+        self.origin = [
+            pos.x.wrapping_shl(4).wrapping_sub(2) >> 2,
+            min_y.wrapping_sub(2) >> 2,
+            pos.z.wrapping_shl(4).wrapping_sub(2) >> 2,
+        ];
+        self.height = height;
+        let len = 25 * height as usize;
+        self.cells.clear();
+        self.cells.resize(len, SurfaceCell::Unknown);
+        self.mixed.clear();
+        self.last = ([0; 3], SurfaceCell::Unknown);
+    }
     #[inline]
-    fn get(&mut self, region: &BiomeRegion<BiomeId>, p: BlockPos) -> Option<BiomeId> {
+    fn get(&mut self, region: &impl BiomeGrid, p: BlockPos) -> Option<BiomeId> {
         let base = [p.x, p.y, p.z].map(|v| v.wrapping_sub(2) >> 2);
         let cell = if self.last.0 == base && self.last.1 != SurfaceCell::Unknown {
             self.last.1
@@ -2323,7 +1861,7 @@ impl UniformSurfaceBiomes {
             SurfaceCell::Unknown | SurfaceCell::Lookup => None,
         }
     }
-    fn cell(&mut self, region: &BiomeRegion<BiomeId>, base: [i32; 3]) -> SurfaceCell {
+    fn cell(&mut self, region: &impl BiomeGrid, base: [i32; 3]) -> SurfaceCell {
         let d: [i32; 3] = std::array::from_fn(|i| base[i].wrapping_sub(self.origin[i]));
         if !(0..5).contains(&d[0]) || !(0..self.height).contains(&d[1]) || !(0..5).contains(&d[2]) {
             return SurfaceCell::Lookup;
@@ -2336,11 +1874,11 @@ impl UniformSurfaceBiomes {
         let mut biomes = [BiomeId(0); 8];
         for (corner, biome) in biomes.iter_mut().enumerate() {
             let offsets = [(corner >> 2) & 1, (corner >> 1) & 1, corner & 1];
-            match region.noise_biome(std::array::from_fn(|i| {
+            match region.noise_biome_opt(std::array::from_fn(|i| {
                 base[i].wrapping_add(offsets[i] as i32)
             })) {
-                Ok(id) => *biome = *id,
-                Err(_) => {
+                Some(id) => *biome = id,
+                None => {
                     *slot = SurfaceCell::Lookup;
                     return SurfaceCell::Lookup;
                 }
@@ -2365,8 +1903,8 @@ struct SurfaceQueries<'a, 'b, R: RandomSource> {
     pipeline: &'a Pipeline<R>,
     temperatures: &'a mut [BiomeTemperature],
     biome: Biomes<'a, 'b>,
-    possible: Option<BTreeSet<String>>,
-    uniform_biomes: Option<UniformSurfaceBiomes>,
+    possible_ids: Option<&'a [u64]>,
+    uniform_biomes: Option<&'a mut UniformSurfaceBiomes>,
 }
 impl<R: RandomSource> SurfaceQueries<'_, '_, R> {
     fn temperature(&mut self, name: &str) -> Result<&mut BiomeTemperature, MaterialRuleError> {
@@ -2399,7 +1937,27 @@ impl<R: RandomSource> MaterialSurfaceQueries for SurfaceQueries<'_, '_, R> {
             .ok_or(DecodeError::Field("unknown material noise"))
     }
     fn possible_biomes(&self) -> Option<BTreeSet<String>> {
-        self.possible.clone()
+        self.possible_ids.map(|ids| {
+            ids.iter()
+                .enumerate()
+                .flat_map(|(word, &bits)| {
+                    let mut bits = bits;
+                    std::iter::from_fn(move || {
+                        (bits != 0).then(|| {
+                            let bit = bits.trailing_zeros();
+                            bits &= bits - 1;
+                            self.pipeline
+                                .data
+                                .biome_name(BiomeId(word as u32 * 64 + bit))
+                                .to_owned()
+                        })
+                    })
+                })
+                .collect()
+        })
+    }
+    fn possible_biome_ids(&self) -> Option<&[u64]> {
+        self.possible_ids
     }
     fn biome(&mut self, p: BlockPos) -> Result<Option<Arc<str>>, MaterialRuleError> {
         Ok(self
@@ -2414,13 +1972,11 @@ impl<R: RandomSource> MaterialSurfaceQueries for SurfaceQueries<'_, '_, R> {
         let id = match &mut self.biome {
             Biomes::Region(region) => match self
                 .uniform_biomes
-                .as_mut()
-                .and_then(|cache| cache.get(region, p))
+                .as_deref_mut()
+                .and_then(|cache| cache.get(*region, p))
             {
                 Some(id) => id,
-                None => *region
-                    .biome(p)
-                    .map_err(|_| MaterialRuleError::MissingBiome)?,
+                None => region.biome(p).ok_or(MaterialRuleError::MissingBiome)?,
             },
             Biomes::Resolver(resolver, context) => {
                 let name = resolver
@@ -2484,21 +2040,32 @@ pub(super) struct WorkerState {
     terrain_context: SamplerContext,
     biome_context: SamplerContext,
     carver_context: SamplerContext,
+    column_context: SamplerContext,
+    column_density: Vec<f32>,
+    /// Reusable 6-field climate volume buffers.
+    climate_buffers: [Vec<f32>; 6],
     /// Seed/dimension-bound lookups avoid the shared mutex for overlapping
     /// carver neighborhoods. Bounded independently of the shared cache.
-    carver_biomes: HashMap<(i32, i32), BiomeId>,
+    carver_biomes: FxHashMap<(i32, i32), BiomeId>,
     /// Noise biomes asked one at a time by structure placement checks
     /// (`StartContext::noise_biome`): several structures test the same
     /// quarts, column checks whole columns, and each is a full climate sample.
-    structure_biomes: HashMap<[i32; 3], BiomeId>,
+    structure_biomes: FxHashMap<[i32; 3], BiomeId>,
     timings: StageTimings,
-    heights: HashMap<(i32, i32, u8), i32>,
+    heights: FxHashMap<(i32, i32, u8), i32>,
     /// Decorate with structure pieces only (for structure parity checks).
     pub(super) structures_only: bool,
     pub(super) structure_mobs: Option<Arc<dyn StructureMobs>>,
     /// The world's surface rule compiled once for this worker's chunks: a
     /// `CompiledSurfaceRule` of the pipeline's random.
     surface_rule: Option<Box<dyn Any + Send>>,
+    /// Reusable per-chunk uniform biome cell cache for the surface stage.
+    uniform_biomes: UniformSurfaceBiomes,
+    /// Empty stand-in chunks recycled across decorated chunks so decoration
+    /// does not allocate 9 throwaway `TerrainChunk`s per chunk.
+    pub(super) decor_standins: Vec<TerrainChunk<'static, GenBlockStates>>,
+    /// Uniform-biome section cache recycled across decorated chunks.
+    pub(super) decor_uniform_biomes: Vec<u32>,
 }
 /// `Mob.finalizeSpawn(level, difficulty, STRUCTURE, null)` of the entities a
 /// structure places with finalizeEntities, run by the game, which owns mobs.
@@ -2509,7 +2076,7 @@ pub trait StructureMobs: Send + Sync {
     /// keeps its `horizon:finalize` for the game to finish on load.
     fn finalize(
         &self,
-        nbt: &mut crate::nbt::Compound,
+        nbt: &mut horizon_core::nbt::Compound,
         biome: &str,
         structures: &[String],
         random: &mut dyn super::structure::legacy::PieceRandom,
@@ -2517,7 +2084,8 @@ pub trait StructureMobs: Send + Sync {
 }
 
 /// A start chunk's saved `structures.starts`, including pending writes.
-pub type SavedStructureStarts = dyn Fn(ChunkPos) -> Option<crate::nbt::Compound> + Send + Sync;
+pub type SavedStructureStarts =
+    dyn Fn(ChunkPos) -> Option<horizon_core::nbt::Compound> + Send + Sync;
 
 trait SeededPipeline: Send + Sync {
     fn set_saved_starts(&self, source: Arc<SavedStructureStarts>);
@@ -2532,8 +2100,6 @@ trait SeededPipeline: Send + Sync {
         region: &mut [ProtoChunk; 9],
     ) -> Result<DecorateStats, GeneratorError>;
     fn data(&self) -> &Arc<GeneratorData>;
-    /// The dimension, seed and superflat flag native generators are told.
-    fn native_context(&self) -> (&str, i64, bool);
     /// What the shared caches hold, for `horizon-ctl memory`.
     fn cache_census(&self) -> CacheCensus {
         CacheCensus::default()
@@ -2569,6 +2135,11 @@ trait SeededPipeline: Send + Sync {
         worker: &mut WorkerState,
         pos: ChunkPos,
     ) -> Vec<Arc<super::structure::start::StructureStart>>;
+    /// `structure_starts` from the cache alone: None when they aren't cached.
+    fn cached_structure_starts(
+        &self,
+        pos: ChunkPos,
+    ) -> Option<Vec<Arc<super::structure::start::StructureStart>>>;
     /// `Structure.generate` for one structure in one chunk (`/place
     /// structure`), outside any structure set's placement.
     fn structure_start(
@@ -2653,35 +2224,35 @@ where
                     self.structures.as_ref(),
                 )
             }
+            // A mod's level that asks for neither structures nor features has nothing to place.
+            None if self.mod_terrain.is_some() => {
+                region[4]
+                    .terrain
+                    .set_generation_stage(PreLightChunkStage::Features);
+                region[4].set_decorated();
+                Ok(DecorateStats::default())
+            }
             None => Err(resource("decoration resources were not loaded")),
         }
     }
     fn data(&self) -> &Arc<GeneratorData> {
         &self.data
     }
-    fn native_context(&self) -> (&str, i64, bool) {
-        (&self.dimension, self.seed, self.flat.is_some())
-    }
     fn release_caches(&self) {
-        // Taken out under the lock, dropped after it.
-        let biomes = std::mem::take(&mut *self.biome_cache.lock().unwrap());
-        let carvers = std::mem::take(&mut *self.carver_cache.lock().unwrap());
-        drop((biomes, carvers));
+        self.biome_cache.clear();
+        self.lattice_cache.clear();
+        self.carver_cache.clear();
     }
     fn cache_census(&self) -> CacheCensus {
-        let biomes = self.biome_cache.lock().unwrap();
+        let (biome_chunks, biome_bytes) = self.biome_cache.census();
         let (start_chunks, start_lists) = self
             .structures
             .as_ref()
             .map_or((0, 0), |s| s.start_census());
         CacheCensus {
-            biome_chunks: biomes.len(),
-            biome_bytes: biomes
-                .values()
-                .map(|b| std::mem::size_of::<BiomeChunk<BiomeId>>() + b.heap_bytes())
-                .sum::<usize>()
-                + biomes.capacity() * std::mem::size_of::<((i32, i32), usize)>(),
-            carver_entries: self.carver_cache.lock().unwrap().len(),
+            biome_chunks,
+            biome_bytes,
+            carver_entries: self.carver_cache.len(),
             start_chunks,
             start_lists,
         }
@@ -2726,6 +2297,17 @@ where
                 )
                 .to_vec(),
             None => Vec::new(),
+        }
+    }
+    fn cached_structure_starts(
+        &self,
+        pos: ChunkPos,
+    ) -> Option<Vec<Arc<super::structure::start::StructureStart>>> {
+        match &self.structures {
+            Some(structures) => structures
+                .cached_starts_at(pos)
+                .map(|starts| starts.to_vec()),
+            None => Some(Vec::new()),
         }
     }
     fn structure_start(
@@ -2931,7 +2513,7 @@ where
             }
             false
         };
-        self.noise_column(x, z, &mut visit);
+        self.noise_column(worker, x, z, &mut visit);
         let (height, state) = top?;
         // A superflat surface is its top layer, with its one biome.
         if self.flat.is_some() {
@@ -2965,7 +2547,7 @@ where
             temperatures: &mut worker.temperatures,
             biome: Biomes::Resolver(&mut resolver, &mut biome_context),
             uniform_biomes: None,
-            possible: None,
+            possible_ids: None,
         };
         let sources = MaterialDensitySources::new(
             queries,
@@ -3145,7 +2727,7 @@ where
         );
         let mut biome_context = SamplerContext::cached();
         let mut biome_memo = BiomeMemo {
-            biomes: HashMap::new(),
+            biomes: FxHashMap::default(),
             // Columns `width` blocks apart are width / 4 quarts apart; cells
             // stop at 64 blocks (wider ones moved a third of level 6's biomes).
             cell: if approximate && width >= 4 {
@@ -3238,7 +2820,7 @@ where
             temperatures: &mut worker.temperatures,
             biome: Biomes::Memo(&mut resolver, &mut biome_context, &mut biome_memo),
             uniform_biomes: None,
-            possible: None,
+            possible_ids: None,
         };
         let sources = MaterialDensitySources::new(
             queries,
@@ -3368,91 +2950,14 @@ where
     }
 }
 
-/// A `JigsawPlacement.generateJigsaw` request (`/place jigsaw`).
-pub struct JigsawQuery<'a> {
-    pub pool: &'a str,
-    pub target: &'a str,
-    pub max_depth: i32,
-    pub position: [i32; 3],
-}
-/// The assembled pieces of a jigsaw and the templates they place.
-pub struct JigsawPieces {
-    pub pieces: Vec<super::structure::jigsaw::PoolPiece>,
-    pub resources: Arc<super::structure::StructureResources>,
-}
-
-/// A `findClosestBiome3d` query.
-pub struct BiomeSearch<'a> {
-    pub allowed: &'a dyn Fn(&str) -> bool,
-    pub origin: [i32; 3],
-    pub radius: i32,
-    pub horizontal: i32,
-    pub vertical: i32,
-    /// `level.getMinY()` and `level.getMaxY()`.
-    pub min_y: i32,
-    pub max_y: i32,
-}
-
-/// `Mth.outFromOrigin(origin, lower, upper, step)`.
-pub fn out_from_origin(origin: i32, lower: i32, upper: i32, step: i32) -> Vec<i32> {
-    let center = origin.clamp(lower, upper);
-    let mut out = Vec::new();
-    let mut cursor = center;
-    loop {
-        let distance = (center - cursor).abs();
-        if !(center - distance >= lower || center + distance <= upper) {
-            return out;
-        }
-        out.push(cursor);
-        let negative = cursor <= center;
-        let can_move_positive = center + distance + step <= upper;
-        let mut next = center + distance + step;
-        if !negative || !can_move_positive {
-            let attempt = center - distance - if negative { step } else { 0 };
-            if attempt >= lower {
-                next = attempt;
-            }
-        }
-        cursor = next;
-    }
-}
-
-/// `BlockPos.spiralAround(ZERO, radius, EAST, SOUTH)` as (x, z) offsets.
-pub fn spiral_around(radius: i32) -> impl Iterator<Item = [i32; 2]> {
-    const DIRS: [[i32; 2]; 4] = [[1, 0], [0, 1], [-1, 0], [0, -1]];
-    let legs = 4 * radius;
-    let (mut leg, mut leg_size, mut leg_index) = (-1i32, 0i32, 0i32);
-    let mut last = [0, 1];
-    std::iter::from_fn(move || {
-        let d = DIRS[((leg + 4) % 4) as usize];
-        let cursor = [last[0] + d[0], last[1] + d[1]];
-        last = cursor;
-        if leg_index >= leg_size {
-            if leg >= legs {
-                return None;
-            }
-            leg += 1;
-            leg_index = 0;
-            leg_size = leg / 2 + 1;
-        }
-        leg_index += 1;
-        Some(cursor)
-    })
-}
-
-/// Counters from one FEATURES pass.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DecorateStats {
-    /// Placed-feature roots executed (including those that placed nothing).
-    pub placed: usize,
-    /// Roots skipped because their algorithm or bindings are not implemented.
-    pub unsupported: usize,
-    /// Roots that started but failed on an unavailable world query or error.
-    /// Their partial writes are kept, as each root reseeds its own random.
-    pub failed: usize,
-    /// Identifiers of skipped or failed roots, for diagnostics.
-    pub skipped: BTreeSet<String>,
-}
+mod flat;
+mod mod_terrain;
+mod queries;
+use flat::FlatLayers;
+pub use flat::FlatSettings;
+pub use queries::{
+    BiomeSearch, DecorateStats, JigsawPieces, JigsawQuery, out_from_origin, spiral_around,
+};
 
 /// A seed-bound generator for one dimension, shareable across worker threads.
 #[derive(Clone)]
@@ -3463,6 +2968,14 @@ pub struct OverworldGenerator {
     noise_clamped: Option<(NoiseSettings, NoiseSettings)>,
 }
 impl OverworldGenerator {
+    /// The structure starts a chunk owns when they are cached already, else None: no save is
+    /// read and nothing is built, for reads that may load no chunk.
+    pub fn cached_structure_starts(
+        &self,
+        pos: ChunkPos,
+    ) -> Option<Vec<Arc<super::structure::start::StructureStart>>> {
+        self.pipeline.cached_structure_starts(pos)
+    }
     /// Install before workers run, so every cache miss can consult the save before generation.
     pub fn set_saved_starts(&self, source: Arc<SavedStructureStarts>) {
         self.pipeline.set_saved_starts(source);
@@ -3501,111 +3014,6 @@ impl OverworldGenerator {
     ) -> Result<Self, GeneratorError> {
         Self::build(data, seed, preset, dimension, true)
     }
-    /// A superflat overworld (`FlatLevelSource`): the layers where the terrain would be, a
-    /// fixed biome, and the structure sets `structure_overrides` allows (every one when it
-    /// names none) generating on the flat ground, with or without structures.
-    pub fn flat(
-        data: Arc<GeneratorData>,
-        seed: i64,
-        flat: &FlatSettings,
-        structures: bool,
-    ) -> Result<Self, GeneratorError> {
-        let registry = data.registry;
-        let (level_min_y, level_height) = overrides::LevelHeight::of_type(
-            &Value::from("minecraft:overworld"),
-            &data.dimension_types,
-        )
-        .map_or((-64, 384), |h| (h.min_y, h.height));
-        // The overworld's own noise settings give the level its sea level and the rest of
-        // the generator its data; no noise is ever sampled.
-        let settings_json: Value = serde_json::from_str(
-            data.settings
-                .get("minecraft:overworld")
-                .ok_or_else(|| resource("missing noise settings minecraft:overworld"))?,
-        )?;
-        // `Biome.CODEC.lenientOptionalFieldOf("biome")`: an unknown biome is Plains.
-        let biome = if data.biome_id(&flat.biome).is_some() {
-            flat.biome.as_str()
-        } else {
-            "minecraft:plains"
-        };
-        let generator = serde_json::json!({
-            "type": "minecraft:noise",
-            "settings": "minecraft:overworld",
-            "biome_source": { "type": "minecraft:fixed", "biome": biome },
-            "structure_overrides": flat.structure_overrides,
-        });
-        let mut pipeline = Pipeline::new(
-            data.clone(),
-            seed,
-            XoroshiroRandom::new(seed),
-            &generator,
-            &settings_json,
-            structures,
-            Some((level_min_y, level_height)),
-        )?;
-        let mut states = Vec::new();
-        let mut null = Vec::new();
-        for (block, height) in &flat.layers {
-            let id = registry
-                .default_state(block)
-                .ok_or_else(|| resource(format!("missing block {block}")))?;
-            // `adjustGenerationSettings`: a layer that is not opaque to MOTION_BLOCKING is
-            // `null` in the layers `FlatLevelSource` reads.
-            let hole = !HeightmapType::MotionBlocking.is_opaque(data.states.get(id));
-            for _ in 0..(*height).max(0) {
-                states.push(id);
-                null.push(hole);
-            }
-        }
-        // `updateLayers`: `voidGen` when every layer is air (no layers at all, too).
-        let air = registry.default_state("minecraft:air");
-        let void_gen = states.iter().all(|&id| Some(id) == air);
-        states.truncate(level_height.max(0) as usize);
-        null.truncate(states.len());
-        // `FlatLevelSource.getSeaLevel`; its minimum Y and depth are in `generation`.
-        pipeline.settings.sea_level = -63;
-        let top_layers: Vec<(i32, BlockStateId)> = null
-            .iter()
-            .zip(&states)
-            .enumerate()
-            .filter(|(_, (hole, _))| **hole)
-            .map(|(i, (_, &state))| (level_min_y + i as i32, state))
-            .collect();
-        pipeline.flat = Some(FlatLayers {
-            min_y: level_min_y,
-            states,
-            null,
-        });
-        // `FlatLevelSource` decorates with `adjustGenerationSettings` of the biome.
-        let adjust = super::generator_decoration::FlatDecoration::new(
-            flat.features,
-            flat.lakes,
-            void_gen,
-            biome == "minecraft:the_void",
-        );
-        pipeline.decoration = super::generator_decoration::Decoration::new_with(
-            &data,
-            &pipeline.source,
-            Some(adjust),
-        )?
-        .map(|mut decoration| {
-            decoration.top_layers = top_layers;
-            Arc::new(decoration)
-        });
-        if let (Some(state), Some(only)) = (pipeline.structures.as_mut(), &flat.structure_overrides)
-        {
-            state.restrict_to(only);
-        }
-        // `ChunkGeneratorStructureState.createForFlat`: the stronghold rings use seed 0.
-        if let Some(state) = pipeline.structures.as_mut() {
-            state.ring_seed = Some(0);
-        }
-        Ok(Self {
-            pipeline: Arc::new(pipeline),
-            noise_clamped: None,
-        })
-    }
     /// A dimension of a world preset, with or without structures (the
     /// world's `generate_structures`: without, no starts, terrain adaptation,
     /// structure pieces or structure locating).
@@ -3625,10 +3033,11 @@ impl OverworldGenerator {
         dimension: &str,
         with_structures: bool,
     ) -> Result<Self, GeneratorError> {
-        Self::for_world_with_settings(data, seed, preset, dimension, with_structures, None)
+        Self::for_world_with_settings(data, seed, preset, dimension, with_structures, None, None)
     }
     /// A saved level stem supplies the generator and dimension type when no data
     /// pack replaces that dimension. Worlds without one use the preset's stem.
+    /// `regions` is the dimension's saved region layout, if it has one.
     pub fn for_world_with_settings(
         data: Arc<GeneratorData>,
         seed: i64,
@@ -3636,6 +3045,7 @@ impl OverworldGenerator {
         dimension: &str,
         with_structures: bool,
         saved_stem: Option<&Value>,
+        regions: Option<Arc<RegionLayout>>,
     ) -> Result<Self, GeneratorError> {
         let stem = if let Some(json) = data.dimensions.get(dimension) {
             serde_json::from_str(json)?
@@ -3649,14 +3059,26 @@ impl OverworldGenerator {
             )?;
             preset_json["dimensions"][dimension].clone()
         };
-        let generator = stem["generator"].clone();
+        if stem["generator"]["type"].as_str() != Some("minecraft:noise") {
+            return Err(resource(format!("{dimension} is not a noise generator")));
+        }
+        Self::from_stem(data, seed, &stem, with_structures, regions, None)
+    }
+    /// The pipeline of level `stem` over its noise settings, with a mod's `terrain` in place of
+    /// the noise when it has one.
+    fn from_stem(
+        data: Arc<GeneratorData>,
+        seed: i64,
+        stem: &Value,
+        with_structures: bool,
+        regions: Option<Arc<RegionLayout>>,
+        terrain: Option<mod_terrain::ModTerrain>,
+    ) -> Result<Self, GeneratorError> {
+        let generator = &stem["generator"];
         // The level's build range: its dimension type's, a data pack's
         // over the vanilla one.
         let level = overrides::LevelHeight::of_type(&stem["type"], &data.dimension_types)
             .map(|h| (h.min_y, h.height));
-        if generator["type"].as_str() != Some("minecraft:noise") {
-            return Err(resource(format!("{dimension} is not a noise generator")));
-        }
         let mut settings_json: Value = match &generator["settings"] {
             Value::String(name) => serde_json::from_str(
                 data.settings
@@ -3692,12 +3114,13 @@ impl OverworldGenerator {
                     data,
                     seed,
                     LegacyRandom::new(seed),
-                    &generator,
+                    generator,
                     &settings_json,
                     with_structures,
                     level,
+                    regions.as_deref(),
                 )?
-                .in_dimension(dimension),
+                .with_mod_terrain(terrain)?,
             )
         } else {
             Arc::new(
@@ -3705,12 +3128,13 @@ impl OverworldGenerator {
                     data,
                     seed,
                     XoroshiroRandom::new(seed),
-                    &generator,
+                    generator,
                     &settings_json,
                     with_structures,
                     level,
+                    regions.as_deref(),
                 )?
-                .in_dimension(dimension),
+                .with_mod_terrain(terrain)?,
             )
         };
         Ok(Self {
@@ -3785,13 +3209,19 @@ impl OverworldGenerator {
                 terrain_context: SamplerContext::cached(),
                 biome_context: SamplerContext::cached(),
                 carver_context: SamplerContext::default(),
-                carver_biomes: HashMap::new(),
-                structure_biomes: HashMap::new(),
+                column_context: SamplerContext::cached(),
+                column_density: Vec::new(),
+                climate_buffers: Default::default(),
+                carver_biomes: FxHashMap::default(),
+                structure_biomes: FxHashMap::default(),
                 timings: StageTimings::default(),
                 structures_only: false,
                 structure_mobs: None,
-                heights: HashMap::new(),
+                heights: FxHashMap::default(),
                 surface_rule: None,
+                uniform_biomes: UniformSurfaceBiomes::empty(),
+                decor_standins: Vec::new(),
+                decor_uniform_biomes: Vec::new(),
             },
         }
     }
@@ -3823,16 +3253,7 @@ impl GeneratorWorker {
     }
     /// Noise/aquifer surface and its material rule, without chunks, structures or features.
     pub fn surface_sample(&mut self, x: i32, z: i32) -> Option<SurfaceSample> {
-        let mut sample = self.pipeline.surface_sample(&mut self.state, x, z, None);
-        let pipeline = &*self.pipeline;
-        far_column(
-            pipeline.native_context(),
-            pipeline.data(),
-            [x, z],
-            &mut sample,
-            None,
-        );
-        sample
+        self.pipeline.surface_sample(&mut self.state, x, z, None)
     }
     /// Noise/aquifer material runs, excluding air; bounds are half-open.
     /// Features and carvers still require generated chunks.
@@ -3842,17 +3263,9 @@ impl GeneratorWorker {
         z: i32,
     ) -> (Option<SurfaceSample>, Vec<(i32, i32, BlockStateId)>) {
         let mut spans = Vec::new();
-        let mut surface = self
+        let surface = self
             .pipeline
             .surface_sample(&mut self.state, x, z, Some(&mut spans));
-        let pipeline = &*self.pipeline;
-        far_column(
-            pipeline.native_context(),
-            pipeline.data(),
-            [x, z],
-            &mut surface,
-            Some(&mut spans),
-        );
         (surface, spans)
     }
     /// `/locate structure`: the nearest start of one of `names`.
@@ -3890,24 +3303,8 @@ impl GeneratorWorker {
         side: usize,
         approximate: bool,
     ) -> Result<Vec<LodColumn>, GeneratorError> {
-        let mut columns =
-            self.pipeline
-                .lod_grid(&mut self.state, x, z, width, side, approximate)?;
-        let pipeline = &*self.pipeline;
-        for (index, (sample, spans)) in columns.iter_mut().enumerate() {
-            let column = [
-                x + (index % side) as i32 * width,
-                z + (index / side) as i32 * width,
-            ];
-            far_column(
-                pipeline.native_context(),
-                pipeline.data(),
-                column,
-                sample,
-                Some(spans),
-            );
-        }
-        Ok(columns)
+        self.pipeline
+            .lod_grid(&mut self.state, x, z, width, side, approximate)
     }
     pub fn noise_biomes(&mut self, quarts: &[[i32; 3]]) -> Vec<Option<String>> {
         self.pipeline.noise_biomes(&mut self.state, quarts)
@@ -3999,19 +3396,56 @@ impl GeneratorWorker {
             &mut state.terrain_context,
             &mut state.biome_context,
             &mut state.carver_context,
+            &mut state.column_context,
         ] {
             context.clear_scratch();
         }
-        state.carver_biomes = HashMap::new();
-        state.structure_biomes = HashMap::new();
-        state.heights = HashMap::new();
+        state.column_density = Vec::new();
+        state.climate_buffers = Default::default();
+        state.carver_biomes = FxHashMap::default();
+        state.structure_biomes = FxHashMap::default();
+        state.heights = FxHashMap::default();
+        state.surface_rule = None;
+        state.uniform_biomes = UniformSurfaceBiomes::empty();
+        state.decor_standins = Vec::new();
+        state.decor_uniform_biomes = Vec::new();
+        super::terrain::release_scratch();
+        super::material_condition::release_density_scratch();
+        super::material_stage::release_scratch();
     }
 }
 
 #[cfg(test)]
+mod mod_density_tests;
+#[cfg(test)]
+mod region_tests;
+#[cfg(test)]
 mod tests {
+    use super::super::biome_chunk::BiomeRegion;
     use super::super::biome_chunks::CACHE_LIMIT;
     use super::*;
+    use std::collections::HashMap;
+    #[test]
+    fn out_from_origin_preserves_order_and_handles_extreme_positive_steps() {
+        assert_eq!(out_from_origin(4, 0, 8, 2), [4, 6, 2, 8, 0]);
+        assert_eq!(out_from_origin(0, 0, 8, 3), [0, 3, 6]);
+        assert_eq!(out_from_origin(8, 0, 8, 3), [8, 5, 2]);
+        for (lower, upper) in [(-63, 320), (1, 256)] {
+            for origin in [i32::MIN, 64, i32::MAX] {
+                assert_eq!(
+                    out_from_origin(origin, lower, upper, i32::MAX),
+                    [origin.clamp(lower, upper)]
+                );
+            }
+        }
+        assert_eq!(
+            out_from_origin(0, i32::MIN, i32::MAX, i32::MAX),
+            [0, i32::MAX, -i32::MAX]
+        );
+        assert!(std::panic::catch_unwind(|| out_from_origin(0, 0, 8, 0)).is_err());
+        assert!(std::panic::catch_unwind(|| out_from_origin(0, 8, 0, 1)).is_err());
+    }
+
     #[test]
     fn settings_default_states_read_the_26_3_block_state_form() {
         let facts = br#"{"states": [
@@ -4037,7 +3471,7 @@ mod tests {
     }
     #[test]
     fn pack_tags_join_the_prepared_ones_and_broken_ones_are_dropped() {
-        let raw = Bundle::from([(
+        let raw = BTreeMap::from([(
             "minecraft:hill".to_owned(),
             r#"{"values":["minecraft:a"]}"#.to_owned(),
         )]);
@@ -4062,12 +3496,44 @@ mod tests {
         assert_eq!(dropped.len(), 1, "{dropped:?}");
         assert!(dropped[0].contains("p:broken"));
         // Without packs the prepared tags must all resolve.
-        let broken = Bundle::from([(
+        let broken = BTreeMap::from([(
             "p:broken".to_owned(),
             r#"{"values":["minecraft:gone"]}"#.to_owned(),
         )]);
         let none = WorldgenOverrides::default();
         assert!(build_tags(&broken, &none, "biome_tags", &mut dropped, known).is_err());
+    }
+    /// A pack's level on a generator nobody registered: opening it is an
+    /// error for the caller to report, and the noise levels still build.
+    #[test]
+    fn a_level_stem_naming_an_unknown_generator_is_an_error() {
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3")
+            });
+        if !root.join("worldgen/world_presets.json").exists() {
+            eprintln!("skipping: no worldgen bundle at {}", root.display());
+            return;
+        }
+        let registry = Box::leak(Box::new(crate::level::data::load_registry(&root).unwrap()));
+        let mut ov = WorldgenOverrides::default();
+        ov.set(
+            overrides::DIMENSIONS,
+            "test:gone",
+            r#"{"type":"minecraft:overworld","generator":{"type":"test:gone"}}"#.to_owned(),
+        );
+        let data = GeneratorData::load_with(&root.join("worldgen"), registry, &ov).unwrap();
+        let open = |dimension| {
+            OverworldGenerator::for_world(data.clone(), 0, "minecraft:normal", dimension, false)
+        };
+        let error = open("test:gone").err().expect("no such generator");
+        assert!(
+            error
+                .to_string()
+                .contains("test:gone is not a noise generator")
+        );
+        assert!(open("minecraft:overworld").is_ok());
     }
     #[test]
     fn a_pack_level_stem_names_taller_noise_which_clamps_to_the_build_height() {
@@ -4130,6 +3596,7 @@ mod tests {
             &preset["dimensions"]["minecraft:the_end"]["generator"],
             &settings,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -4212,6 +3679,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn uniform_surface_biomes_preserve_zoom_and_missing_corner_errors() {
         use super::super::biome_chunk::BiomeChunk;
         use std::convert::Infallible;
@@ -4292,6 +3760,103 @@ mod tests {
             }
         }
         assert!(successes > 0 && failures > 0);
+    }
+
+    /// `SurfaceBiomeRegion::new` rejects neighbor chunks whose `(min_y, height)`
+    /// differs from the center chunk (as old-world `old_biomes` can produce) or
+    /// whose coordinates do not match their 3x3 slot, matching `BiomeRegion::new`.
+    /// For accepted neighborhoods, `SurfaceBiomeRegion` and `UniformSurfaceBiomes`
+    /// agree with `BiomeRegion` at every quart and block.
+    #[test]
+    fn surface_biome_region_rejects_mismatched_neighbor_ranges_and_matches_biome_region() {
+        use std::convert::Infallible;
+
+        let center = ChunkPos::new(-3, 5);
+        let zoom = BiomeZoom::new(obfuscate_seed(42));
+        let make_grid = |override_slot: Option<(usize, ChunkPos, i32, i32)>| {
+            let mut slots: [Option<Arc<BiomeChunk<BiomeId>>>; 9] = Default::default();
+            for (i, slot) in slots.iter_mut().enumerate() {
+                let (pos, min_y, height) = match override_slot {
+                    Some((target, p, min_y, height)) if target == i => (p, min_y, height),
+                    _ => (
+                        ChunkPos::new(center.x + (i % 3) as i32 - 1, center.z + (i / 3) as i32 - 1),
+                        -64,
+                        128,
+                    ),
+                };
+                let mut chunk = BiomeChunk::new(pos, min_y, height, BiomeId(0)).unwrap();
+                chunk
+                    .fill(min_y, min_y + height - 1, |[qx, qy, qz]| {
+                        Ok::<_, Infallible>(BiomeId(
+                            (qx.wrapping_mul(3) + qy.wrapping_mul(7) + qz.wrapping_mul(5))
+                                .rem_euclid(11) as u32,
+                        ))
+                    })
+                    .unwrap();
+                *slot = Some(Arc::new(chunk));
+            }
+            slots.map(Option::unwrap)
+        };
+
+        // Neighbor with different min_y (e.g. pre-1.18 old chunk starting at y = 0).
+        let diff_min = make_grid(Some((0, ChunkPos::new(center.x - 1, center.z - 1), 0, 128)));
+        assert_eq!(
+            SurfaceBiomeRegion::new(center, diff_min, zoom).err(),
+            Some(BiomeRegionError::InvalidChunks)
+        );
+
+        // Neighbor with different height (same min_y, taller or shorter build height).
+        let diff_height = make_grid(Some((5, ChunkPos::new(center.x + 1, center.z), -64, 64)));
+        assert_eq!(
+            SurfaceBiomeRegion::new(center, diff_height, zoom).err(),
+            Some(BiomeRegionError::InvalidChunks)
+        );
+
+        // Neighbor with both min_y and height differing (0..256 next to -64..64).
+        let old_range = make_grid(Some((8, ChunkPos::new(center.x + 1, center.z + 1), 0, 256)));
+        assert_eq!(
+            SurfaceBiomeRegion::new(center, old_range, zoom).err(),
+            Some(BiomeRegionError::InvalidChunks)
+        );
+
+        // Neighbor placed in the wrong slot (duplicate center position).
+        let misplaced = make_grid(Some((1, center, -64, 128)));
+        assert_eq!(
+            SurfaceBiomeRegion::new(center, misplaced, zoom).err(),
+            Some(BiomeRegionError::InvalidChunks)
+        );
+
+        // Matching 3x3 neighborhood agrees with BiomeRegion and UniformSurfaceBiomes
+        // across every quart (including neighbor chunks and clamped Y) and every block.
+        let valid = make_grid(None);
+        let reference = BiomeRegion::new(
+            valid.iter().map(|chunk| (**chunk).clone()).collect(),
+            obfuscate_seed(42),
+        )
+        .unwrap();
+        let region = SurfaceBiomeRegion::new(center, valid, zoom).unwrap();
+        let mut cache = UniformSurfaceBiomes::new(center, -64, 128);
+        for qx in (center.x - 1) * 4..(center.x + 2) * 4 {
+            for qz in (center.z - 1) * 4..(center.z + 2) * 4 {
+                for qy in -20..20 {
+                    assert_eq!(
+                        region.noise_biome([qx, qy, qz]),
+                        reference.noise_biome([qx, qy, qz]).ok().copied()
+                    );
+                }
+            }
+        }
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in (-70..70).rev() {
+                    let p = BlockPos::new(center.x * 16 + x, y, center.z * 16 + z);
+                    let expected = *reference.biome(p).unwrap();
+                    assert_eq!(region.biome(p), Some(expected));
+                    let cached = cache.get(&region, p).or_else(|| region.biome(p));
+                    assert_eq!(cached, Some(expected));
+                }
+            }
+        }
     }
 
     /// Reduced far detail paints only the top two blocks of a wide column
@@ -4867,6 +4432,7 @@ mod tests {
                     &settings,
                     true,
                     Some((-64, 384)),
+                    None,
                 )
                 .expect("pipeline"),
             ),
@@ -4943,6 +4509,7 @@ mod tests {
                 &settings,
                 true,
                 Some((-64, 384)),
+                None,
             )
             .expect("pipeline"),
         );
@@ -4978,18 +4545,26 @@ mod tests {
                 assert!(Arc::ptr_eq(first, other));
             }
         }
-        // Two generations of other chunks push this one out of the cache.
+        // Two generations of other chunks push this one out of its cache shard.
         {
-            let mut cache = pipeline.biome_cache.lock().unwrap();
-            for x in 0..CACHE_LIMIT as i32 {
-                cache.insert((x, 10000), biomes.clone());
+            let target_shard = shard_of((pos.x, pos.z), CACHE_SHARDS);
+            let per_shard = (CACHE_LIMIT / CACHE_SHARDS).max(2);
+            let mut inserted = 0usize;
+            for x in 0.. {
+                if shard_of((x, 10000), CACHE_SHARDS) == target_shard {
+                    pipeline.biome_cache.insert((x, 10000), biomes.clone());
+                    inserted += 1;
+                    if inserted >= per_shard {
+                        break;
+                    }
+                }
             }
-            assert!(cache.len() <= CACHE_LIMIT);
+            assert!(pipeline.biome_cache.len() <= CACHE_LIMIT);
         }
         let mut worker = generator.worker();
         let rebuilt = pipeline.biome_chunk(&mut worker.state, pos).unwrap();
         assert!(!Arc::ptr_eq(biomes, &rebuilt));
-        assert!(pipeline.biome_cache.lock().unwrap().len() <= CACHE_LIMIT);
+        assert!(pipeline.biome_cache.len() <= CACHE_LIMIT);
         for section in 0..24 {
             assert_eq!(biomes.section(section), rebuilt.section(section));
         }
@@ -5017,10 +4592,10 @@ mod tests {
             })
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn saved_starts_match_generated_layouts() {
         use super::super::structure::start::Piece;
-        use crate::nbt::Compound;
+        use horizon_core::nbt::Compound;
         let root = std::path::PathBuf::from(
             std::env::var_os("HORIZON_TEST_RESOURCES").expect("resources"),
         );
@@ -5210,5 +4785,2558 @@ mod tests {
         assert!(normal.iter().all(|height| (0..384).contains(height)));
         assert_ne!(normal, surface("minecraft:amplified"));
         assert_ne!(normal, surface("minecraft:large_biomes"));
+    }
+
+    struct ProtoSnapshot {
+        position: ChunkPos,
+        stage: PreLightChunkStage,
+        decorated: bool,
+        min_y: i32,
+        height: i32,
+        sections: Vec<horizon_core::nbt::Tag>,
+        biomes: Vec<[BiomeId; 64]>,
+        heightmaps: Vec<Option<Vec<u64>>>,
+        postprocessing: Vec<Vec<u16>>,
+        block_ticks: Vec<horizon_core::ticks::SavedTick>,
+        fluid_ticks: Vec<horizon_core::ticks::SavedTick>,
+        block_entities: Vec<([i32; 3], horizon_core::nbt::Compound)>,
+        entities: Vec<horizon_core::nbt::Compound>,
+        structure_starts_len: usize,
+    }
+
+    impl ProtoSnapshot {
+        fn of(chunk: &ProtoChunk) -> Self {
+            let section_count = (chunk.terrain.height() / 16) as usize;
+            assert!(
+                chunk.terrain.section(section_count).is_none(),
+                "unexpected extra terrain section"
+            );
+            let mut sections = Vec::with_capacity(section_count);
+            let mut biomes = Vec::with_capacity(section_count);
+            for idx in 0..section_count {
+                sections.push(chunk.terrain.section(idx).unwrap().to_nbt().unwrap());
+                biomes.push(*chunk.biomes.section(idx).unwrap());
+            }
+            let heightmaps = HeightmapType::ALL
+                .into_iter()
+                .map(|kind| chunk.terrain.heightmap(kind).map(|m| m.raw_data().to_vec()))
+                .collect();
+            Self {
+                position: chunk.position(),
+                stage: chunk.terrain.generation_stage(),
+                decorated: chunk.decorated,
+                min_y: chunk.terrain.min_y(),
+                height: chunk.terrain.height(),
+                sections,
+                biomes,
+                heightmaps,
+                postprocessing: chunk.terrain.postprocessing().to_vec(),
+                block_ticks: chunk.terrain.block_ticks().pack(0).to_vec(),
+                fluid_ticks: chunk.terrain.fluid_ticks().pack(0).to_vec(),
+                block_entities: chunk.block_entities.clone(),
+                entities: chunk.entities.clone(),
+                structure_starts_len: chunk.structure_starts.len(),
+            }
+        }
+    }
+
+    fn assert_proto_snapshot_equal(a: &ProtoSnapshot, b: &ProtoSnapshot, label: &str) {
+        assert_eq!(a.position, b.position, "{label}: chunk position");
+        assert_eq!(a.stage, b.stage, "{label}: generation stage");
+        assert_eq!(a.decorated, b.decorated, "{label}: decorated flag");
+        assert_eq!(a.min_y, b.min_y, "{label}: min_y");
+        assert_eq!(a.height, b.height, "{label}: height");
+        assert_eq!(a.sections.len(), b.sections.len(), "{label}: section count");
+        for (idx, ((sa, sb), (ba, bb))) in a
+            .sections
+            .iter()
+            .zip(&b.sections)
+            .zip(a.biomes.iter().zip(&b.biomes))
+            .enumerate()
+        {
+            assert_eq!(sa, sb, "{label}: section {idx} NBT");
+            assert_eq!(ba, bb, "{label}: biome section {idx}");
+        }
+        for ((ha, hb), kind) in a
+            .heightmaps
+            .iter()
+            .zip(&b.heightmaps)
+            .zip(HeightmapType::ALL)
+        {
+            assert_eq!(ha, hb, "{label}: heightmap {kind:?}");
+        }
+        assert_eq!(
+            a.postprocessing, b.postprocessing,
+            "{label}: postprocessing"
+        );
+        assert_eq!(a.block_ticks, b.block_ticks, "{label}: block ticks");
+        assert_eq!(a.fluid_ticks, b.fluid_ticks, "{label}: fluid ticks");
+        assert_eq!(
+            a.block_entities, b.block_entities,
+            "{label}: block entities"
+        );
+        assert_eq!(a.entities, b.entities, "{label}: entities");
+        assert_eq!(
+            a.structure_starts_len, b.structure_starts_len,
+            "{label}: structure starts count"
+        );
+    }
+
+    fn assert_proto_chunk_byte_equal(a: &ProtoChunk, b: &ProtoChunk, label: &str) {
+        assert_proto_snapshot_equal(&ProtoSnapshot::of(a), &ProtoSnapshot::of(b), label);
+    }
+
+    /// Private temporary directory created atomically with a non-recursive
+    /// `DirBuilder` (`0o700` on Unix) so a test fixture never reuses or deletes
+    /// a directory it did not create.
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl TempDirGuard {
+        fn create(prefix: &str) -> Self {
+            use std::collections::hash_map::RandomState;
+            use std::hash::BuildHasher;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+
+            let base = std::env::temp_dir();
+            let pid = std::process::id();
+            Self::create_with(&base, |attempt| {
+                let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let nonce = RandomState::new().hash_one((pid, seq, attempt, nanos));
+                format!("{prefix}-{pid}-{seq}-{nanos:x}-{nonce:016x}")
+            })
+        }
+
+        fn create_with(base: &Path, mut next_name: impl FnMut(u64) -> String) -> Self {
+            let builder = Self::private_dir_builder();
+            for attempt in 0..1024u64 {
+                let path = base.join(next_name(attempt));
+                match builder.create(&path) {
+                    Ok(()) => return Self(path),
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => panic!(
+                        "failed to create temporary directory {}: {err}",
+                        path.display()
+                    ),
+                }
+            }
+            panic!(
+                "failed to create a unique temporary directory under {} after 1024 attempts",
+                base.display()
+            );
+        }
+
+        fn private_dir_builder() -> fs::DirBuilder {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+            }
+            #[cfg(not(unix))]
+            {
+                fs::DirBuilder::new()
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn create_subdir(&self, name: &str) -> std::path::PathBuf {
+            let path = self.0.join(name);
+            Self::private_dir_builder()
+                .create(&path)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to create temporary subdirectory {}: {err}",
+                        path.display()
+                    )
+                });
+            path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct SyntheticReuseFixture {
+        data: Arc<GeneratorData>,
+        registry: &'static BlockRegistry,
+        _dir: TempDirGuard,
+    }
+
+    fn build_synthetic_reuse_data() -> SyntheticReuseFixture {
+        use horizon_core::geometry::{Axis, VoxelShape};
+        use horizon_core::nbt::{JavaString, Limits, NamedTag, Tag, write_named};
+        static REGISTRY: OnceLock<&'static BlockRegistry> = OnceLock::new();
+        static META: OnceLock<(
+            Vec<Tag>,
+            Vec<(bool, bool)>,
+            Vec<i32>,
+            Vec<(&'static str, i8)>,
+        )> = OnceLock::new();
+
+        let (states_nbt, flags, cached_shapes, block_props) = META.get_or_init(|| {
+            let mut states_nbt = Vec::new();
+            let mut defaults: Vec<(&'static str, i32)> = Vec::new();
+            let mut flags = Vec::new();
+            let mut cached_shapes = Vec::new();
+            let mut block_props: Vec<(&'static str, i8)> = Vec::new();
+
+            let mut add_simple =
+                |name: &'static str, is_air: bool, is_solid: bool, prop_flags: i8| {
+                    let idx = states_nbt.len() as i32;
+                    states_nbt.push(Tag::compound([("id", Tag::String(name.into()))]));
+                    defaults.push((name, idx));
+                    flags.push((is_air, false));
+                    cached_shapes.push(i32::from(is_solid));
+                    block_props.push((name, prop_flags));
+                };
+
+            // Bit flags for block-properties.nbt:
+            // 4 = replaceable, 8 = liquid, 16 = can_occlude.
+            add_simple("minecraft:air", true, false, 4);
+            add_simple("minecraft:void_air", true, false, 4);
+            add_simple("minecraft:cave_air", true, false, 4);
+
+            for solid_name in [
+                "minecraft:stone",
+                "minecraft:deepslate",
+                "minecraft:bedrock",
+                "minecraft:dirt",
+                "minecraft:sand",
+                "minecraft:gravel",
+                "minecraft:coal_ore",
+                "minecraft:iron_ore",
+                "minecraft:raw_iron_block",
+                "minecraft:tuff",
+                "minecraft:cobblestone",
+                "minecraft:end_stone",
+                "minecraft:obsidian",
+                "minecraft:ice",
+                "minecraft:packed_ice",
+                "minecraft:snow_block",
+                "minecraft:chest",
+                "minecraft:terracotta",
+                "minecraft:orange_terracotta",
+                "minecraft:yellow_terracotta",
+                "minecraft:brown_terracotta",
+                "minecraft:red_terracotta",
+                "minecraft:white_terracotta",
+                "minecraft:light_gray_terracotta",
+            ] {
+                add_simple(solid_name, false, true, 16);
+            }
+
+            add_simple("minecraft:torch", false, false, 0);
+
+            for fluid_name in ["minecraft:water", "minecraft:lava"] {
+                let first = states_nbt.len() as i32;
+                defaults.push((fluid_name, first));
+                for level in 0..16 {
+                    states_nbt.push(Tag::compound([
+                        ("id", Tag::String(fluid_name.into())),
+                        (
+                            "properties",
+                            Tag::compound([(
+                                "level",
+                                Tag::String(level.to_string().as_str().into()),
+                            )]),
+                        ),
+                    ]));
+                    flags.push((false, true));
+                    cached_shapes.push(0);
+                }
+                block_props.push((fluid_name, 4 | 8));
+            }
+
+            for snowy_name in [
+                "minecraft:grass_block",
+                "minecraft:mycelium",
+                "minecraft:podzol",
+            ] {
+                let first = states_nbt.len() as i32;
+                defaults.push((snowy_name, first));
+                for snowy in ["false", "true"] {
+                    states_nbt.push(Tag::compound([
+                        ("id", Tag::String(snowy_name.into())),
+                        (
+                            "properties",
+                            Tag::compound([("snowy", Tag::String(snowy.into()))]),
+                        ),
+                    ]));
+                    flags.push((false, false));
+                    cached_shapes.push(1);
+                }
+                block_props.push((snowy_name, 16));
+            }
+
+            // minecraft:snow (layers 1..=8)
+            {
+                let first = states_nbt.len() as i32;
+                defaults.push(("minecraft:snow", first));
+                for layers in 1..=8 {
+                    states_nbt.push(Tag::compound([
+                        ("id", Tag::String("minecraft:snow".into())),
+                        (
+                            "properties",
+                            Tag::compound([(
+                                "layers",
+                                Tag::String(layers.to_string().as_str().into()),
+                            )]),
+                        ),
+                    ]));
+                    flags.push((false, false));
+                    cached_shapes.push(0);
+                }
+                block_props.push(("minecraft:snow", 4));
+            }
+
+            // minecraft:pale_moss_carpet (required by BlockPlacementBindings)
+            {
+                let mut default_idx = states_nbt.len() as i32;
+                for bottom in ["false", "true"] {
+                    for north in ["none", "low", "tall"] {
+                        for east in ["none", "low", "tall"] {
+                            for south in ["none", "low", "tall"] {
+                                for west in ["none", "low", "tall"] {
+                                    if bottom == "true"
+                                        && north == "none"
+                                        && east == "none"
+                                        && south == "none"
+                                        && west == "none"
+                                    {
+                                        default_idx = states_nbt.len() as i32;
+                                    }
+                                    states_nbt.push(Tag::compound([
+                                        ("id", Tag::String("minecraft:pale_moss_carpet".into())),
+                                        (
+                                            "properties",
+                                            Tag::compound([
+                                                ("bottom", Tag::String(bottom.into())),
+                                                ("east", Tag::String(east.into())),
+                                                ("north", Tag::String(north.into())),
+                                                ("south", Tag::String(south.into())),
+                                                ("west", Tag::String(west.into())),
+                                            ]),
+                                        ),
+                                    ]));
+                                    flags.push((false, false));
+                                    cached_shapes.push(0);
+                                }
+                            }
+                        }
+                    }
+                }
+                defaults.push(("minecraft:pale_moss_carpet", default_idx));
+                block_props.push(("minecraft:pale_moss_carpet", 0));
+            }
+
+            let registry = BlockRegistry::from_nbt(&Tag::compound([
+                ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+                ("states", Tag::List(states_nbt.clone())),
+                (
+                    "defaults",
+                    Tag::compound(defaults.into_iter().map(|(k, v)| (k, Tag::Int(v)))),
+                ),
+            ]))
+            .unwrap();
+            let _ = REGISTRY.set(Box::leak(Box::new(registry)));
+            (states_nbt, flags, cached_shapes, block_props)
+        });
+        let registry = *REGISTRY.get().unwrap();
+
+        let guard = TempDirGuard::create("horizon-worker-reuse-test");
+        let dir = guard.path();
+        let blocks_dir = guard.create_subdir("blocks");
+
+        let write_nbt = |path: &Path, tag: Tag| {
+            let out = write_named(
+                &NamedTag {
+                    name: JavaString::default(),
+                    tag,
+                },
+                Limits::default(),
+            )
+            .unwrap();
+            std::fs::write(path, out).unwrap();
+        };
+        let shape_nbt = |shape: &VoxelShape, canonical: i8, occupied: Vec<u8>| {
+            let (dmin, dmax) = shape.discrete_bounds();
+            let axes = shape.cube_coordinate_axes();
+            let cube_axes = i8::from(axes[0]) | (i8::from(axes[1]) << 1) | (i8::from(axes[2]) << 2);
+            let coords = |axis| {
+                Tag::LongArray(
+                    shape
+                        .coordinates(axis)
+                        .iter()
+                        .map(|v| v.to_bits() as i64)
+                        .collect(),
+                )
+            };
+            Tag::compound([
+                ("canonical", Tag::Byte(canonical)),
+                ("x", coords(Axis::X)),
+                ("y", coords(Axis::Y)),
+                ("z", coords(Axis::Z)),
+                ("occupied", Tag::ByteArray(occupied)),
+                ("cube_axes", Tag::Byte(cube_axes)),
+                ("discrete_min", Tag::IntArray(dmin.to_vec())),
+                ("discrete_max", Tag::IntArray(dmax.to_vec())),
+                ("cube", Tag::Byte(i8::from(shape.is_cube()))),
+            ])
+        };
+        let shapes = vec![
+            shape_nbt(&VoxelShape::empty(), 1, Vec::new()),
+            shape_nbt(&VoxelShape::block(), 2, vec![1]),
+        ];
+        let collision_tag = |kind: Option<&str>| {
+            let mut entries: Vec<(&str, Tag)> = vec![
+                ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+                ("states", Tag::List(states_nbt.clone())),
+                ("shapes", Tag::List(shapes.clone())),
+                ("cached_shapes", Tag::IntArray(cached_shapes.clone())),
+            ];
+            if let Some(kind) = kind {
+                entries.push(("Kind", Tag::String(kind.into())));
+            }
+            Tag::compound(entries)
+        };
+        write_nbt(
+            &blocks_dir.join("cached-collision.nbt"),
+            collision_tag(None),
+        );
+        write_nbt(
+            &blocks_dir.join("cached-support.nbt"),
+            collision_tag(Some("block_support")),
+        );
+        write_nbt(
+            &blocks_dir.join("block-properties.nbt"),
+            Tag::compound([
+                ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+                ("states", Tag::List(states_nbt.clone())),
+                (
+                    "blocks",
+                    Tag::compound(
+                        block_props
+                            .iter()
+                            .map(|&(name, bits)| (name, Tag::Byte(bits))),
+                    ),
+                ),
+                ("occlusion", collision_tag(None)),
+            ]),
+        );
+        std::fs::write(
+            blocks_dir.join("survival-rules.json"),
+            r#"{"minecraft:snow":"SnowLayer","minecraft:torch":"CenterBelow"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            blocks_dir.join("survival-extra-definitions.json"),
+            r#"{"ignition_odds":{},"fence_gates":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            blocks_dir.join("placement-definitions.json"),
+            r#"{"double_plants":[],"mossy_carpets":[]}"#,
+        )
+        .unwrap();
+
+        let write_json = |name: &str, value: Value| {
+            std::fs::write(dir.join(name), serde_json::to_string(&value).unwrap()).unwrap();
+        };
+        let write_bundle = |name: &str, entries: &[(&str, Value)]| {
+            let mut map = serde_json::Map::new();
+            for (k, v) in entries {
+                map.insert(
+                    (*k).to_owned(),
+                    Value::String(serde_json::to_string(v).unwrap()),
+                );
+            }
+            std::fs::write(
+                dir.join(name),
+                serde_json::to_string(&Value::Object(map)).unwrap(),
+            )
+            .unwrap();
+        };
+
+        write_json("block_flags.json", serde_json::to_value(flags).unwrap());
+
+        let noise_def = |base_octave: i32| {
+            serde_json::json!({
+                "base_octave": base_octave,
+                "octave_count": 2,
+                "base_amplitude": 1.0
+            })
+        };
+        write_bundle(
+            "noises.json",
+            &[
+                ("minecraft:clay_bands_offset", noise_def(-4)),
+                ("minecraft:surface", noise_def(-4)),
+                ("minecraft:surface_secondary", noise_def(-3)),
+                ("minecraft:badlands_surface", noise_def(-4)),
+                ("minecraft:badlands_pillar", noise_def(-3)),
+                ("minecraft:badlands_pillar_roof", noise_def(-4)),
+                ("minecraft:iceberg_surface", noise_def(-4)),
+                ("minecraft:iceberg_pillar", noise_def(-3)),
+                ("minecraft:iceberg_pillar_roof", noise_def(-4)),
+                ("minecraft:aquifer_barrier", noise_def(-3)),
+                ("minecraft:aquifer_fluid_level_floodedness", noise_def(-4)),
+                ("minecraft:aquifer_fluid_level_spread", noise_def(-4)),
+                ("minecraft:aquifer_lava", noise_def(-2)),
+                ("minecraft:terrain", noise_def(-5)),
+                ("minecraft:vein", noise_def(-3)),
+            ],
+        );
+        write_bundle("densities.json", &[]);
+        write_bundle("conditions.json", &[]);
+
+        let surface_rule = serde_json::json!({
+            "type": "minecraft:sequence",
+            "sequence": [
+                {
+                    "type": "minecraft:condition",
+                    "if_true": {
+                        "type": "minecraft:vertical_gradient",
+                        "random_name": "minecraft:bedrock_floor",
+                        "true_at_and_below": {"above_bottom": 0},
+                        "false_at_and_above": {"above_bottom": 4}
+                    },
+                    "then_run": {"type": "minecraft:block", "result_state": "minecraft:bedrock"}
+                },
+                {
+                    "type": "minecraft:condition",
+                    "if_true": {"type": "minecraft:above_preliminary_surface"},
+                    "then_run": {
+                        "type": "minecraft:sequence",
+                        "sequence": [
+                            {
+                                "type": "minecraft:condition",
+                                "if_true": {
+                                    "type": "minecraft:stone_depth",
+                                    "offset": 0,
+                                    "add_surface_depth": false,
+                                    "secondary_depth_range": 0,
+                                    "surface_type": "floor"
+                                },
+                                "then_run": {
+                                    "type": "minecraft:sequence",
+                                    "sequence": [
+                                        {
+                                            "type": "minecraft:condition",
+                                            "if_true": {
+                                                "type": "minecraft:biome",
+                                                "biome_is": ["minecraft:eroded_badlands"]
+                                            },
+                                            "then_run": {"type": "minecraft:bandlands"}
+                                        },
+                                        {
+                                            "type": "minecraft:condition",
+                                            "if_true": {
+                                                "type": "minecraft:biome",
+                                                "biome_is": ["minecraft:frozen_ocean"]
+                                            },
+                                            "then_run": {"type": "minecraft:block", "result_state": "minecraft:gravel"}
+                                        },
+                                        {
+                                            "type": "minecraft:condition",
+                                            "if_true": {
+                                                "type": "minecraft:noise_threshold",
+                                                "noise": "minecraft:surface",
+                                                "min_threshold": 0.4,
+                                                "max_threshold": 1.0
+                                            },
+                                            "then_run": {"type": "minecraft:block", "result_state": "minecraft:sand"}
+                                        },
+                                        {"type": "minecraft:block", "result_state": "minecraft:grass_block"}
+                                    ]
+                                }
+                            },
+                            {
+                                "type": "minecraft:condition",
+                                "if_true": {
+                                    "type": "minecraft:stone_depth",
+                                    "offset": 2,
+                                    "add_surface_depth": true,
+                                    "secondary_depth_range": 0,
+                                    "surface_type": "floor"
+                                },
+                                "then_run": {"type": "minecraft:block", "result_state": "minecraft:dirt"}
+                            }
+                        ]
+                    }
+                },
+                {
+                    "type": "minecraft:ore_vein",
+                    "ore_block": "minecraft:iron_ore",
+                    "raw_ore_block": "minecraft:raw_iron_block",
+                    "filler_block": "minecraft:tuff",
+                    "raw_ore_chance": 0.2,
+                    "density": {
+                        "type": "minecraft:mul",
+                        "left": {
+                            "type": "minecraft:gradient",
+                            "axis": "y",
+                            "from_coordinate": -32,
+                            "to_coordinate": 8,
+                            "from_value": 0.8,
+                            "to_value": -0.2
+                        },
+                        "right": {
+                            "type": "minecraft:noise",
+                            "noise": "minecraft:vein",
+                            "xz_scale": 1.0,
+                            "y_scale": 1.0
+                        }
+                    },
+                    "richness": {
+                        "type": "minecraft:noise",
+                        "noise": "minecraft:vein",
+                        "xz_scale": 2.0,
+                        "y_scale": 2.0
+                    },
+                    "filler_gap": {
+                        "type": "minecraft:noise",
+                        "noise": "minecraft:surface_secondary",
+                        "xz_scale": 1.0,
+                        "y_scale": 1.0
+                    }
+                },
+                {
+                    "type": "minecraft:condition",
+                    "if_true": {
+                        "type": "minecraft:vertical_gradient",
+                        "random_name": "minecraft:deepslate",
+                        "true_at_and_below": {"absolute": -4},
+                        "false_at_and_above": {"absolute": 4}
+                    },
+                    "then_run": {"type": "minecraft:block", "result_state": "minecraft:deepslate"}
+                }
+            ]
+        });
+        write_bundle(
+            "rules.json",
+            &[("minecraft:synthetic_surface", surface_rule)],
+        );
+
+        write_bundle(
+            "carvers.json",
+            &[
+                (
+                    "minecraft:cave",
+                    serde_json::json!({
+                        "type": "minecraft:cave",
+                        "probability": 0.35,
+                        "y": {
+                            "type": "minecraft:uniform",
+                            "min_inclusive": {"absolute": -24},
+                            "max_inclusive": {"absolute": 48}
+                        },
+                        "count": 2,
+                        "thickness": 1.0,
+                        "room_vertical_radius_multiplier": 1.0,
+                        "horizontal_radius_multiplier": 1.0,
+                        "vertical_radius_multiplier": 1.0,
+                        "floor_level": -0.7
+                    }),
+                ),
+                (
+                    "minecraft:canyon",
+                    serde_json::json!({
+                        "type": "minecraft:canyon",
+                        "probability": 0.25,
+                        "y": {
+                            "type": "minecraft:uniform",
+                            "min_inclusive": {"absolute": -20},
+                            "max_inclusive": {"absolute": 44}
+                        },
+                        "vertical_rotation": 0.0,
+                        "shape": {
+                            "distance_factor": 1.0,
+                            "thickness": 1.0,
+                            "width_smoothness": 3,
+                            "horizontal_radius_factor": 1.0,
+                            "vertical_radius_default_factor": 1.0,
+                            "vertical_radius_center_factor": 0.0,
+                            "y_scale": 3.0
+                        }
+                    }),
+                ),
+            ],
+        );
+
+        let biome_features = serde_json::json!([
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            ["minecraft:ore_coal"],
+            [],
+            [],
+            ["minecraft:bonus_chest"],
+            ["minecraft:freeze_top_layer"]
+        ]);
+        let biome_carvers = serde_json::json!(["minecraft:cave", "minecraft:canyon"]);
+        write_bundle(
+            "biomes.json",
+            &[
+                (
+                    "minecraft:plains",
+                    serde_json::json!({
+                        "temperature": 0.8,
+                        "downfall": 0.4,
+                        "has_precipitation": true,
+                        "carvers": biome_carvers,
+                        "features": biome_features
+                    }),
+                ),
+                (
+                    "minecraft:snowy_taiga",
+                    serde_json::json!({
+                        "temperature": -0.5,
+                        "downfall": 0.4,
+                        "has_precipitation": true,
+                        "carvers": biome_carvers,
+                        "features": biome_features
+                    }),
+                ),
+                (
+                    "minecraft:eroded_badlands",
+                    serde_json::json!({
+                        "temperature": 2.0,
+                        "downfall": 0.0,
+                        "has_precipitation": false,
+                        "carvers": biome_carvers,
+                        "features": biome_features
+                    }),
+                ),
+                (
+                    "minecraft:frozen_ocean",
+                    serde_json::json!({
+                        "temperature": 0.0,
+                        "downfall": 0.5,
+                        "has_precipitation": true,
+                        "temperature_modifier": "frozen",
+                        "carvers": biome_carvers,
+                        "features": biome_features
+                    }),
+                ),
+            ],
+        );
+        write_bundle("biome_tags.json", &[]);
+
+        let motion_blocks = serde_json::json!({
+            "values": [
+                "minecraft:stone",
+                "minecraft:deepslate",
+                "minecraft:bedrock",
+                "minecraft:dirt",
+                "minecraft:grass_block",
+                "minecraft:mycelium",
+                "minecraft:podzol",
+                "minecraft:sand",
+                "minecraft:gravel",
+                "minecraft:coal_ore",
+                "minecraft:iron_ore",
+                "minecraft:raw_iron_block",
+                "minecraft:tuff",
+                "minecraft:cobblestone",
+                "minecraft:end_stone",
+                "minecraft:obsidian",
+                "minecraft:ice",
+                "minecraft:packed_ice",
+                "minecraft:snow_block",
+                "minecraft:chest",
+                "minecraft:terracotta",
+                "minecraft:orange_terracotta",
+                "minecraft:yellow_terracotta",
+                "minecraft:brown_terracotta",
+                "minecraft:red_terracotta",
+                "minecraft:white_terracotta",
+                "minecraft:light_gray_terracotta"
+            ]
+        });
+        write_bundle(
+            "block_tags.json",
+            &[
+                (
+                    "minecraft:blocks_motion_in_heightmap",
+                    motion_blocks.clone(),
+                ),
+                (
+                    "minecraft:blocks_motion_in_heightmap_no_leaves",
+                    motion_blocks,
+                ),
+                (
+                    "minecraft:uncarvable",
+                    serde_json::json!({"values": ["minecraft:bedrock"]}),
+                ),
+                (
+                    "minecraft:cannot_support_snow_layer",
+                    serde_json::json!({"values": ["minecraft:ice", "minecraft:packed_ice"]}),
+                ),
+            ],
+        );
+        write_bundle(
+            "fluid_tags.json",
+            &[
+                (
+                    "minecraft:water",
+                    serde_json::json!({"values": ["minecraft:water", "minecraft:flowing_water"]}),
+                ),
+                (
+                    "minecraft:lava",
+                    serde_json::json!({"values": ["minecraft:lava", "minecraft:flowing_lava"]}),
+                ),
+            ],
+        );
+
+        write_bundle(
+            "features.json",
+            &[
+                (
+                    "minecraft:ore_coal",
+                    serde_json::json!({
+                        "type": "minecraft:ore",
+                        "size": 8,
+                        "discard_chance_on_air_exposure": 0.0,
+                        "targets": [{
+                            "target": {
+                                "predicate_type": "minecraft:block_match",
+                                "block": "minecraft:stone"
+                            },
+                            "state": "minecraft:coal_ore"
+                        }]
+                    }),
+                ),
+                (
+                    "minecraft:bonus_chest",
+                    serde_json::json!({
+                        "type": "minecraft:bonus_chest",
+                        "config": {}
+                    }),
+                ),
+                (
+                    "minecraft:freeze_top_layer",
+                    serde_json::json!({
+                        "type": "minecraft:freeze_top_layer",
+                        "config": {}
+                    }),
+                ),
+            ],
+        );
+        write_bundle(
+            "placed_features.json",
+            &[
+                (
+                    "minecraft:ore_coal",
+                    serde_json::json!({
+                        "feature": "minecraft:ore_coal",
+                        "placement": [
+                            {"type": "minecraft:count", "count": 6},
+                            {"type": "minecraft:in_square"},
+                            {
+                                "type": "minecraft:height_range",
+                                "height": {
+                                    "type": "minecraft:uniform",
+                                    "min_inclusive": {"absolute": -32},
+                                    "max_inclusive": {"absolute": 48}
+                                }
+                            },
+                            {"type": "minecraft:biome"}
+                        ]
+                    }),
+                ),
+                (
+                    "minecraft:bonus_chest",
+                    serde_json::json!({
+                        "feature": "minecraft:bonus_chest",
+                        "placement": [
+                            {"type": "minecraft:in_square"},
+                            {"type": "minecraft:heightmap", "heightmap": "MOTION_BLOCKING_NO_LEAVES"},
+                            {"type": "minecraft:biome"}
+                        ]
+                    }),
+                ),
+                (
+                    "minecraft:freeze_top_layer",
+                    serde_json::json!({
+                        "feature": "minecraft:freeze_top_layer",
+                        "placement": [{"type": "minecraft:biome"}]
+                    }),
+                ),
+            ],
+        );
+
+        // Terrain oscillates across sea_level (32) and sea_level + 17 (49), so
+        // warm/cold lakes, hills, caves, canyons, aquifers, and snow/ice all fire.
+        let terrain_density = serde_json::json!({
+            "type": "minecraft:add",
+            "left": {
+                "type": "minecraft:gradient",
+                "axis": "y",
+                "from_coordinate": 16,
+                "to_coordinate": 60,
+                "from_value": 1.0,
+                "to_value": -1.0
+            },
+            "right": {
+                "type": "minecraft:mul",
+                "left": 0.75,
+                "right": {
+                    "type": "minecraft:noise",
+                    "noise": "minecraft:terrain",
+                    "xz_scale": 1.0,
+                    "y_scale": 0.5
+                }
+            }
+        });
+        let surface_level = serde_json::json!({
+            "type": "minecraft:add",
+            "left": 38.0,
+            "right": {
+                "type": "minecraft:mul",
+                "left": 14.0,
+                "right": {
+                    "type": "minecraft:noise",
+                    "noise": "minecraft:terrain",
+                    "xz_scale": 1.0,
+                    "y_scale": 0.0
+                }
+            }
+        });
+        write_bundle(
+            "settings.json",
+            &[(
+                "minecraft:synthetic_overworld",
+                serde_json::json!({
+                    "sea_level": 32,
+                    "default_block": "minecraft:stone",
+                    "default_fluid": "minecraft:water",
+                    "legacy_random_source": false,
+                    "noise": {"min_y": -32, "height": 96},
+                    "noise_router": {
+                        "temperature": 0.0,
+                        "vegetation": 0.0,
+                        "continents": 0.0,
+                        "erosion": 0.0,
+                        "depth": 0.0,
+                        "ridges": 0.0,
+                        "chunk_surface_level": surface_level,
+                        "final_density": terrain_density
+                    },
+                    "aquifers": {
+                        "barrier": {
+                            "type": "minecraft:noise",
+                            "noise": "minecraft:aquifer_barrier",
+                            "xz_scale": 1.0,
+                            "y_scale": 0.5
+                        },
+                        "fluid_level_floodedness": {
+                            "type": "minecraft:noise",
+                            "noise": "minecraft:aquifer_fluid_level_floodedness",
+                            "xz_scale": 1.0,
+                            "y_scale": 0.67
+                        },
+                        "fluid_level_spread": {
+                            "type": "minecraft:noise",
+                            "noise": "minecraft:aquifer_fluid_level_spread",
+                            "xz_scale": 1.0,
+                            "y_scale": 0.714
+                        },
+                        "lava": {
+                            "type": "minecraft:noise",
+                            "noise": "minecraft:aquifer_lava",
+                            "xz_scale": 1.0,
+                            "y_scale": 1.0
+                        },
+                        "exclusion": 0.0,
+                        "surface_level": surface_level
+                    },
+                    "material_rule": "minecraft:synthetic_surface"
+                }),
+            )],
+        );
+        write_bundle(
+            "dimension_types.json",
+            &[(
+                "minecraft:overworld",
+                serde_json::json!({"min_y": -32, "height": 96}),
+            )],
+        );
+        // Scale = 2 gives 4-chunk-wide checkerboard tiles: interior centers are
+        // uniform single-biome 3×3s while boundary centers span mixed biome bitsets.
+        write_bundle(
+            "world_presets.json",
+            &[(
+                "minecraft:normal",
+                serde_json::json!({
+                    "dimensions": {
+                        "minecraft:overworld": {
+                            "type": "minecraft:overworld",
+                            "generator": {
+                                "type": "minecraft:noise",
+                                "settings": "minecraft:synthetic_overworld",
+                                "biome_source": {
+                                    "type": "minecraft:checkerboard",
+                                    "scale": 2,
+                                    "biomes": [
+                                        "minecraft:plains",
+                                        "minecraft:snowy_taiga",
+                                        "minecraft:eroded_badlands",
+                                        "minecraft:frozen_ocean"
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let data = GeneratorData::load(dir, registry).unwrap();
+        assert!(data.warnings().is_empty(), "{:?}", data.warnings());
+        SyntheticReuseFixture {
+            data,
+            registry,
+            _dir: guard,
+        }
+    }
+
+    fn neighborhood_positions(center: ChunkPos) -> [ChunkPos; 9] {
+        std::array::from_fn(|i| {
+            ChunkPos::new(
+                center.x.wrapping_add(i as i32 % 3 - 1),
+                center.z.wrapping_add(i as i32 / 3 - 1),
+            )
+        })
+    }
+
+    fn verify_worker_reuse_on_centers(
+        generator: &OverworldGenerator,
+        centers: &[ChunkPos],
+        passes: &[&[usize]],
+    ) -> (Vec<[ProtoChunk; 9]>, Vec<DecorateStats>) {
+        // Baseline: a brand-new GeneratorWorker for every proto chunk and every
+        // decorated 3×3 neighborhood. Snapshot each proto chunk before decoration
+        // so we verify both proto and decorated equality without generating the
+        // baseline twice.
+        let mut fresh_proto: BTreeMap<(i32, i32), ProtoSnapshot> = BTreeMap::new();
+        let mut fresh_decorated: Vec<[ProtoChunk; 9]> = Vec::with_capacity(centers.len());
+        let mut fresh_stats: Vec<DecorateStats> = Vec::with_capacity(centers.len());
+        for &center in centers {
+            let positions = neighborhood_positions(center);
+            let mut region =
+                std::array::from_fn(|i| generator.worker().generate_proto(positions[i]).unwrap());
+            for (pos, chunk) in positions.iter().zip(region.iter()) {
+                fresh_proto.insert((pos.x, pos.z), ProtoSnapshot::of(chunk));
+            }
+            let stats = generator.worker().decorate(&mut region).unwrap();
+            fresh_decorated.push(region);
+            fresh_stats.push(stats);
+        }
+
+        // Candidate: ONE reused GeneratorWorker across multiple shuffled passes
+        // of both proto generation and decoration.
+        let mut reused = generator.worker();
+        let all_positions: Vec<ChunkPos> = centers
+            .iter()
+            .flat_map(|&c| neighborhood_positions(c))
+            .collect();
+
+        for (pass_idx, &center_order) in passes.iter().enumerate() {
+            assert_eq!(center_order.len(), centers.len());
+            let mut proto_order: Vec<usize> = (0..all_positions.len()).collect();
+            let proto_len = proto_order.len();
+            let stride = if pass_idx.is_multiple_of(2) { 7 } else { 11 };
+            let offset = (pass_idx * 5 + 3) % proto_len;
+            proto_order.sort_by_key(|&i| (i * stride + offset) % proto_len);
+
+            let mut reused_proto: BTreeMap<(i32, i32), ProtoChunk> = BTreeMap::new();
+            for idx in proto_order {
+                let pos = all_positions[idx];
+                let chunk = reused.generate_proto(pos).unwrap();
+                assert_proto_snapshot_equal(
+                    &fresh_proto[&(pos.x, pos.z)],
+                    &ProtoSnapshot::of(&chunk),
+                    &format!("pass {pass_idx} proto ({}, {})", pos.x, pos.z),
+                );
+                reused_proto.insert((pos.x, pos.z), chunk);
+            }
+
+            for &center_idx in center_order {
+                let center = centers[center_idx];
+                let positions = neighborhood_positions(center);
+                let mut region = std::array::from_fn(|i| {
+                    reused_proto
+                        .remove(&(positions[i].x, positions[i].z))
+                        .unwrap()
+                });
+                let stats = reused.decorate(&mut region).unwrap();
+                assert_eq!(
+                    stats, fresh_stats[center_idx],
+                    "pass {pass_idx} decorate stats center ({}, {})",
+                    center.x, center.z
+                );
+                for (slot, (want, got)) in fresh_decorated[center_idx]
+                    .iter()
+                    .zip(region.iter())
+                    .enumerate()
+                {
+                    assert_proto_chunk_byte_equal(
+                        want,
+                        got,
+                        &format!(
+                            "pass {pass_idx} decorated center ({}, {}) slot {slot}",
+                            center.x, center.z
+                        ),
+                    );
+                }
+            }
+            assert_eq!(reused.state.decor_standins.len(), 9);
+            assert!(!reused.state.decor_uniform_biomes.is_empty());
+        }
+        // Verify release() drops cached surface-rule, uniform-biome, and
+        // decoration scratch state cleanly and subsequent generation still
+        // matches fresh workers byte-for-byte.
+        assert!(reused.state.surface_rule.is_some());
+        reused.release();
+        assert!(reused.state.surface_rule.is_none());
+        assert!(reused.state.uniform_biomes.cells.is_empty());
+        assert!(reused.state.decor_standins.is_empty());
+        assert!(reused.state.decor_uniform_biomes.is_empty());
+        if let Some(&center) = centers.last() {
+            let chunk = reused.generate_proto(center).unwrap();
+            assert_proto_snapshot_equal(
+                &fresh_proto[&(center.x, center.z)],
+                &ProtoSnapshot::of(&chunk),
+                &format!("post-release proto ({}, {})", center.x, center.z),
+            );
+        }
+        (fresh_decorated, fresh_stats)
+    }
+
+    #[test]
+    fn temp_dir_guard_retries_existing_paths_and_cleans_up_on_drop() {
+        let outer = TempDirGuard::create("horizon-temp-guard-test");
+        let outer_path = outer.path().to_path_buf();
+        assert!(outer_path.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::symlink_metadata(&outer_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+
+        let existing = outer.create_subdir("colliding");
+        let sentinel = existing.join("keep.txt");
+        fs::write(&sentinel, "sentinel").unwrap();
+
+        let inner = TempDirGuard::create_with(outer.path(), |attempt| {
+            if attempt == 0 {
+                "colliding".to_owned()
+            } else {
+                format!("fresh-{attempt}")
+            }
+        });
+        let inner_path = inner.path().to_path_buf();
+        assert_eq!(inner_path, outer.path().join("fresh-1"));
+        assert!(inner_path.is_dir());
+
+        drop(inner);
+        assert!(!inner_path.exists());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "sentinel");
+
+        drop(outer);
+        assert!(!outer_path.exists());
+    }
+
+    #[test]
+    fn worker_reuse_matches_fresh_workers_for_proto_and_decorated_chunks() {
+        let fixture = build_synthetic_reuse_data();
+        let generator = OverworldGenerator::for_world(
+            Arc::clone(&fixture.data),
+            12345,
+            "minecraft:normal",
+            "minecraft:overworld",
+            false,
+        )
+        .unwrap();
+
+        // 3 disjoint 3×3 neighborhoods (27 proto chunks, 3 decorated regions)
+        // covering all 4 biomes: uniform plains (1, 1), uniform snowy_taiga
+        // (5, 1), and a mixed eroded_badlands + frozen_ocean boundary (7, 5).
+        let centers = [
+            ChunkPos::new(1, 1),
+            ChunkPos::new(5, 1),
+            ChunkPos::new(7, 5),
+        ];
+        let order_a = [2, 0, 1];
+        let order_b = [1, 2, 0];
+        let (decorated, decorate_stats) =
+            verify_worker_reuse_on_centers(&generator, &centers, &[&order_a, &order_b]);
+        for stats in &decorate_stats {
+            assert_eq!(
+                stats.failed, 0,
+                "unexpected failed features: {:?}",
+                stats.skipped
+            );
+            assert_eq!(
+                stats.unsupported, 0,
+                "unexpected unsupported features: {:?}",
+                stats.skipped
+            );
+        }
+
+        // Verify the synthetic world actually exercised surface rules, ores,
+        // freezing/snow, and block entities so the equality test is non-vacuous.
+        let coal_ore = fixture
+            .registry
+            .default_state("minecraft:coal_ore")
+            .unwrap();
+        let grass = fixture
+            .registry
+            .default_state("minecraft:grass_block")
+            .unwrap();
+        let deepslate = fixture
+            .registry
+            .default_state("minecraft:deepslate")
+            .unwrap();
+        let bedrock = fixture.registry.default_state("minecraft:bedrock").unwrap();
+        let ice = fixture.registry.default_state("minecraft:ice").unwrap();
+        let snow = fixture.registry.default_state("minecraft:snow").unwrap();
+        let terracotta = fixture
+            .registry
+            .default_state("minecraft:terracotta")
+            .unwrap();
+
+        let mut saw_block_entities = false;
+        let mut saw_coal_ore = false;
+        let mut saw_grass = false;
+        let mut saw_deepslate = false;
+        let mut saw_bedrock = false;
+        let mut saw_freeze_or_snow = false;
+        let mut saw_terracotta = false;
+        for region in &decorated {
+            for chunk in region {
+                if !chunk.block_entities.is_empty() {
+                    saw_block_entities = true;
+                }
+                let ox = chunk.position().x * 16;
+                let oz = chunk.position().z * 16;
+                for y in -32..64 {
+                    for lx in 0..16 {
+                        for lz in 0..16 {
+                            let b = chunk.terrain.block(ox + lx, y, oz + lz);
+                            if b == coal_ore {
+                                saw_coal_ore = true;
+                            } else if b == grass {
+                                saw_grass = true;
+                            } else if b == deepslate {
+                                saw_deepslate = true;
+                            } else if b == bedrock {
+                                saw_bedrock = true;
+                            } else if b == ice || b == snow {
+                                saw_freeze_or_snow = true;
+                            } else if b == terracotta {
+                                saw_terracotta = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_block_entities, "expected bonus_chest block entities");
+        assert!(saw_coal_ore, "expected ore_coal feature blocks");
+        assert!(saw_grass, "expected grass_block from surface rule");
+        assert!(saw_deepslate, "expected deepslate from surface rule");
+        assert!(saw_bedrock, "expected bedrock from surface rule");
+        assert!(
+            saw_freeze_or_snow,
+            "expected ice or snow from freeze_top_layer"
+        );
+        assert!(
+            saw_terracotta,
+            "expected terracotta from eroded_badlands bandlands"
+        );
+    }
+
+    #[test]
+    fn decoration_error_preserves_caller_chunks_and_standin_pool() {
+        let fixture = build_synthetic_reuse_data();
+        let generator = OverworldGenerator::for_world(
+            Arc::clone(&fixture.data),
+            12345,
+            "minecraft:normal",
+            "minecraft:overworld",
+            false,
+        )
+        .unwrap();
+
+        // Populate the worker's recycled stand-in pool with 9 stand-ins from (1, 1).
+        let mut worker = generator.worker();
+        let positions_a = neighborhood_positions(ChunkPos::new(1, 1));
+        let mut region_a = std::array::from_fn(|i| worker.generate_proto(positions_a[i]).unwrap());
+        let _ = worker.decorate(&mut region_a).unwrap();
+        assert_eq!(worker.state.decor_standins.len(), 9);
+        assert!(!worker.state.decor_uniform_biomes.is_empty());
+
+        // Build a second 3×3 neighborhood at (5, 1) and replace slot 0's terrain
+        // with a terrain-stage chunk at the same position but mismatched height
+        // (16 instead of 96). This passes the 3×3 position and stage checks and
+        // trips the TerrainRegion::new InvalidChunks precondition check.
+        let positions_b = neighborhood_positions(ChunkPos::new(5, 1));
+        let mut bad_region =
+            std::array::from_fn(|i| worker.generate_proto(positions_b[i]).unwrap());
+        let min_y = bad_region[0].terrain.min_y();
+        let mut mismatched = TerrainChunk::new(
+            bad_region[0].position(),
+            min_y,
+            16,
+            fixture.registry,
+            fixture.data.block_states().clone(),
+        )
+        .unwrap();
+        mismatched.set_generation_stage(PreLightChunkStage::Terrain);
+        bad_region[0].terrain = mismatched;
+
+        let before: Vec<ProtoSnapshot> = bad_region.iter().map(ProtoSnapshot::of).collect();
+        let err = worker
+            .decorate(&mut bad_region)
+            .expect_err("mismatched chunk height must fail decoration");
+        assert!(
+            err.to_string().contains("InvalidChunks"),
+            "unexpected error: {err}"
+        );
+
+        // Every caller chunk must remain byte-identical to its pre-call snapshot
+        // (no recycled stand-ins from (1, 1) left in caller chunks).
+        for (slot, (want, got)) in before.iter().zip(bad_region.iter()).enumerate() {
+            assert_proto_snapshot_equal(
+                want,
+                &ProtoSnapshot::of(got),
+                &format!("failed decorate slot {slot}"),
+            );
+        }
+        assert_eq!(worker.state.decor_standins.len(), 9);
+
+        // Subsequent decoration of a valid neighborhood on the same worker must
+        // still match a fresh worker byte-for-byte.
+        let mut fresh_region =
+            std::array::from_fn(|i| generator.worker().generate_proto(positions_b[i]).unwrap());
+        let fresh_stats = generator.worker().decorate(&mut fresh_region).unwrap();
+
+        let mut reused_region =
+            std::array::from_fn(|i| worker.generate_proto(positions_b[i]).unwrap());
+        let reused_stats = worker.decorate(&mut reused_region).unwrap();
+        assert_eq!(reused_stats, fresh_stats);
+        for (slot, (want, got)) in fresh_region.iter().zip(reused_region.iter()).enumerate() {
+            assert_proto_chunk_byte_equal(want, got, &format!("post-error slot {slot}"));
+        }
+
+        worker.release();
+        assert!(worker.state.decor_standins.is_empty());
+        assert!(worker.state.decor_uniform_biomes.is_empty());
+    }
+
+    #[test]
+    fn worker_reuse_matches_fresh_workers_on_overworld_bundle() {
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3")
+            });
+        if !root.join("worldgen/world_presets.json").exists() {
+            eprintln!("skipping: no worldgen bundle at {}", root.display());
+            return;
+        }
+        let registry = Box::leak(Box::new(crate::level::data::load_registry(&root).unwrap()));
+        let data = GeneratorData::load(&root.join("worldgen"), registry).unwrap();
+        let generator = OverworldGenerator::new(data, 12345).unwrap();
+        let centers = [ChunkPos::new(0, 0), ChunkPos::new(3, 0)];
+        let order_a = [1, 0];
+        let order_b = [0, 1];
+        let _ = verify_worker_reuse_on_centers(&generator, &centers, &[&order_a, &order_b]);
+    }
+
+    #[test]
+    fn distant_surface_sample_does_not_alias_sliced_y_coordinates() {
+        let dir = TempDirGuard::create("horizon-wg-surface-slice-y");
+        dir.create_subdir("blocks");
+
+        let block_specs: [(&str, bool, bool); 20] = [
+            ("minecraft:air", true, false),
+            ("minecraft:void_air", true, false),
+            ("minecraft:cave_air", true, false),
+            ("minecraft:stone", false, false),
+            ("minecraft:water", false, true),
+            ("minecraft:lava", false, true),
+            ("minecraft:grass_block", false, false),
+            ("minecraft:mycelium", false, false),
+            ("minecraft:dirt", false, false),
+            ("minecraft:sand", false, false),
+            ("minecraft:bedrock", false, false),
+            ("minecraft:packed_ice", false, false),
+            ("minecraft:snow_block", false, false),
+            ("minecraft:terracotta", false, false),
+            ("minecraft:orange_terracotta", false, false),
+            ("minecraft:yellow_terracotta", false, false),
+            ("minecraft:brown_terracotta", false, false),
+            ("minecraft:red_terracotta", false, false),
+            ("minecraft:white_terracotta", false, false),
+            ("minecraft:light_gray_terracotta", false, false),
+        ];
+        let states_json: Vec<Value> = block_specs
+            .iter()
+            .map(|&(name, air, fluid)| {
+                let state = if fluid {
+                    serde_json::json!({"id": name, "properties": {"level": "0"}})
+                } else {
+                    serde_json::json!(name)
+                };
+                serde_json::json!([name, air, fluid, "x", state])
+            })
+            .collect();
+        let defaults_json: serde_json::Map<String, Value> = block_specs
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, _, _))| (name.to_owned(), Value::from(i)))
+            .collect();
+        let facts_bytes = serde_json::to_vec(&serde_json::json!({
+            "states": states_json,
+            "defaults": defaults_json,
+        }))
+        .expect("serialize synthetic block facts");
+        let (registry, _) =
+            BlockRegistry::from_facts_json_bytes(&facts_bytes).expect("build block registry");
+        let registry: &'static BlockRegistry = Box::leak(Box::new(registry));
+
+        let write_json = |rel: &str, value: &Value| {
+            fs::write(
+                dir.path().join(rel),
+                serde_json::to_vec(value).expect("serialize bundle file"),
+            )
+            .expect("write bundle file");
+        };
+        let write_bundle = |rel: &str, entries: &[(&str, Value)]| {
+            let map: serde_json::Map<String, Value> = entries
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        (*k).to_owned(),
+                        Value::String(serde_json::to_string(v).expect("serialize bundle entry")),
+                    )
+                })
+                .collect();
+            write_json(rel, &Value::Object(map));
+        };
+
+        let flags: Vec<(bool, bool)> = block_specs
+            .iter()
+            .map(|&(_, air, fluid)| (air, fluid))
+            .collect();
+        write_json("block_flags.json", &serde_json::json!(flags));
+
+        let motion_blocks = serde_json::json!({
+            "values": [
+                "minecraft:stone",
+                "minecraft:grass_block",
+                "minecraft:dirt",
+                "minecraft:sand",
+                "minecraft:bedrock",
+                "minecraft:water",
+                "minecraft:lava"
+            ]
+        });
+        write_bundle(
+            "block_tags.json",
+            &[
+                (
+                    "minecraft:blocks_motion_in_heightmap",
+                    motion_blocks.clone(),
+                ),
+                (
+                    "minecraft:blocks_motion_in_heightmap_no_leaves",
+                    motion_blocks,
+                ),
+                (
+                    "minecraft:uncarvable",
+                    serde_json::json!({"values": ["minecraft:bedrock"]}),
+                ),
+            ],
+        );
+        write_bundle("biome_tags.json", &[]);
+        write_bundle("conditions.json", &[]);
+        write_bundle("carvers.json", &[]);
+
+        // One shared cached Y-gradient read through Y=0 (temperature) and Y=4096 (depth).
+        // Under a 12-bit packed Y cache key, both slices collide and resolve desert + sand
+        // instead of plains + grass_block inside Pipeline::surface_sample.
+        write_bundle(
+            "densities.json",
+            &[(
+                "test:shared_y_grad",
+                serde_json::json!({
+                    "type": "minecraft:cache",
+                    "input": {
+                        "type": "minecraft:gradient",
+                        "axis": "y",
+                        "from_coordinate": 0,
+                        "to_coordinate": 4096,
+                        "from_value": 0.0,
+                        "to_value": 1.0
+                    }
+                }),
+            )],
+        );
+
+        let noise_names = [
+            "minecraft:clay_bands_offset",
+            "minecraft:surface",
+            "minecraft:surface_secondary",
+            "minecraft:badlands_surface",
+            "minecraft:badlands_pillar",
+            "minecraft:badlands_pillar_roof",
+            "minecraft:iceberg_surface",
+            "minecraft:iceberg_pillar",
+            "minecraft:iceberg_pillar_roof",
+        ];
+        let noise_entries: Vec<(&str, Value)> = noise_names
+            .iter()
+            .map(|&name| (name, serde_json::json!({"base_octave": -4})))
+            .collect();
+        write_bundle("noises.json", &noise_entries);
+
+        write_bundle(
+            "biomes.json",
+            &[
+                (
+                    "minecraft:plains",
+                    serde_json::json!({
+                        "temperature": 0.8,
+                        "downfall": 0.4,
+                        "has_precipitation": true,
+                        "carvers": []
+                    }),
+                ),
+                (
+                    "minecraft:desert",
+                    serde_json::json!({
+                        "temperature": 2.0,
+                        "downfall": 0.0,
+                        "has_precipitation": false,
+                        "carvers": []
+                    }),
+                ),
+            ],
+        );
+
+        write_bundle(
+            "rules.json",
+            &[(
+                "test:surface",
+                serde_json::json!({
+                    "type": "minecraft:sequence",
+                    "sequence": [
+                        {
+                            "type": "minecraft:condition",
+                            "if_true": {
+                                "type": "minecraft:stone_depth",
+                                "offset": 0,
+                                "add_surface_depth": false,
+                                "secondary_depth_range": 0,
+                                "surface_type": "floor"
+                            },
+                            "then_run": {
+                                "type": "minecraft:sequence",
+                                "sequence": [
+                                    {
+                                        "type": "minecraft:condition",
+                                        "if_true": {
+                                            "type": "minecraft:biome",
+                                            "biome_is": ["minecraft:desert"]
+                                        },
+                                        "then_run": {
+                                            "type": "minecraft:block",
+                                            "result_state": "minecraft:sand"
+                                        }
+                                    },
+                                    {
+                                        "type": "minecraft:block",
+                                        "result_state": "minecraft:grass_block"
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }),
+            )],
+        );
+
+        write_bundle(
+            "settings.json",
+            &[(
+                "minecraft:overworld",
+                serde_json::json!({
+                    "noise": {"min_y": 0, "height": 80},
+                    "sea_level": 24,
+                    "default_block": "minecraft:stone",
+                    "default_fluid": "minecraft:water",
+                    "legacy_random_source": false,
+                    "disable_mob_generation": true,
+                    "material_rule": "test:surface",
+                    "noise_router": {
+                        "temperature": {
+                            "type": "minecraft:slice",
+                            "axis": "y",
+                            "coordinate": 0,
+                            "input": "test:shared_y_grad"
+                        },
+                        "vegetation": 0.25,
+                        "continents": 0.25,
+                        "erosion": 0.0,
+                        "depth": {
+                            "type": "minecraft:slice",
+                            "axis": "y",
+                            "coordinate": 4096,
+                            "input": "test:shared_y_grad"
+                        },
+                        "ridges": 0.0,
+                        "chunk_surface_level": 48.0,
+                        "final_density": {
+                            "type": "minecraft:gradient",
+                            "axis": "y",
+                            "from_coordinate": 0,
+                            "to_coordinate": 80,
+                            "from_value": 2.0,
+                            "to_value": -1.2
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let point = |depth: f64| {
+            serde_json::json!({
+                "temperature": [0.0, 0.0],
+                "humidity": [0.25, 0.25],
+                "continentalness": [0.25, 0.25],
+                "erosion": [0.0, 0.0],
+                "depth": [depth, depth],
+                "weirdness": [0.0, 0.0],
+                "offset": 0.0
+            })
+        };
+        write_bundle(
+            "world_presets.json",
+            &[(
+                "minecraft:normal",
+                serde_json::json!({
+                    "dimensions": {
+                        "minecraft:overworld": {
+                            "type": "minecraft:overworld",
+                            "generator": {
+                                "type": "minecraft:noise",
+                                "settings": "minecraft:overworld",
+                                "biome_source": {
+                                    "type": "minecraft:multi_noise",
+                                    "biomes": [
+                                        {"biome": "minecraft:plains", "parameters": point(1.0)},
+                                        {"biome": "minecraft:desert", "parameters": point(0.0)}
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let data =
+            GeneratorData::load(dir.path(), registry).expect("load synthetic generator data");
+        let plains_id = data.biome_id("minecraft:plains").expect("plains biome id");
+        let grass_id = registry
+            .default_state("minecraft:grass_block")
+            .expect("grass_block state");
+        let generator = OverworldGenerator::for_world(
+            data,
+            0x005E_ED19_537B_i64,
+            "minecraft:normal",
+            "minecraft:overworld",
+            false,
+        )
+        .expect("build synthetic overworld generator");
+        let mut worker = generator.worker();
+
+        for (x, z) in [
+            (12, -20),
+            (-12, 20),
+            (0, 0),
+            ((1 << 26) + 12, -(1 << 26) - 20),
+        ] {
+            let sample = worker
+                .surface_sample(x, z)
+                .expect("distant surface sample at sliced-Y column");
+            assert_eq!(
+                sample.biome, plains_id,
+                "surface_sample biome at ({x}, {z}) must distinguish Y=0 and Y=4096 slices"
+            );
+            assert_eq!(
+                sample.state, grass_id,
+                "surface_sample material rule at ({x}, {z}) must resolve plains grass_block"
+            );
+        }
+
+        let sample = worker
+            .surface_sample(12, -20)
+            .expect("surface sample at (12, -20)");
+        let chunk = worker
+            .generate_proto(ChunkPos::new(0, -2))
+            .expect("proto chunk at (0, -2)");
+        assert_eq!(sample.biome, chunk.biome_id_at(12, sample.height - 1, -20));
+        assert_eq!(sample.state, chunk.block(12, sample.height - 1, -20));
+
+        // Point biome queries (`carver_context`) also remain uncached and distinguish Y=0 / Y=4096.
+        let point_quarts = [
+            [3, 0, -5],
+            [3, 1024, -5],
+            [1 << 24, -1024, -(1 << 24)],
+            [0, 0, 0],
+        ];
+        let point_biomes = worker.noise_biomes(&point_quarts);
+        assert_eq!(point_biomes.len(), point_quarts.len());
+        for (quart, got) in point_quarts.into_iter().zip(point_biomes) {
+            assert_eq!(got.as_deref(), Some("minecraft:plains"), "quart {quart:?}");
+        }
+    }
+
+    #[test]
+    fn sharded_worldgen_caches_preserve_lookup_promotion_eviction_and_clear() {
+        let same_shard_keys =
+            |target_shard: usize, count: usize, y_offset: i32| -> Vec<(i32, i32)> {
+                let mut keys = Vec::with_capacity(count);
+                for x in 1.. {
+                    let key = (x, y_offset);
+                    if shard_of(key, CACHE_SHARDS) == target_shard {
+                        keys.push(key);
+                        if keys.len() == count {
+                            break;
+                        }
+                    }
+                }
+                keys
+            };
+        let other_shard_key = |avoid_shard: usize| -> (i32, i32) {
+            (1..)
+                .map(|x| (x, -9999))
+                .find(|&key| shard_of(key, CACHE_SHARDS) != avoid_shard)
+                .unwrap()
+        };
+
+        // BiomeCache: hit in `now`, promote from `old` -> `now`, evict after two generations,
+        // keep other shards intact, and drop everything on `clear`.
+        let biome_cache = BiomeCache::new();
+        let kept_key = (2, -3);
+        let kept_shard = shard_of(kept_key, CACHE_SHARDS);
+        let bystander_key = other_shard_key(kept_shard);
+        let kept = Arc::new(BiomeChunk::new(ChunkPos::new(2, -3), -64, 64, BiomeId(7)).unwrap());
+        let bystander = Arc::new(
+            BiomeChunk::new(
+                ChunkPos::new(bystander_key.0, bystander_key.1),
+                -64,
+                64,
+                BiomeId(9),
+            )
+            .unwrap(),
+        );
+        biome_cache.insert(kept_key, kept.clone());
+        biome_cache.insert(bystander_key, bystander.clone());
+        assert!(Arc::ptr_eq(&biome_cache.get(&kept_key).unwrap(), &kept));
+
+        let per_shard = (CACHE_LIMIT / CACHE_SHARDS).max(2);
+        let half = per_shard / 2;
+        let first_gen = same_shard_keys(kept_shard, half, 100);
+        for &k in &first_gen {
+            biome_cache.insert(k, kept.clone());
+        }
+        // `kept_key` rotated into `old` and must promote back to `now` on lookup.
+        assert!(Arc::ptr_eq(&biome_cache.get(&kept_key).unwrap(), &kept));
+        let (chunks, bytes) = biome_cache.census();
+        assert!(chunks >= 2 && bytes > 0);
+        // Two full generations of distinct keys in the same shard evict `kept_key`.
+        let evict = same_shard_keys(kept_shard, per_shard, 200);
+        for &k in &evict {
+            biome_cache.insert(k, kept.clone());
+        }
+        assert!(biome_cache.get(&kept_key).is_none());
+        assert!(Arc::ptr_eq(
+            &biome_cache.get(&bystander_key).unwrap(),
+            &bystander
+        ));
+        assert!(biome_cache.len() <= CACHE_LIMIT);
+        biome_cache.clear();
+        assert_eq!(biome_cache.len(), 0);
+        assert_eq!(biome_cache.census().0, 0);
+
+        // LatticeCache: hit, per-shard eviction without disturbing other shards, and `clear`.
+        let lattice_cache = LatticeCache::new();
+        let lat_key = (5, -9);
+        let lat_shard = shard_of(lat_key, CACHE_SHARDS);
+        let lat_bystander = other_shard_key(lat_shard);
+        let sample = Arc::new(Vec::new());
+        let sample_b = Arc::new(Vec::new());
+        lattice_cache.insert(lat_key, sample.clone());
+        lattice_cache.insert(lat_bystander, sample_b.clone());
+        assert!(Arc::ptr_eq(&lattice_cache.get(&lat_key).unwrap(), &sample));
+        let lat_cap = (LATTICE_CACHE_LIMIT / CACHE_SHARDS).max(1);
+        for k in same_shard_keys(lat_shard, lat_cap, 300) {
+            lattice_cache.insert(k, sample.clone());
+        }
+        assert!(lattice_cache.get(&lat_key).is_none());
+        assert!(Arc::ptr_eq(
+            &lattice_cache.get(&lat_bystander).unwrap(),
+            &sample_b
+        ));
+        lattice_cache.clear();
+        assert!(lattice_cache.get(&lat_bystander).is_none());
+
+        // CarverCache: hit, per-shard eviction without disturbing other shards, and `clear`.
+        let carver_cache = CarverCache::new();
+        let carver_key = (1, 2);
+        let carver_shard = shard_of(carver_key, CACHE_SHARDS);
+        let carver_bystander = other_shard_key(carver_shard);
+        carver_cache.insert(carver_key, BiomeId(11));
+        carver_cache.insert(carver_bystander, BiomeId(13));
+        assert_eq!(carver_cache.get(&carver_key), Some(BiomeId(11)));
+        assert_eq!(carver_cache.len(), 2);
+        let carver_cap = (CARVER_CACHE_LIMIT / CACHE_SHARDS).max(1);
+        for k in same_shard_keys(carver_shard, carver_cap, 400) {
+            carver_cache.insert(k, BiomeId(21));
+        }
+        assert!(carver_cache.get(&carver_key).is_none());
+        assert_eq!(carver_cache.get(&carver_bystander), Some(BiomeId(13)));
+        carver_cache.clear();
+        assert_eq!(carver_cache.len(), 0);
+    }
+
+    #[test]
+    fn chunk_generation_is_independent_of_chunk_order_and_thread_count() {
+        use std::sync::Barrier;
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct ChunkSnapshot {
+            blocks: Vec<u32>,
+            biomes: Vec<u32>,
+            heightmaps: Vec<(HeightmapType, Vec<i32>)>,
+            own_starts: Vec<(String, [i32; 2], Vec<u8>)>,
+            direct_starts: Vec<(String, [i32; 2], Vec<u8>)>,
+            referenced_starts: Vec<(String, [i32; 2], [i32; 3], [i32; 3])>,
+        }
+
+        fn serialize_starts(
+            starts: Vec<Arc<super::super::structure::start::StructureStart>>,
+        ) -> Vec<(String, [i32; 2], Vec<u8>)> {
+            starts
+                .into_iter()
+                .map(|start| {
+                    let tag = start.save().expect("synthetic structure start saves");
+                    let bytes = horizon_core::nbt::write_network(
+                        &tag,
+                        horizon_core::nbt::Limits::default(),
+                    )
+                    .expect("serialize structure start NBT");
+                    (start.name.clone(), [start.chunk.x, start.chunk.z], bytes)
+                })
+                .collect()
+        }
+
+        fn snapshot(worker: &mut GeneratorWorker, pos: ChunkPos) -> ChunkSnapshot {
+            let chunk = worker
+                .generate_proto(pos)
+                .expect("synthetic proto chunk generates");
+            let direct_starts = serialize_starts(worker.structure_starts(pos));
+            let min_y = chunk.terrain.min_y();
+            let height = chunk.terrain.height();
+            let sections = (height / 16) as usize;
+            let mut blocks = Vec::with_capacity(sections * 4096);
+            let mut section_blocks = [0u32; 4096];
+            for section in 0..sections {
+                let section_y = min_y + (section as i32) * 16;
+                assert!(
+                    chunk.terrain.section_states(section_y, &mut section_blocks),
+                    "in-bounds section y={section_y}"
+                );
+                blocks.extend_from_slice(&section_blocks);
+            }
+            let mut biomes = Vec::with_capacity(sections * 64);
+            for section in 0..sections {
+                biomes.extend(
+                    chunk
+                        .biomes()
+                        .section(section)
+                        .expect("in-bounds biome section")
+                        .iter()
+                        .map(|b| b.0),
+                );
+            }
+            let heightmaps = HeightmapType::ALL
+                .into_iter()
+                .map(|kind| {
+                    let map = chunk
+                        .terrain
+                        .heightmap(kind)
+                        .expect("primed proto heightmap");
+                    let mut values = Vec::with_capacity(256);
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            values.push(map.first_available(x, z).expect("in-bounds heightmap"));
+                        }
+                    }
+                    (kind, values)
+                })
+                .collect();
+            let own_starts = serialize_starts(chunk.own_starts());
+            let referenced_starts = chunk
+                .structures()
+                .into_iter()
+                .map(|(name, start_chunk, min, max)| {
+                    (name.to_owned(), [start_chunk.x, start_chunk.z], min, max)
+                })
+                .collect();
+            ChunkSnapshot {
+                blocks,
+                biomes,
+                heightmaps,
+                own_starts,
+                direct_starts,
+                referenced_starts,
+            }
+        }
+
+        // Build a compact self-contained synthetic worldgen bundle exercising
+        // multi-noise biomes, cached density functions, noise terrain, surface
+        // rules, cave carving, and cross-chunk structure starts.
+        let dir = TempDirGuard::create("horizon-wg-order-threads");
+        dir.create_subdir("blocks");
+
+        let block_specs: [(&str, bool, bool); 20] = [
+            ("minecraft:air", true, false),
+            ("minecraft:void_air", true, false),
+            ("minecraft:cave_air", true, false),
+            ("minecraft:stone", false, false),
+            ("minecraft:water", false, true),
+            ("minecraft:lava", false, true),
+            ("minecraft:grass_block", false, false),
+            ("minecraft:mycelium", false, false),
+            ("minecraft:dirt", false, false),
+            ("minecraft:sand", false, false),
+            ("minecraft:bedrock", false, false),
+            ("minecraft:packed_ice", false, false),
+            ("minecraft:snow_block", false, false),
+            ("minecraft:terracotta", false, false),
+            ("minecraft:orange_terracotta", false, false),
+            ("minecraft:yellow_terracotta", false, false),
+            ("minecraft:brown_terracotta", false, false),
+            ("minecraft:red_terracotta", false, false),
+            ("minecraft:white_terracotta", false, false),
+            ("minecraft:light_gray_terracotta", false, false),
+        ];
+        let states_json: Vec<Value> = block_specs
+            .iter()
+            .map(|&(name, air, fluid)| {
+                let state = if fluid {
+                    serde_json::json!({"id": name, "properties": {"level": "0"}})
+                } else {
+                    serde_json::json!(name)
+                };
+                serde_json::json!([name, air, fluid, "x", state])
+            })
+            .collect();
+        let defaults_json: serde_json::Map<String, Value> = block_specs
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, _, _))| (name.to_owned(), Value::from(i)))
+            .collect();
+        let facts_bytes = serde_json::to_vec(&serde_json::json!({
+            "states": states_json,
+            "defaults": defaults_json,
+        }))
+        .expect("serialize synthetic block facts");
+        let (registry, _) =
+            BlockRegistry::from_facts_json_bytes(&facts_bytes).expect("build block registry");
+        let registry: &'static BlockRegistry = Box::leak(Box::new(registry));
+        let state_count = registry.len();
+
+        let write_json = |rel: &str, value: &Value| {
+            fs::write(
+                dir.path().join(rel),
+                serde_json::to_vec(value).expect("serialize bundle file"),
+            )
+            .expect("write bundle file");
+        };
+        let write_bundle = |rel: &str, entries: &[(&str, Value)]| {
+            let map: serde_json::Map<String, Value> = entries
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        (*k).to_owned(),
+                        Value::String(serde_json::to_string(v).expect("serialize bundle entry")),
+                    )
+                })
+                .collect();
+            write_json(rel, &Value::Object(map));
+        };
+
+        let flags: Vec<(bool, bool)> = block_specs
+            .iter()
+            .map(|&(_, air, fluid)| (air, fluid))
+            .collect();
+        write_json("block_flags.json", &serde_json::json!(flags));
+
+        let motion_blocks = serde_json::json!({
+            "values": [
+                "minecraft:stone",
+                "minecraft:grass_block",
+                "minecraft:dirt",
+                "minecraft:sand",
+                "minecraft:bedrock",
+                "minecraft:water",
+                "minecraft:lava"
+            ]
+        });
+        write_bundle(
+            "block_tags.json",
+            &[
+                (
+                    "minecraft:blocks_motion_in_heightmap",
+                    motion_blocks.clone(),
+                ),
+                (
+                    "minecraft:blocks_motion_in_heightmap_no_leaves",
+                    motion_blocks,
+                ),
+                (
+                    "minecraft:uncarvable",
+                    serde_json::json!({"values": ["minecraft:bedrock"]}),
+                ),
+            ],
+        );
+        write_bundle("biome_tags.json", &[]);
+        write_bundle("conditions.json", &[]);
+        write_bundle("densities.json", &[]);
+        write_bundle("template_pools.json", &[]);
+
+        let rotate: Vec<[usize; 3]> = (0..state_count).map(|i| [i, i, i]).collect();
+        let mirror: Vec<[usize; 2]> = (0..state_count).map(|i| [i, i]).collect();
+        let full_block: Vec<bool> = block_specs
+            .iter()
+            .map(|&(_, air, fluid)| !air && !fluid)
+            .collect();
+        write_json(
+            "blocks/structure-blocks.json",
+            &serde_json::json!({
+                "rotate": rotate,
+                "mirror": mirror,
+                "full_block": full_block,
+                "loot_containers": [],
+                "block_entities": {},
+            }),
+        );
+
+        let noise_names = [
+            "minecraft:clay_bands_offset",
+            "minecraft:surface",
+            "minecraft:surface_secondary",
+            "minecraft:badlands_surface",
+            "minecraft:badlands_pillar",
+            "minecraft:badlands_pillar_roof",
+            "minecraft:iceberg_surface",
+            "minecraft:iceberg_pillar",
+            "minecraft:iceberg_pillar_roof",
+            "minecraft:temperature",
+            "minecraft:vegetation",
+            "minecraft:continentalness",
+            "minecraft:erosion",
+            "minecraft:ridge",
+            "minecraft:jagged",
+        ];
+        let noise_entries: Vec<(&str, Value)> = noise_names
+            .iter()
+            .map(|&name| (name, serde_json::json!({"base_octave": -4})))
+            .collect();
+        write_bundle("noises.json", &noise_entries);
+
+        write_bundle(
+            "carvers.json",
+            &[(
+                "minecraft:cave",
+                serde_json::json!({
+                    "type": "minecraft:cave",
+                    "probability": 0.45,
+                    "count": {"type": "minecraft:uniform", "min_inclusive": 1, "max_inclusive": 2},
+                    "y": {
+                        "type": "minecraft:uniform",
+                        "min_inclusive": {"absolute": 8},
+                        "max_inclusive": {"absolute": 44}
+                    },
+                    "thickness": {"type": "minecraft:uniform", "min_inclusive": 0.6, "max_exclusive": 1.4},
+                    "room_vertical_radius_multiplier": {"type": "minecraft:uniform", "min_inclusive": 0.5, "max_exclusive": 1.0},
+                    "horizontal_radius_multiplier": {"type": "minecraft:uniform", "min_inclusive": 0.6, "max_exclusive": 1.0},
+                    "vertical_radius_multiplier": {"type": "minecraft:uniform", "min_inclusive": 0.6, "max_exclusive": 1.0},
+                    "floor_level": {"type": "minecraft:uniform", "min_inclusive": -1.0, "max_exclusive": -0.5}
+                }),
+            )],
+        );
+
+        write_bundle(
+            "biomes.json",
+            &[
+                (
+                    "minecraft:plains",
+                    serde_json::json!({
+                        "temperature": 0.8,
+                        "downfall": 0.4,
+                        "has_precipitation": true,
+                        "carvers": ["minecraft:cave"]
+                    }),
+                ),
+                (
+                    "minecraft:desert",
+                    serde_json::json!({
+                        "temperature": 2.0,
+                        "downfall": 0.0,
+                        "has_precipitation": false,
+                        "carvers": ["minecraft:cave"]
+                    }),
+                ),
+                (
+                    "minecraft:swamp",
+                    serde_json::json!({
+                        "temperature": 0.8,
+                        "downfall": 0.9,
+                        "has_precipitation": true,
+                        "carvers": ["minecraft:cave"]
+                    }),
+                ),
+                (
+                    "minecraft:forest",
+                    serde_json::json!({
+                        "temperature": 0.7,
+                        "downfall": 0.8,
+                        "has_precipitation": true,
+                        "carvers": ["minecraft:cave"]
+                    }),
+                ),
+            ],
+        );
+
+        write_bundle(
+            "rules.json",
+            &[(
+                "test:surface",
+                serde_json::json!({
+                    "type": "minecraft:sequence",
+                    "sequence": [
+                        {
+                            "type": "minecraft:condition",
+                            "if_true": {
+                                "type": "minecraft:stone_depth",
+                                "offset": 0,
+                                "add_surface_depth": false,
+                                "secondary_depth_range": 0,
+                                "surface_type": "floor"
+                            },
+                            "then_run": {
+                                "type": "minecraft:sequence",
+                                "sequence": [
+                                    {
+                                        "type": "minecraft:condition",
+                                        "if_true": {
+                                            "type": "minecraft:biome",
+                                            "biome_is": ["minecraft:desert"]
+                                        },
+                                        "then_run": {
+                                            "type": "minecraft:block",
+                                            "result_state": "minecraft:sand"
+                                        }
+                                    },
+                                    {
+                                        "type": "minecraft:block",
+                                        "result_state": "minecraft:grass_block"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "type": "minecraft:condition",
+                            "if_true": {
+                                "type": "minecraft:stone_depth",
+                                "offset": 0,
+                                "add_surface_depth": true,
+                                "secondary_depth_range": 0,
+                                "surface_type": "floor"
+                            },
+                            "then_run": {
+                                "type": "minecraft:block",
+                                "result_state": "minecraft:dirt"
+                            }
+                        }
+                    ]
+                }),
+            )],
+        );
+
+        write_bundle(
+            "settings.json",
+            &[(
+                "minecraft:overworld",
+                serde_json::json!({
+                    "noise": {"min_y": 0, "height": 80},
+                    "sea_level": 24,
+                    "default_block": "minecraft:stone",
+                    "default_fluid": "minecraft:water",
+                    "legacy_random_source": false,
+                    "disable_mob_generation": true,
+                    "material_rule": "test:surface",
+                    "noise_router": {
+                        "temperature": {
+                            "type": "minecraft:cache",
+                            "input": {
+                                "type": "minecraft:add",
+                                "left": {
+                                    "type": "minecraft:gradient",
+                                    "axis": "x",
+                                    "from_coordinate": -32,
+                                    "to_coordinate": 32,
+                                    "from_value": -1.0,
+                                    "to_value": 1.0
+                                },
+                                "right": {
+                                    "type": "minecraft:noise",
+                                    "noise": "minecraft:temperature",
+                                    "xz_scale": 1.0,
+                                    "y_scale": 0.0
+                                }
+                            }
+                        },
+                        "vegetation": {
+                            "type": "minecraft:cache",
+                            "input": {
+                                "type": "minecraft:add",
+                                "left": {
+                                    "type": "minecraft:gradient",
+                                    "axis": "z",
+                                    "from_coordinate": -32,
+                                    "to_coordinate": 32,
+                                    "from_value": -1.0,
+                                    "to_value": 1.0
+                                },
+                                "right": {
+                                    "type": "minecraft:noise",
+                                    "noise": "minecraft:vegetation",
+                                    "xz_scale": 1.0,
+                                    "y_scale": 0.0
+                                }
+                            }
+                        },
+                        "continents": {
+                            "type": "minecraft:cache",
+                            "input": {
+                                "type": "minecraft:noise",
+                                "noise": "minecraft:continentalness",
+                                "xz_scale": 1.0,
+                                "y_scale": 0.0
+                            }
+                        },
+                        "erosion": {
+                            "type": "minecraft:cache",
+                            "input": {
+                                "type": "minecraft:noise",
+                                "noise": "minecraft:erosion",
+                                "xz_scale": 1.0,
+                                "y_scale": 0.0
+                            }
+                        },
+                        "depth": {
+                            "type": "minecraft:gradient",
+                            "axis": "y",
+                            "from_coordinate": 0,
+                            "to_coordinate": 80,
+                            "from_value": 1.0,
+                            "to_value": -1.0
+                        },
+                        "ridges": {
+                            "type": "minecraft:slice",
+                            "axis": "y",
+                            "coordinate": 4096,
+                            "input": {
+                                "type": "minecraft:cache",
+                                "input": {
+                                    "type": "minecraft:noise",
+                                    "noise": "minecraft:ridge",
+                                    "xz_scale": 1.0,
+                                    "y_scale": 0.0
+                                }
+                            }
+                        },
+                        "chunk_surface_level": 48.0,
+                        "final_density": {
+                            "type": "minecraft:add",
+                            "left": {
+                                "type": "minecraft:interpolated",
+                                "cell_size_xz": 4,
+                                "cell_size_y": 8,
+                                "input": {
+                                    "type": "minecraft:add",
+                                    "left": {
+                                        "type": "minecraft:gradient",
+                                        "axis": "y",
+                                        "from_coordinate": 0,
+                                        "to_coordinate": 80,
+                                        "from_value": 2.0,
+                                        "to_value": -1.2
+                                    },
+                                    "right": {
+                                        "type": "minecraft:noise",
+                                        "noise": "minecraft:jagged",
+                                        "xz_scale": 0.5,
+                                        "y_scale": 0.25
+                                    }
+                                }
+                            },
+                            "right": {"type": "minecraft:beardifier"}
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let all_biomes = serde_json::json!([
+            "minecraft:plains",
+            "minecraft:desert",
+            "minecraft:swamp",
+            "minecraft:forest"
+        ]);
+        write_bundle(
+            "structures.json",
+            &[
+                (
+                    "minecraft:desert_pyramid",
+                    serde_json::json!({
+                        "type": "minecraft:desert_pyramid",
+                        "biomes": &all_biomes,
+                        "step": "surface_structures",
+                        "terrain_adaptation": "beard_thin"
+                    }),
+                ),
+                (
+                    "minecraft:swamp_hut",
+                    serde_json::json!({
+                        "type": "minecraft:swamp_hut",
+                        "biomes": &all_biomes,
+                        "step": "surface_structures",
+                        "terrain_adaptation": "none"
+                    }),
+                ),
+            ],
+        );
+        write_bundle(
+            "structure_sets.json",
+            &[
+                (
+                    "minecraft:desert_pyramids",
+                    serde_json::json!({
+                        "structures": [{"structure": "minecraft:desert_pyramid", "weight": 1}],
+                        "placement": {
+                            "type": "minecraft:random_spread",
+                            "salt": 14357617,
+                            "spacing": 2,
+                            "separation": 1
+                        }
+                    }),
+                ),
+                (
+                    "minecraft:swamp_huts",
+                    serde_json::json!({
+                        "structures": [{"structure": "minecraft:swamp_hut", "weight": 1}],
+                        "placement": {
+                            "type": "minecraft:random_spread",
+                            "salt": 14357620,
+                            "spacing": 2,
+                            "separation": 1
+                        }
+                    }),
+                ),
+            ],
+        );
+
+        let param = |t: [f64; 2], h: [f64; 2]| {
+            serde_json::json!({
+                "temperature": t,
+                "humidity": h,
+                "continentalness": [-1.0, 1.0],
+                "erosion": [-1.0, 1.0],
+                "depth": [-1.0, 1.0],
+                "weirdness": [-1.0, 1.0],
+                "offset": 0.0
+            })
+        };
+        write_bundle(
+            "world_presets.json",
+            &[(
+                "minecraft:normal",
+                serde_json::json!({
+                    "dimensions": {
+                        "minecraft:overworld": {
+                            "type": "minecraft:overworld",
+                            "generator": {
+                                "type": "minecraft:noise",
+                                "settings": "minecraft:overworld",
+                                "biome_source": {
+                                    "type": "minecraft:multi_noise",
+                                    "biomes": [
+                                        {"biome": "minecraft:plains", "parameters": param([-1.0, 0.0], [-1.0, 0.0])},
+                                        {"biome": "minecraft:desert", "parameters": param([0.0, 1.0], [-1.0, 0.0])},
+                                        {"biome": "minecraft:swamp", "parameters": param([-1.0, 0.0], [0.0, 1.0])},
+                                        {"biome": "minecraft:forest", "parameters": param([0.0, 1.0], [0.0, 1.0])}
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let data =
+            GeneratorData::load(dir.path(), registry).expect("load synthetic generator data");
+        let seed = 0x005E_ED19_537A_i64;
+        let new_generator = || {
+            OverworldGenerator::for_world(
+                data.clone(),
+                seed,
+                "minecraft:normal",
+                "minecraft:overworld",
+                true,
+            )
+            .expect("build synthetic overworld generator")
+        };
+
+        let mut order_a = Vec::with_capacity(16);
+        for z in -2..2 {
+            for x in -2..2 {
+                order_a.push(ChunkPos::new(x, z));
+            }
+        }
+        let mut order_b: Vec<ChunkPos> = order_a
+            .iter()
+            .copied()
+            .rev()
+            .filter(|pos| (pos.x + pos.z) & 1 != 0)
+            .collect();
+        order_b.extend(
+            order_a
+                .iter()
+                .copied()
+                .rev()
+                .filter(|pos| (pos.x + pos.z) & 1 == 0),
+        );
+        assert_eq!(order_b.len(), order_a.len());
+        assert_ne!(order_a, order_b);
+
+        // Run 1: single worker in row-major order.
+        let generator_a = new_generator();
+        let mut worker_a = generator_a.worker();
+        let mut results_a = BTreeMap::new();
+        for &pos in &order_a {
+            results_a.insert((pos.x, pos.z), snapshot(&mut worker_a, pos));
+        }
+
+        // Guard against vacuous passes: confirm biomes, surface blocks, and
+        // structure starts/references are genuinely exercised across the grid.
+        let mut seen_biomes = BTreeSet::new();
+        let mut seen_blocks = BTreeSet::new();
+        let mut total_own_starts = 0usize;
+        let mut total_referenced_starts = 0usize;
+        for snap in results_a.values() {
+            assert_eq!(snap.own_starts, snap.direct_starts);
+            seen_biomes.extend(snap.biomes.iter().copied());
+            seen_blocks.extend(snap.blocks.iter().copied());
+            total_own_starts += snap.own_starts.len();
+            total_referenced_starts += snap.referenced_starts.len();
+        }
+        assert!(
+            seen_biomes.len() >= 2,
+            "expected multiple biomes across grid, got {seen_biomes:?}"
+        );
+        let grass_id = registry.default_state("minecraft:grass_block").unwrap().0;
+        let sand_id = registry.default_state("minecraft:sand").unwrap().0;
+        assert!(
+            seen_blocks.contains(&grass_id) && seen_blocks.contains(&sand_id),
+            "expected both grass_block and sand surface rules to trigger"
+        );
+        assert!(
+            total_own_starts >= 4 && total_referenced_starts >= 4,
+            "expected structure starts and references across grid, got own={total_own_starts} refs={total_referenced_starts}"
+        );
+
+        // Run 2: single worker in reversed checkerboard order on a fresh generator.
+        let generator_b = new_generator();
+        let mut worker_b = generator_b.worker();
+        let mut results_b = BTreeMap::new();
+        for &pos in &order_b {
+            results_b.insert((pos.x, pos.z), snapshot(&mut worker_b, pos));
+        }
+        assert_eq!(
+            results_b, results_a,
+            "chunk output must be independent of chunk generation order"
+        );
+
+        // Run 3: 8 concurrent workers contending on a single fresh generator.
+        let generator_c = new_generator();
+        let barrier = Barrier::new(8);
+        let results_c = Mutex::new(BTreeMap::new());
+        std::thread::scope(|scope| {
+            for tid in 0..8 {
+                let generator = &generator_c;
+                let barrier = &barrier;
+                let results_c = &results_c;
+                let order = &order_a;
+                scope.spawn(move || {
+                    let mut worker = generator.worker();
+                    barrier.wait();
+                    let mut local = Vec::new();
+                    for pos in order.iter().copied().skip(tid).step_by(8) {
+                        local.push(((pos.x, pos.z), snapshot(&mut worker, pos)));
+                    }
+                    let mut out = results_c.lock().unwrap();
+                    for (key, snap) in local {
+                        out.insert(key, snap);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            results_c.into_inner().unwrap(),
+            results_a,
+            "chunk output must be identical across 1 vs 8 concurrent workers"
+        );
     }
 }

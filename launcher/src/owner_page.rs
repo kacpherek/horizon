@@ -8,16 +8,22 @@ impl Launcher {
     /// Whether the screen covers the window: no owner, and either Play was refused or the player
     /// hasn't read it yet. The data question comes first.
     pub(crate) fn asking_owner(&self) -> bool {
-        (self.owner == Some(false) || sign_in_preview())
+        (!horizon_launcher::developer_offline::selected() || sign_in_preview())
+            && (self.owner == Some(false) || sign_in_preview())
             && (self.owner_screen_open || !self.settings.owner_notice_seen || sign_in_preview())
             && !self.asking_consent()
             && self.opening.is_none()
     }
 
-    /// Opens the screen and starts the sign-in on it.
+    /// Opens the screen and starts the sign-in on it; a sign-in already under way (its code on
+    /// screen, or Microsoft still answering) is shown as it is, not started over.
     pub(crate) fn sign_in_to_play(&mut self) {
         self.owner_screen_open = true;
-        self.start_sign_in();
+        let under_way = self.sign_in.is_some()
+            && !matches!(self.sign_in_state, None | Some(SignInState::Done(_)));
+        if !under_way {
+            self.start_sign_in();
+        }
     }
 
     /// Closes it; it comes back with the next refused Play.
@@ -148,6 +154,7 @@ impl Launcher {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .gap(px(8.))
                                 .child(if microsoft::has_private_window() {
                                     shell::action("owner-private", shell::Action::Quiet, &t)
@@ -237,7 +244,7 @@ impl Launcher {
         .flex_col()
         .gap(px(8.))
         // A set width: text measured at it wraps where it is drawn.
-        .w(px(520.))
+        .w(px(560.))
         .max_w_full()
         .p(px(32.))
         .child(body)
@@ -287,7 +294,7 @@ impl Launcher {
             .flex()
             .flex_col()
             // A set width: text measured at it wraps where it is drawn.
-            .w(px(520.))
+            .w(px(560.))
             .max_w_full()
             .p(px(32.))
             .child(ui::text(13., FontWeight::MEDIUM, ink::QUIET).child(tr("Microsoft account")))
@@ -365,8 +372,11 @@ impl Launcher {
                             )))
                         })
                         .child(
+                            // Flush with the code's panel: the buttons share its width.
                             div()
+                                .w_full()
                                 .flex()
+                                .flex_wrap()
                                 .gap(px(8.))
                                 .child(if microsoft::has_private_window() {
                                     ui::quiet(
@@ -375,18 +385,19 @@ impl Launcher {
                                         32.,
                                         &t,
                                     )
+                                    .flex_grow_1()
                                     .on_click(
                                         move |_, _, cx| microsoft::open_private(&private_uri, cx),
                                     )
                                 } else {
-                                    ui::quiet("owner-copy-link", tr("Copy link"), 32., &t).on_click(
-                                        move |_, _, cx| {
+                                    ui::quiet("owner-copy-link", tr("Copy link"), 32., &t)
+                                        .flex_grow_1()
+                                        .on_click(move |_, _, cx| {
                                             copy_to_clipboard(
                                                 cx,
                                                 gpui::ClipboardItem::new_string(link_uri.clone()),
                                             )
-                                        },
-                                    )
+                                        })
                                 })
                                 .child(
                                     ui::quiet(
@@ -395,6 +406,7 @@ impl Launcher {
                                         32.,
                                         &t,
                                     )
+                                    .flex_grow_1()
                                     .on_click(
                                         move |_, _, cx| {
                                             microsoft::use_different_account(&other_uri, cx)

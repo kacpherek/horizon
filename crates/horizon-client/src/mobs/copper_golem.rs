@@ -33,23 +33,23 @@ pub fn register(m: &mut Mob) {
     m.extra.vector[0] = -1.0;
 }
 /// `CopperGolemOxidationLevels`: the body and eye textures.
-pub fn texture(m: &Mob) -> String {
-    match m.extra.variant {
-        0 => "entity/copper_golem/copper_golem".into(),
-        n => format!(
-            "entity/copper_golem/copper_golem_{}",
-            WEATHER[n.min(3) as usize]
-        ),
-    }
+pub fn texture(m: &Mob) -> &'static str {
+    const TEXTURES: [&str; 4] = [
+        "entity/copper_golem/copper_golem",
+        "entity/copper_golem/copper_golem_exposed",
+        "entity/copper_golem/copper_golem_weathered",
+        "entity/copper_golem/copper_golem_oxidized",
+    ];
+    TEXTURES[m.extra.variant.min(3) as usize]
 }
-pub fn eye_texture(m: &Mob) -> String {
-    match m.extra.variant {
-        0 => "entity/copper_golem/copper_golem_eyes".into(),
-        n => format!(
-            "entity/copper_golem/copper_golem_eyes_{}",
-            WEATHER[n.min(3) as usize]
-        ),
-    }
+pub fn eye_texture(m: &Mob) -> &'static str {
+    const TEXTURES: [&str; 4] = [
+        "entity/copper_golem/copper_golem_eyes",
+        "entity/copper_golem/copper_golem_eyes_exposed",
+        "entity/copper_golem/copper_golem_eyes_weathered",
+        "entity/copper_golem/copper_golem_eyes_oxidized",
+    ];
+    TEXTURES[m.extra.variant.min(3) as usize]
 }
 /// The sound of the oxidation level: `spin`, `hurt`, `death` or `step`.
 pub fn sound(m: &Mob, what: &str) -> &'static str {
@@ -167,7 +167,7 @@ pub fn anim(m: &Mob, s: &State, p: &mut Poses, animations: &HashMap<String, Anim
     p.xrot("head", s.x_rot.to_radians());
     p.yrot("head", s.y_rot.to_radians());
     let get = |n: &str| animations.get(&format!("CopperGolemAnimation.COPPER_GOLEM_{n}"));
-    let holding = m.extra.main_hand.is_some() || m.extra.off_hand.is_some();
+    let holding = m.extra.main_hand_id().is_some() || m.extra.off_hand_id().is_some();
     if holding {
         if let Some(a) = get("WALK_ITEM") {
             a.apply_walk(s.pos, s.speed, 2.0, 2.5, p);

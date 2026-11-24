@@ -22,7 +22,9 @@ pub(crate) struct LevelFeatureWorld<'s, 'a, L: LevelAccess + ?Sized> {
     pub features: &'s LiveFeatures,
     /// The entities a structure template placed (`add_entity`), for the caller
     /// to spawn.
-    pub entities: Vec<crate::nbt::Compound>,
+    pub entities: Vec<horizon_core::nbt::Compound>,
+    /// The positions this feature changed, in order, for `structure_grow`.
+    pub placed: Vec<[i32; 3]>,
 }
 
 fn pos([x, y, z]: [i32; 3]) -> BlockPos {
@@ -31,7 +33,7 @@ fn pos([x, y, z]: [i32; 3]) -> BlockPos {
 
 impl<L: LevelAccess + ?Sized> LevelFeatureWorld<'_, '_, L> {
     fn sea(&self) -> i32 {
-        super::vanilla_sea_level(self.sim.level.level_key())
+        self.sim.level.sea_level()
     }
     fn in_tag(&self, state: BlockStateId, tag: &str) -> bool {
         let name = tag.trim_start_matches('#');
@@ -53,7 +55,11 @@ impl<L: LevelAccess + ?Sized> FeatureWorld for LevelFeatureWorld<'_, '_, L> {
         state: BlockStateId,
         flags: i32,
     ) -> Result<bool, Self::Error> {
-        Ok(self.sim.set_block(pos(position), state, flags))
+        let changed = self.sim.set_block(pos(position), state, flags);
+        if changed {
+            self.placed.push(position);
+        }
+        Ok(changed)
     }
 }
 
@@ -62,12 +68,12 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
     fn set_block_entity(
         &mut self,
         position: [i32; 3],
-        nbt: crate::nbt::Compound,
+        nbt: horizon_core::nbt::Compound,
     ) -> Result<(), PlacementQueryError> {
         self.sim.level.load_block_entity(pos(position), nbt);
         Ok(())
     }
-    fn add_entity(&mut self, nbt: crate::nbt::Compound) -> Result<(), PlacementQueryError> {
+    fn add_entity(&mut self, nbt: horizon_core::nbt::Compound) -> Result<(), PlacementQueryError> {
         self.entities.push(nbt);
         Ok(())
     }
@@ -123,7 +129,12 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
         position: [i32; 3],
         state: BlockStateId,
     ) -> Result<(), PlacementQueryError> {
-        self.sim.level.set_raw(pos(position), state);
+        let at = pos(position);
+        let changed = self.sim.state(at) != state;
+        self.sim.level.set_raw(at, state);
+        if changed {
+            self.placed.push(position);
+        }
         Ok(())
     }
     /// LevelChunk.setBlockState without neighbour or shape updates.
@@ -132,7 +143,9 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
         position: [i32; 3],
         state: BlockStateId,
     ) -> Result<(), PlacementQueryError> {
-        self.sim.set_block(pos(position), state, 2 | 16);
+        if self.sim.set_block(pos(position), state, 2 | 16) {
+            self.placed.push(position);
+        }
         Ok(())
     }
     fn collision_full_block(
@@ -372,6 +385,7 @@ mod dungeon_spawner_default_tests {
         random: LegacyRandom,
         loads: usize,
     }
+    impl crate::level::BlockEntityNeighbors for Unbound {}
     impl LevelAccess for Unbound {
         fn block_state(&self, _: BlockPos) -> BlockStateId {
             BlockStateId(0)
@@ -388,7 +402,7 @@ mod dungeon_spawner_default_tests {
         fn game_time(&self) -> i64 {
             0
         }
-        fn load_block_entity(&mut self, _: BlockPos, _: crate::nbt::Compound) {
+        fn load_block_entity(&mut self, _: BlockPos, _: horizon_core::nbt::Compound) {
             self.loads += 1;
         }
     }

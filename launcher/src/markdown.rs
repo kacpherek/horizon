@@ -1,8 +1,9 @@
 //! Release notes: pulldown-cmark events into gpui elements.
+use crate::cull::Cull;
 use crate::theme::Theme;
 use gpui::{
-    div, prelude::*, px, AnyElement, FontStyle, FontWeight, HighlightStyle, SharedString,
-    StyledText,
+    div, prelude::*, px, AnyElement, Div, FontStyle, FontWeight, HighlightStyle, ScrollHandle,
+    SharedString, StyledText,
 };
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::ops::Range;
@@ -29,7 +30,37 @@ enum Span {
     Link,
 }
 
+/// Every block of `source`: for notes short enough to draw whole.
 pub fn render(source: &str, t: &Theme) -> AnyElement {
+    let notes = Notes::parse(source);
+    frame(t)
+        .gap(px(gap(t)))
+        .children(notes.0.iter().map(|b| block(b, t)))
+        .into_any_element()
+}
+
+/// Notes parsed once. A Nightly's notes run to some 1,500 items, too many to parse and lay out
+/// on every frame, so [`Notes::column`] builds only the blocks near the view.
+pub struct Notes(Vec<Block>);
+
+impl Notes {
+    pub fn parse(source: &str) -> Notes {
+        Notes(parse(source))
+    }
+
+    /// The blocks near `scroll`'s view; `cull` keeps the others' heights as spacers.
+    pub fn column(&self, t: &Theme, cull: &Cull, scroll: &ScrollHandle) -> Div {
+        frame(t).child(cull.column(
+            scroll,
+            self.0.len(),
+            gap(t),
+            |_| false,
+            |i| block(&self.0[i], t),
+        ))
+    }
+}
+
+fn parse(source: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let (mut text, mut spans) = (String::new(), Vec::new());
     let mut open: Vec<(Span, usize)> = Vec::new();
@@ -61,6 +92,8 @@ pub fn render(source: &str, t: &Theme) -> AnyElement {
     ) {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
+                // A tight list's item has no paragraph to end its text before the heading.
+                flush(&mut blocks, &mut text, &mut spans, &mut item, None);
                 heading = Some(match level {
                     HeadingLevel::H1 => 1,
                     HeadingLevel::H2 => 2,
@@ -92,8 +125,16 @@ pub fn render(source: &str, t: &Theme) -> AnyElement {
                 });
                 item = Some((depth, number));
             }
-            Event::End(TagEnd::Item) => flush(&mut blocks, &mut text, &mut spans, &mut item, None),
-            Event::Start(Tag::CodeBlock(_)) => code = Some(String::new()),
+            Event::End(TagEnd::Item) => {
+                flush(&mut blocks, &mut text, &mut spans, &mut item, None);
+                // An item with no text of its own (empty, or only a code block) ends here too.
+                item = None;
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                // A tight list's item has no paragraph to end its text before the block.
+                flush(&mut blocks, &mut text, &mut spans, &mut item, None);
+                code = Some(String::new())
+            }
             Event::End(TagEnd::CodeBlock) => {
                 blocks.push(Block::Code(code.take().unwrap_or_default()))
             }
@@ -116,7 +157,14 @@ pub fn render(source: &str, t: &Theme) -> AnyElement {
             },
             Event::SoftBreak => text.push(' '),
             Event::HardBreak => text.push('\n'),
-            Event::Rule => blocks.push(Block::Rule),
+            // A tight list's item has no paragraph to end its text before a rule or a quote.
+            Event::Rule => {
+                flush(&mut blocks, &mut text, &mut spans, &mut item, None);
+                blocks.push(Block::Rule)
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                flush(&mut blocks, &mut text, &mut spans, &mut item, None)
+            }
             Event::Start(Tag::Table(_)) => {
                 flush(&mut blocks, &mut text, &mut spans, &mut item, None);
                 table = Some(Vec::new())
@@ -138,129 +186,215 @@ pub fn render(source: &str, t: &Theme) -> AnyElement {
         }
     }
     flush(&mut blocks, &mut text, &mut spans, &mut item, None);
+    blocks
+}
 
-    let styled = |text: String, spans: Spans| {
-        let highlights = spans.into_iter().map(|(range, span)| {
-            let style = match span {
-                Span::Strong => HighlightStyle {
-                    font_weight: Some(FontWeight::SEMIBOLD),
-                    color: Some(t.ink),
-                    ..Default::default()
-                },
-                Span::Emphasis => HighlightStyle {
-                    font_style: Some(FontStyle::Italic),
-                    ..Default::default()
-                },
-                Span::Code => HighlightStyle {
-                    background_color: Some(t.plate_soft),
-                    color: Some(t.ink),
-                    ..Default::default()
-                },
-                Span::Link => HighlightStyle {
-                    color: Some(t.ink),
-                    ..Default::default()
-                },
-            };
-            (range, style)
-        });
-        StyledText::new(SharedString::from(text)).with_highlights(highlights.collect::<Vec<_>>())
-    };
-    // The glass look sets notes as the mockup's: 14 px on 1.55 at 75 %, lists with square
-    // bullets, 6 px apart.
-    let glass = t.glass;
-    let mut column = div()
+fn styled(text: &str, spans: &Spans, t: &Theme) -> StyledText {
+    let highlights = spans.iter().map(|(range, span)| {
+        let style = match span {
+            Span::Strong => HighlightStyle {
+                font_weight: Some(FontWeight::SEMIBOLD),
+                color: Some(t.ink),
+                ..Default::default()
+            },
+            Span::Emphasis => HighlightStyle {
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            },
+            Span::Code => HighlightStyle {
+                background_color: Some(t.plate_soft),
+                color: Some(t.ink),
+                ..Default::default()
+            },
+            Span::Link => HighlightStyle {
+                color: Some(t.ink),
+                ..Default::default()
+            },
+        };
+        (range.clone(), style)
+    });
+    StyledText::new(SharedString::from(text.to_owned()))
+        .with_highlights(highlights.collect::<Vec<_>>())
+}
+
+/// The space between blocks. The glass look sets notes as the mockup's: 14 px on 1.55 at 75 %,
+/// lists with square bullets, 6 px apart.
+fn gap(t: &Theme) -> f32 {
+    if t.glass {
+        6.
+    } else {
+        8.
+    }
+}
+
+/// The notes' column, without the space between its blocks.
+fn frame(t: &Theme) -> Div {
+    div()
         .flex()
         .flex_col()
-        .gap(px(if glass { 6. } else { 8. }))
         .text_size(px(crate::theme::UI.px))
-        .line_height(px(if glass { 21.7 } else { 22. }))
-        .text_color(t.ink_soft);
-    for block in blocks {
-        column = column.child(match block {
-            Block::Heading(level, text, spans) => div()
-                .pt(px(if level <= 2 { 12. } else { 6. }))
-                .text_size(px(if level <= 2 { 16. } else { 14. }))
-                .font_weight(if glass {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
-                })
-                .text_color(t.ink)
-                .child(styled(text, spans))
-                .into_any_element(),
-            Block::Paragraph(text, spans) => div().child(styled(text, spans)).into_any_element(),
-            Block::Item(depth, number, text, spans) => div()
+        .line_height(px(if t.glass { 21.7 } else { 22. }))
+        .text_color(t.ink_soft)
+}
+
+fn block(block: &Block, t: &Theme) -> AnyElement {
+    let glass = t.glass;
+    match block {
+        Block::Heading(level, text, spans) => div()
+            .pt(px(if *level <= 2 { 12. } else { 6. }))
+            .text_size(px(if *level <= 2 { 16. } else { 14. }))
+            .font_weight(if glass {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::MEDIUM
+            })
+            .text_color(t.ink)
+            .child(styled(text, spans, t))
+            .into_any_element(),
+        Block::Paragraph(text, spans) => div().child(styled(text, spans, t)).into_any_element(),
+        Block::Item(depth, number, text, spans) => div()
+            .flex()
+            .gap(px(if glass { 12. } else { 8. }))
+            .pl(px(*depth as f32 * 16.))
+            .child(match number {
+                // The mockup's bullet: a 5 px square, white at 40 %.
+                None if glass => div()
+                    .flex_none()
+                    .mt(px(8.5))
+                    .size(px(5.))
+                    .bg(crate::glass_ui::white(0.4)),
+                _ => div().flex_none().w(px(16.)).text_color(t.muted).child(
+                    number
+                        .map(|n| format!("{n}."))
+                        .unwrap_or_else(|| "–".into()),
+                ),
+            })
+            .child(div().flex_1().min_w_0().child(styled(text, spans, t)))
+            .into_any_element(),
+        Block::Code(code) => div()
+            .p(px(16.))
+            .rounded(px(if glass {
+                12.
+            } else {
+                crate::theme::RADIUS_PLATE
+            }))
+            .bg(t.plate_soft)
+            .font_family(crate::theme::MONO)
+            .text_size(px(12.))
+            .line_height(px(18.))
+            .text_color(t.ink)
+            .child(code.trim_end().to_string())
+            .into_any_element(),
+        Block::Rule => div().h(px(1.)).bg(t.rule).my(px(8.)).into_any_element(),
+        Block::Table(rows) => {
+            let mut grid = div()
                 .flex()
-                .gap(px(if glass { 12. } else { 8. }))
-                .pl(px(depth as f32 * 16.))
-                .child(match number {
-                    // The mockup's bullet: a 5 px square, white at 40 %.
-                    None if glass => div()
-                        .flex_none()
-                        .mt(px(8.5))
-                        .size(px(5.))
-                        .bg(crate::glass_ui::white(0.4)),
-                    _ => div().flex_none().w(px(16.)).text_color(t.muted).child(
-                        number
-                            .map(|n| format!("{n}."))
-                            .unwrap_or_else(|| "–".into()),
-                    ),
-                })
-                .child(div().flex_1().min_w_0().child(styled(text, spans)))
-                .into_any_element(),
-            Block::Code(code) => div()
-                .p(px(16.))
-                .rounded(px(if glass {
-                    12.
-                } else {
-                    crate::theme::RADIUS_PLATE
-                }))
-                .bg(t.plate_soft)
-                .font_family(crate::theme::MONO)
-                .text_size(px(12.))
-                .line_height(px(18.))
-                .text_color(t.ink)
-                .child(code.trim_end().to_string())
-                .into_any_element(),
-            Block::Rule => div().h(px(1.)).bg(t.rule).my(px(8.)).into_any_element(),
-            Block::Table(rows) => {
-                let mut grid = div()
+                .flex_col()
+                .my(px(4.))
+                .border_t_1()
+                .border_color(t.rule);
+            for (i, row) in rows.iter().enumerate() {
+                let mut line = div()
                     .flex()
-                    .flex_col()
-                    .my(px(4.))
-                    .border_t_1()
+                    .gap(px(16.))
+                    .py(px(8.))
+                    .border_b_1()
                     .border_color(t.rule);
-                for (i, row) in rows.into_iter().enumerate() {
-                    let mut line = div()
-                        .flex()
-                        .gap(px(16.))
-                        .py(px(8.))
-                        .border_b_1()
-                        .border_color(t.rule);
-                    let columns = row.len();
-                    for (j, (text, spans)) in row.into_iter().enumerate() {
-                        // Two-column tables keep a narrow first column; wider ones share the width.
-                        let cell = if j == 0 && columns > 1 {
-                            div().w(px(180.)).flex_none()
-                        } else if j + 1 < columns && columns > 2 {
-                            div().w(px(56.)).flex_none()
-                        } else {
-                            div().flex_1().min_w_0()
-                        };
-                        line = line.child(
-                            cell.when(i == 0, |d| {
-                                d.text_color(t.ink)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_size(px(12.5))
-                            })
-                            .child(styled(text, spans)),
-                        );
-                    }
-                    grid = grid.child(line);
+                let columns = row.len();
+                for (j, (text, spans)) in row.iter().enumerate() {
+                    // Two-column tables keep a narrow first column; wider ones share the width.
+                    let cell = if j == 0 && columns > 1 {
+                        div().w(px(180.)).flex_none()
+                    } else if j + 1 < columns && columns > 2 {
+                        div().w(px(56.)).flex_none()
+                    } else {
+                        div().flex_1().min_w_0()
+                    };
+                    line = line.child(
+                        cell.when(i == 0, |d| {
+                            d.text_color(t.ink)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_size(px(12.5))
+                        })
+                        .child(styled(text, spans, t)),
+                    );
                 }
-                grid.into_any_element()
+                grid = grid.child(line);
             }
-        });
+            grid.into_any_element()
+        }
     }
-    column.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each block as a line: its kind, and its text with what a test needs.
+    fn shown(blocks: &[Block]) -> Vec<String> {
+        blocks
+            .iter()
+            .map(|block| match block {
+                Block::Heading(level, text, _) => format!("heading {level} {text}"),
+                Block::Paragraph(text, _) => format!("paragraph {text}"),
+                Block::Item(depth, number, text, _) => format!("item {depth} {number:?} {text}"),
+                Block::Code(code) => format!("code {}", code.trim()),
+                Block::Rule => "rule".to_string(),
+                Block::Table(rows) => format!("table {}", rows.len()),
+            })
+            .collect()
+    }
+
+    /// The items of a tight list have no paragraphs, so an item's text is still waiting when a
+    /// code block in that item starts: it goes before the block, and text after the block stays
+    /// apart from it.
+    #[test]
+    fn a_code_block_in_a_list_item_follows_the_items_text() {
+        let steps = "1. Add the repository:\n   ```\n   maven\n   ```\n2. Then build.\n";
+        assert_eq!(
+            shown(&parse(steps)),
+            [
+                "item 0 Some(1) Add the repository:",
+                "code maven",
+                "item 0 Some(2) Then build.",
+            ]
+        );
+        let around = "- before\n  ```\n  code\n  ```\n  after\n";
+        assert_eq!(
+            shown(&parse(around)),
+            ["item 0 None before", "code code", "paragraph after"]
+        );
+    }
+
+    /// An item with no text of its own (empty, or only a code block) ends with the item: the
+    /// paragraph after the list is not drawn as one more item.
+    #[test]
+    fn a_paragraph_after_an_item_without_text_is_not_an_item() {
+        assert_eq!(
+            shown(&parse("- a\n-\n\nAfter.\n")),
+            ["item 0 None a", "paragraph After."]
+        );
+        assert_eq!(
+            shown(&parse("- ```\n  x\n  ```\n\nAfter.\n")),
+            ["code x", "paragraph After."]
+        );
+    }
+
+    /// A heading, a rule or a quote in a tight list's item starts after the item's text, as a
+    /// code block does: the text is not merged into the block or drawn after it.
+    #[test]
+    fn a_block_in_a_tight_list_item_follows_the_items_text() {
+        assert_eq!(
+            shown(&parse("- a\n  # h\n- b\n")),
+            ["item 0 None a", "heading 1 h", "item 0 None b"]
+        );
+        assert_eq!(
+            shown(&parse("- a\n  ***\n- b\n")),
+            ["item 0 None a", "rule", "item 0 None b"]
+        );
+        assert_eq!(
+            shown(&parse("- a\n  > q\n- b\n")),
+            ["item 0 None a", "paragraph q", "item 0 None b"]
+        );
+    }
 }

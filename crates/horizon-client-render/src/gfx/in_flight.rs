@@ -1,7 +1,7 @@
 //! Frames in flight: the readbacks a submission starts, landing frames the submit thread
 //! submitted, keeping offscreen frames at most two ahead of the GPU, and a screenshot's copy.
 
-use super::{Renderer, ScreenshotRequest, copy_frame, screenshot_save, submit};
+use super::{Renderer, ScreenshotRequest, copy_frame, submit};
 
 impl Renderer {
     /// The frame's readbacks to start right after its submission (on the submit thread when
@@ -48,9 +48,7 @@ impl Renderer {
             timer.submitted(&self.queue);
             timer.collect(&self.device, &mut self.gpu_times);
         }
-        if let Some(Some(timer)) = Self::pass_timer(&mut self.pack_post, &mut self.native) {
-            timer.submitted(&self.queue);
-        }
+        self.pack_timing_submitted();
         if let Some(timer) = &mut self.own_timing {
             timer.submitted(&self.queue);
         }
@@ -94,39 +92,38 @@ impl Renderer {
         // the row stride too small for the copy and abort in validation.
         if self.config.format.block_copy_size(None) == Some(4) {
             let size = [self.config.width, self.config.height];
-            let format = self.config.format.remove_srgb_suffix();
-            // The layered float frame maps the world to SDR, then adds the HUD as drawn.
-            // Other float frames keep their clipped 8-bit copy.
-            let copy = self
-                .hdr
-                .as_mut()
-                .and_then(|hdr| {
-                    hdr.sdr_screenshot(&self.device, encoder, format, request.size.is_some())
-                })
-                .or_else(|| {
-                    (texture.format() != format && texture.format() == self.output.frame.format)
-                        .then(|| {
-                            self.readback
-                                .unorm_copy(&self.device, encoder, texture, format)
-                        })
-                });
-            let texture = copy.as_ref().unwrap_or(texture);
-            Some((request, copy_frame(&self.device, encoder, texture, size)))
+            let texture = self.sdr_capture_source(encoder, texture, request.size.is_some());
+            Some((request, copy_frame(&self.device, encoder, &texture, size)))
         } else {
             let error = format!(
                 "screenshots need a 32-bit surface format, not {:?}",
                 self.config.format
             );
-            if request.background {
-                self.saved_screenshots.push(screenshot_save::Saved {
-                    path: request.path,
-                    result: Err(error),
-                    hdr: None,
-                });
-            } else {
-                self.screenshot_result = Some(Err(error));
-            }
+            self.screenshot_result = Some(Err(error));
             None
         }
+    }
+
+    /// The post-tone-map picture in the screenshot's SDR encoding, before any
+    /// copy made for the offscreen compositor.
+    pub(super) fn sdr_capture_source(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        world_only: bool,
+    ) -> wgpu::Texture {
+        let format = self.config.format.remove_srgb_suffix();
+        self.hdr
+            .as_mut()
+            .and_then(|hdr| hdr.sdr_screenshot(&self.device, encoder, format, world_only))
+            .or_else(|| {
+                (texture.format() != format && texture.format() == self.output.frame.format).then(
+                    || {
+                        self.readback
+                            .unorm_copy(&self.device, encoder, texture, format)
+                    },
+                )
+            })
+            .unwrap_or_else(|| texture.clone())
     }
 }

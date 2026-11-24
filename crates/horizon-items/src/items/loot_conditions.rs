@@ -9,21 +9,26 @@ use super::LootContext;
 use horizon_core::random::RandomSource;
 use serde_json::Value;
 
-impl LootContext<'_> {
+impl<R: RandomSource> LootContext<'_, R> {
     /// The condition `id` names in `Registries.PREDICATE`. A root whose
     /// `predicate/` files were never loaded (`Items::for_tests`, a scratch
     /// root) keeps the two ids vanilla's own block tables name readable as
     /// their own kinds, as this engine read every string before the registry.
-    pub(super) fn named_condition<R: RandomSource>(&self, id: &str, random: &mut R) -> bool {
+    pub(super) fn named_condition(&self, id: &str, random: &mut R) -> bool {
         match self.items.predicates.get(id) {
             Some(condition) => self.condition(condition, random),
             None => match id {
                 "minecraft:tool/can_silk_touch" => {
                     self.enchantment_level("minecraft:silk_touch") > 0
                 }
-                "minecraft:tool/can_shear" => {
-                    self.held.is_some_and(|h| &*h.item == "minecraft:shears")
-                }
+                // `match_tool` for the shears, which asks `shears_dig` (`stock_condition`)
+                "minecraft:tool/can_shear" => self.condition(
+                    &serde_json::json!({
+                        "type": "minecraft:match_tool",
+                        "predicate": {"items": "minecraft:shears"},
+                    }),
+                    random,
+                ),
                 _ => false,
             },
         }
@@ -32,7 +37,7 @@ impl LootContext<'_> {
     /// A pool's or an entry's `condition` (`LootPool.CODEC`,
     /// `LootPoolEntryContainer.CODEC`) and the `conditions` list old pack data
     /// writes instead, all of which must hold.
-    pub(super) fn conditions<R: RandomSource>(&self, o: &Value, random: &mut R) -> bool {
+    pub(super) fn conditions(&self, o: &Value, random: &mut R) -> bool {
         if let Some(c) = o.get("condition")
             && !self.condition(c, random)
         {

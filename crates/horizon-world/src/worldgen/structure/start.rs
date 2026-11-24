@@ -1,13 +1,5 @@
 //! Structures, structure sets and their placements, structure starts,
 //! references, terrain adaptation and per-chunk piece placement.
-use super::{
-    BoundingBox, StructureResources,
-    jigsaw::{
-        JigsawConfig, JigsawContext, PlaceFeature, PoolPiece, Pools, Projection, lay_out_children,
-        place_start,
-    },
-    legacy::{LegacyPiece, PieceContext},
-};
 use crate::{
     heightmap::HeightmapType,
     worldgen::{
@@ -30,6 +22,18 @@ use serde_json::{Value, value::RawValue};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
+};
+use {
+    super::{
+        StructureResources,
+        jigsaw::{
+            JigsawConfig, JigsawContext, PlaceFeature, PoolPiece, Pools, Projection,
+            lay_out_children, place_start,
+        },
+        legacy::{LegacyPiece, PieceContext},
+        mod_types::{ModStructureType, ModStructureTypes},
+    },
+    horizon_core::bounding_box::BoundingBox,
 };
 
 pub const STEPS: [&str; 11] = [
@@ -97,8 +101,27 @@ pub enum StructureKind {
     EndCity,
     /// `horizon:formations`: Formations' SimpleStructure.
     Formations(super::formations::Def),
+    /// A structure type a mod registered (`"type": "modid:tower"`): vanilla's
+    /// `StructureType` as code, with the structure's own JSON config.
+    Mod(ModType),
     /// A structure type whose generator is not implemented yet.
     Unsupported(String),
+}
+
+/// A mod's structure type as a structure's kind carries it: the type's engine
+/// side and the structure's own JSON config, which its
+/// `find_generation_point` reads.
+pub struct ModType {
+    pub ty: Arc<dyn ModStructureType>,
+    /// The mod's config, prepared once while decoding this definition.
+    pub config: Arc<horizon_core::nbt::Tag>,
+}
+impl std::fmt::Debug for ModType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModType")
+            .field("type", &self.config.get("type"))
+            .finish()
+    }
 }
 #[derive(Debug)]
 pub struct StructureDef {
@@ -338,6 +361,9 @@ impl StructureRegistry {
         sets: &BTreeMap<String, String>,
         pools: BTreeMap<String, String>,
         biome_set: &dyn Fn(&Value) -> Result<BTreeSet<BiomeId>, DecodeError>,
+        // The structure types the executable's mods registered, looked up
+        // before `Unsupported` (`"type": "modid:tower"`).
+        mod_types: &ModStructureTypes,
     ) -> Result<Self, DecodeError> {
         let mut defs = Vec::new();
         for (name, json) in structures {
@@ -420,7 +446,15 @@ impl StructureRegistry {
                     Ok(def) => StructureKind::Formations(def),
                     Err(_) => StructureKind::Unsupported("horizon:formations".into()),
                 },
-                other => StructureKind::Unsupported(other.to_owned()),
+                other => match mod_types.get(other) {
+                    Some(ty) => StructureKind::Mod(ModType {
+                        ty: ty.clone(),
+                        config: ty.prepare_config(&v).map_err(|error| {
+                            DecodeError::Registry(format!("structure {name}: {error}"))
+                        })?,
+                    }),
+                    None => StructureKind::Unsupported(other.to_owned()),
+                },
             };
             defs.push(StructureDef {
                 name: name.clone(),
@@ -479,19 +513,20 @@ impl StructureRegistry {
                 },
                 _ => Placement::Unsupported,
             };
+            let mut structures = Vec::new();
+            for entry in v["structures"].as_array().into_iter().flatten() {
+                // StructureSelectionEntry.CODEC uses ExtraCodecs.POSITIVE_INT.
+                let weight = entry["weight"]
+                    .as_i64()
+                    .filter(|w| (1..=i64::from(i32::MAX)).contains(w))
+                    .ok_or(DecodeError::Field("structure set positive int weight"))?;
+                if let Some(definition) = entry["structure"].as_str().and_then(index) {
+                    structures.push((definition, weight as i32));
+                }
+            }
             out.push(StructureSet {
                 name: name.clone(),
-                structures: v["structures"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| {
-                        Some((
-                            index(e["structure"].as_str()?)?,
-                            e["weight"].as_i64().unwrap_or(1) as i32,
-                        ))
-                    })
-                    .collect(),
+                structures,
                 placement,
                 salt: p["salt"].as_i64().unwrap_or(0) as i32,
                 frequency: frequency as f32,
@@ -622,7 +657,10 @@ impl StructureRegistry {
         };
         let sx = spread(&mut random);
         let sz = spread(&mut random);
-        Some(ChunkPos::new(gx * spacing + sx, gz * spacing + sz))
+        Some(ChunkPos::new(
+            gx.wrapping_mul(spacing).wrapping_add(sx),
+            gz.wrapping_mul(spacing).wrapping_add(sz),
+        ))
     }
     pub fn is_structure_chunk(
         &self,
@@ -673,7 +711,8 @@ impl StructureRegistry {
                 };
                 let sx = spread(&mut random);
                 let sz = spread(&mut random);
-                gx * spacing + sx == x && gz * spacing + sz == z
+                gx.wrapping_mul(spacing).wrapping_add(sx) == x
+                    && gz.wrapping_mul(spacing).wrapping_add(sz) == z
             }
             Placement::ConcentricRings { .. } => rings
                 .get(&set.name)
@@ -683,6 +722,17 @@ impl StructureRegistry {
         if !placed {
             return false;
         }
+        self.structure_chunk_after_placed(set, seed, x, z, rings, zones)
+    }
+    fn structure_chunk_after_placed(
+        &self,
+        set: &StructureSet,
+        seed: i64,
+        x: i32,
+        z: i32,
+        rings: &Rings,
+        zones: bool,
+    ) -> bool {
         if set.rings.as_ref().is_some_and(|r| !r.allows(x, z)) {
             return false;
         }
@@ -728,10 +778,117 @@ impl StructureRegistry {
         let Some(other) = self.sets.iter().find(|s| s.name == other) else {
             return false;
         };
-        (x - range..=x + range).any(|tx| {
-            (z - range..=z + range)
-                .any(|tz| self.structure_chunk(other, seed, tx, tz, rings, zones))
-        })
+        let (Some(min_x), Some(max_x), Some(min_z), Some(max_z)) = (
+            x.checked_sub(range),
+            x.checked_add(range),
+            z.checked_sub(range),
+            z.checked_add(range),
+        ) else {
+            return (x - range..=x + range).any(|tx| {
+                (z - range..=z + range)
+                    .any(|tz| self.structure_chunk(other, seed, tx, tz, rings, zones))
+            });
+        };
+        if min_x > max_x || min_z > max_z {
+            return false;
+        }
+        // When `other` evaluates its own exclusion rules, candidate order is
+        // observable (a recursive branch can appear after a match that ends
+        // the scan in `(x, z)` order). Preserve strict ascending `(x, z)`
+        // evaluation order whenever `structure_chunk_after_placed` can recurse.
+        let can_recurse = zones && (other.exclusion.is_some() || other.avoid.is_some());
+        match other.placement {
+            Placement::DimensionOrigin => {
+                (min_x..=max_x).contains(&self.origin.x) && (min_z..=max_z).contains(&self.origin.z)
+            }
+            Placement::RandomSpread {
+                spacing,
+                separation,
+                triangular,
+            } if spacing > 0 && (0..spacing).contains(&separation) => {
+                // Each `spacing x spacing` sector produces at most one candidate chunk.
+                let limit = spacing - separation;
+                let spread = |r: &mut WorldgenRandom<LegacyRandom>| {
+                    if triangular {
+                        (r.next_int_bound(limit).unwrap_or(0)
+                            + r.next_int_bound(limit).unwrap_or(0))
+                            / 2
+                    } else {
+                        r.next_int_bound(limit).unwrap_or(0)
+                    }
+                };
+                let min_gx = min_x.div_euclid(spacing);
+                let max_gx = max_x.div_euclid(spacing);
+                let min_gz = min_z.div_euclid(spacing);
+                let max_gz = max_z.div_euclid(spacing);
+                // Across distinct `gx` sectors, `gx * spacing + sx` is strictly
+                // increasing (`0 <= sx < spacing`). Within one `gx` sector, `sx`
+                // varies with `gz` when `limit > 1`, so sort that column's
+                // in-range candidates by `(x, z)` before recursing.
+                let sort_column = can_recurse && limit > 1 && min_gz < max_gz;
+                let mut column = Vec::new();
+                for gx in min_gx..=max_gx {
+                    if sort_column {
+                        column.clear();
+                    }
+                    for gz in min_gz..=max_gz {
+                        let mut random = WorldgenRandom::new(LegacyRandom::new(0));
+                        random.set_large_feature_with_salt(seed, gx, gz, other.salt);
+                        let sx = spread(&mut random);
+                        let sz = spread(&mut random);
+                        let px = i64::from(gx) * i64::from(spacing) + i64::from(sx);
+                        let pz = i64::from(gz) * i64::from(spacing) + i64::from(sz);
+                        if (i64::from(min_x)..=i64::from(max_x)).contains(&px)
+                            && (i64::from(min_z)..=i64::from(max_z)).contains(&pz)
+                        {
+                            if sort_column {
+                                column.push((px as i32, pz as i32));
+                            } else if self.structure_chunk_after_placed(
+                                other, seed, px as i32, pz as i32, rings, zones,
+                            ) {
+                                return true;
+                            }
+                        }
+                    }
+                    if sort_column {
+                        column.sort_unstable();
+                        if column.iter().any(|&(px, pz)| {
+                            self.structure_chunk_after_placed(other, seed, px, pz, rings, zones)
+                        }) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Placement::ConcentricRings { .. } => rings.get(&other.name).is_some_and(|list| {
+                if can_recurse {
+                    let mut candidates: Vec<(i32, i32)> = list
+                        .iter()
+                        .filter(|c| {
+                            (min_x..=max_x).contains(&c.x) && (min_z..=max_z).contains(&c.z)
+                        })
+                        .map(|c| (c.x, c.z))
+                        .collect();
+                    candidates.sort_unstable();
+                    candidates.dedup();
+                    candidates.into_iter().any(|(px, pz)| {
+                        self.structure_chunk_after_placed(other, seed, px, pz, rings, zones)
+                    })
+                } else {
+                    list.iter().any(|c| {
+                        (min_x..=max_x).contains(&c.x)
+                            && (min_z..=max_z).contains(&c.z)
+                            && self
+                                .structure_chunk_after_placed(other, seed, c.x, c.z, rings, zones)
+                    })
+                }
+            }),
+            Placement::Unsupported => false,
+            _ => (min_x..=max_x).any(|tx| {
+                (min_z..=max_z).any(|tz| self.structure_chunk(other, seed, tx, tz, rings, zones))
+            }),
+        }
     }
 }
 impl StructureSet {
@@ -788,6 +945,13 @@ impl Piece {
             Self::Legacy(p) => p.bounding_box(),
         }
     }
+    /// The box once placed ([`LegacyPiece::placed_bounding_box`]).
+    pub fn placed_bounding_box(&self) -> BoundingBox {
+        match self {
+            Self::Pool(p) => p.bounding_box,
+            Self::Legacy(p) => p.placed_bounding_box(),
+        }
+    }
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::Pool(_) => "minecraft:jigsaw",
@@ -795,7 +959,7 @@ impl Piece {
         }
     }
     /// `StructurePiece.createTag`; None for a type Horizon cannot save yet.
-    pub fn save(&self) -> Option<crate::nbt::Compound> {
+    pub fn save(&self) -> Option<horizon_core::nbt::Compound> {
         match self {
             Self::Pool(p) => Some(p.save()),
             Self::Legacy(p) => p.save(),
@@ -842,13 +1006,15 @@ pub struct StructureStart {
     pub pieces: Vec<Piece>,
     /// Piece union, inflated by 12 for terrain-adapting structures.
     pub bounding_box: BoundingBox,
+    /// Whether any piece supplied cached terrain metadata.
+    pub(crate) has_piece_beardifier: bool,
 }
 impl StructureStart {
     /// `StructureStart.createTag` in its own chunk; None while one of its
     /// pieces cannot be saved. `references` counts `addReference` calls,
     /// which only locating structures makes: 0 in a freshly made world.
-    pub fn save(&self) -> Option<crate::nbt::Tag> {
-        use crate::nbt::Tag;
+    pub fn save(&self) -> Option<horizon_core::nbt::Tag> {
+        use horizon_core::nbt::Tag;
         let children: Option<Vec<Tag>> = self
             .pieces
             .iter()
@@ -899,6 +1065,22 @@ impl NoiseColumn {
     }
 }
 
+/// A caller-owned final noise column, filled directly during one sampling pass.
+pub trait NoiseColumnTarget {
+    fn resize(&mut self, min: i32, height: usize);
+    fn set(&mut self, index: usize, block: NoiseBlock);
+}
+impl NoiseColumnTarget for NoiseColumn {
+    fn resize(&mut self, min: i32, height: usize) {
+        self.min = min;
+        self.blocks.clear();
+        self.blocks.resize(height, NoiseBlock::Air);
+    }
+    fn set(&mut self, index: usize, block: NoiseBlock) {
+        self.blocks[index] = block;
+    }
+}
+
 /// Biome and height queries for one structure generation attempt.
 pub trait StartContext: JigsawContext {
     /// A chunk an older version generated: its structure starts are the ones
@@ -920,11 +1102,27 @@ pub trait StartContext: JigsawContext {
     }
     /// ChunkGenerator.getBaseColumn as heightmap opacity, indexed from min_y.
     fn base_column(&mut self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool>;
-    /// base_column for several heightmap kinds from one noise-column pass.
-    fn base_columns(&mut self, x: i32, z: i32, kinds: &[HeightmapType]) -> Vec<Vec<bool>>;
+    /// Several heightmap predicates from one pass, for the engine's vanilla callers.
+    fn base_columns(&mut self, x: i32, z: i32, kinds: &[HeightmapType]) -> Vec<Vec<bool>> {
+        self.base_columns_by(x, z, kinds.len(), &|index| kinds[index])
+    }
+    /// Several heightmap predicates from one pass, projected without a temporary kind vector.
+    fn base_columns_by(
+        &mut self,
+        x: i32,
+        z: i32,
+        count: usize,
+        kind: &dyn Fn(usize) -> HeightmapType,
+    ) -> Vec<Vec<bool>>;
     /// ChunkGenerator.getBaseColumn's blocks: the noise column's states, as
     /// mods' placements test them (Formations').
-    fn noise_column(&mut self, x: i32, z: i32) -> NoiseColumn;
+    fn noise_column(&mut self, x: i32, z: i32) -> NoiseColumn {
+        let mut column = NoiseColumn::default();
+        self.noise_column_into(x, z, &mut column);
+        column
+    }
+    /// Fill the caller's final column directly, with no intermediate classified-block vector.
+    fn noise_column_into(&mut self, x: i32, z: i32, column: &mut dyn NoiseColumnTarget);
     /// Biome.coldEnoughToSnow at a position.
     fn cold_enough_to_snow(&mut self, biome: BiomeId, pos: [i32; 3]) -> bool;
     fn generation(&self) -> WorldGenerationContext;
@@ -1016,17 +1214,10 @@ pub(crate) fn create_starts_with_saved(
         let mut options = set.structures.clone();
         let mut random = WorldgenRandom::new(LegacyRandom::new(0));
         random.set_large_feature_seed(seed, chunk.x, chunk.z);
-        let mut total: i32 = options.iter().map(|o| o.1).sum();
         while !options.is_empty() {
-            let mut choice = random.next_int_bound(total).unwrap_or(0);
-            let mut index = 0;
-            for option in &options {
-                choice -= option.1;
-                if choice < 0 {
-                    break;
-                }
-                index += 1;
-            }
+            let Some(index) = pick_structure(&options, &mut random) else {
+                break;
+            };
             let selected = options[index];
             if let Some(start) = try_generate(
                 registry, resources, bindings, context, selected.0, chunk, false,
@@ -1035,12 +1226,24 @@ pub(crate) fn create_starts_with_saved(
                 break;
             }
             options.remove(index);
-            total -= selected.1;
         }
     }
     starts.extend(saved);
     starts
 }
+// StructureSet uses a list of positive-int entries, not WeightedList: vanilla
+// does not reject oversized totals in its codec. Keep vanilla's int draw below
+// the limit; above it use one unsigned nextLong modulo the i64 total, just as
+// the other wide structure selectors do.
+fn pick_structure(options: &[(usize, i32)], random: &mut impl RandomSource) -> Option<usize> {
+    let total: i64 = options.iter().map(|o| i64::from(o.1)).sum();
+    let mut choice = crate::worldgen::weighted::draw(total, random)?;
+    options.iter().position(|option| {
+        choice -= i64::from(option.1);
+        choice < 0
+    })
+}
+
 /// `Structure.generate` of one structure for one chunk: what the chunk's
 /// structure set would build there, or, for `/place structure`, the start this
 /// structure builds in any chunk (the set's placement is not consulted, and
@@ -1429,6 +1632,19 @@ fn generate(
             )?;
             (position, pieces.into_iter().map(Piece::Pool).collect())
         }
+        StructureKind::Mod(mod_type) => {
+            // The type's own start and pieces; the biome check below and the
+            // set's spacing stay the game's, as for every other kind.
+            let context: &mut dyn StartContext = context;
+            let (position, pieces) = mod_type.ty.find_generation_point(
+                context,
+                resources,
+                chunk,
+                &mod_type.config,
+                &mut random,
+            )?;
+            (position, pieces.into_iter().map(Piece::Legacy).collect())
+        }
         StructureKind::Unsupported(_) => return None,
     };
     let quart = position.map(|v| v >> 2);
@@ -1444,11 +1660,30 @@ impl StructureStart {
     /// least one: their box, grown where the structure adapts the terrain.
     pub fn new(structure: usize, def: &StructureDef, chunk: ChunkPos, pieces: Vec<Piece>) -> Self {
         let mut bounding_box = pieces[0].bounding_box();
-        for piece in &pieces[1..] {
-            bounding_box.encapsulate(&piece.bounding_box());
+        let mut override_bounds: Option<BoundingBox> = None;
+        let mut has_piece_beardifier = false;
+        for (index, piece) in pieces.iter().enumerate() {
+            if index != 0 {
+                bounding_box.encapsulate(&piece.bounding_box());
+            }
+            if let Piece::Legacy(legacy) = piece
+                && let Some(rigid) = legacy.beardifier()
+            {
+                has_piece_beardifier = true;
+                if rigid.adjustment != TerrainAdjustment::None {
+                    let bounds = influence_box(rigid.bounds.minimum(), rigid.bounds.maximum());
+                    match &mut override_bounds {
+                        Some(union) => union.encapsulate(&bounds),
+                        None => override_bounds = Some(bounds),
+                    }
+                }
+            }
         }
         if def.terrain != TerrainAdjustment::None {
             bounding_box = bounding_box.inflated(12, 12);
+        }
+        if let Some(bounds) = override_bounds {
+            bounding_box.encapsulate(&bounds);
         }
         if let Some(enhanced) = def.enhanced_terrain.as_ref().filter(|e| e.inflate) {
             let r = enhanced.radius();
@@ -1461,6 +1696,7 @@ impl StructureStart {
             references: 0,
             pieces,
             bounding_box,
+            has_piece_beardifier,
         }
     }
 }
@@ -1539,10 +1775,29 @@ pub fn beardifier(
             include(b, &mut kernels);
         }
         let adjustment = def.terrain;
-        if adjustment == TerrainAdjustment::None {
+        if adjustment == TerrainAdjustment::None && !start.has_piece_beardifier {
             continue;
         }
         for piece in &start.pieces {
+            if start.has_piece_beardifier
+                && let Piece::Legacy(legacy) = piece
+                && let Some(rigid) = legacy.beardifier()
+            {
+                let b = BoundingBox::new(rigid.bounds.minimum(), rigid.bounds.maximum());
+                if rigid.adjustment != TerrainAdjustment::None
+                    && b.max[0] >= bx - 12
+                    && b.min[0] <= bx + 15 + 12
+                    && b.max[2] >= bz - 12
+                    && b.min[2] <= bz + 15 + 12
+                {
+                    rigids.push(rigid);
+                    include(b, &mut any);
+                }
+                continue;
+            }
+            if adjustment == TerrainAdjustment::None {
+                continue;
+            }
             let b = piece.bounding_box();
             let near = b.max[0] >= bx - 12
                 && b.min[0] <= bx + 15 + 12
@@ -1663,10 +1918,31 @@ pub fn place_in_chunk<W: FeatureWorld + PlacementContext, R: RandomSource + 'sta
     Ok(())
 }
 
+/// A piece's terrain box grown by the beardifier's reach (12 around), without overflowing:
+/// a mod's bounds may sit at the `i32` limits.
+fn influence_box(minimum: [i32; 3], maximum: [i32; 3]) -> BoundingBox {
+    BoundingBox::new(
+        minimum.map(|v| v.saturating_sub(12)),
+        maximum.map(|v| v.saturating_add(12)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_terrain_box_at_the_i32_limits_grows_without_overflowing() {
+        assert_eq!(
+            influence_box([i32::MIN, i32::MIN + 5, 0], [i32::MAX, i32::MAX - 5, 3]),
+            BoundingBox::new([i32::MIN, i32::MIN, -12], [i32::MAX, i32::MAX, 15])
+        );
+        assert_eq!(
+            influence_box([0, 64, 0], [8, 73, 8]),
+            BoundingBox::new([-12, 52, -12], [20, 85, 20])
+        );
+    }
 
     fn registry(structures: &[(&str, Value)], sets: &[(&str, Value)]) -> StructureRegistry {
         let text = |l: &[(&str, Value)]| {
@@ -1675,24 +1951,37 @@ mod tests {
                 .collect::<BTreeMap<_, _>>()
         };
         // Biome tags: `#t:one` is biome 1, `#t:two` biome 2.
-        StructureRegistry::new(&text(structures), &text(sets), BTreeMap::new(), &|v| {
-            Ok(match v.as_str() {
-                Some("#t:one") => BTreeSet::from([BiomeId(1)]),
-                Some("#t:two") => BTreeSet::from([BiomeId(2)]),
-                _ => BTreeSet::new(),
-            })
-        })
+        StructureRegistry::new(
+            &text(structures),
+            &text(sets),
+            BTreeMap::new(),
+            &|v| {
+                Ok(match v.as_str() {
+                    Some("#t:one") => BTreeSet::from([BiomeId(1)]),
+                    Some("#t:two") => BTreeSet::from([BiomeId(2)]),
+                    _ => BTreeSet::new(),
+                })
+            },
+            &ModStructureTypes::new(),
+        )
         .unwrap()
     }
 
     fn try_registry(placement: Value) -> Result<StructureRegistry, DecodeError> {
+        try_weight_registry(placement, json!(1))
+    }
+
+    fn try_weight_registry(
+        placement: Value,
+        weight: Value,
+    ) -> Result<StructureRegistry, DecodeError> {
         let structures = BTreeMap::from([(
             "t:s".to_owned(),
             json!({"type": "minecraft:igloo", "biomes": []}).to_string(),
         )]);
         let sets = BTreeMap::from([(
             "t:set".to_owned(),
-            json!({"structures": [{"structure": "t:s", "weight": 1}],
+            json!({"structures": [{"structure": "t:s", "weight": weight}],
                 "placement": placement})
             .to_string(),
         )]);
@@ -1701,7 +1990,54 @@ mod tests {
             &sets,
             BTreeMap::new(),
             &|_| Ok(BTreeSet::new()),
+            &ModStructureTypes::new(),
         )
+    }
+
+    #[test]
+    fn structure_weights_decode_positive_int() {
+        let placement = json!({"type": "minecraft:dimension_origin"});
+        for weight in [
+            json!(-1),
+            json!(0),
+            json!(2147483648_i64),
+            json!(u64::MAX),
+            json!(1.5),
+            json!("1"),
+            Value::Null,
+        ] {
+            assert!(
+                try_weight_registry(placement.clone(), weight.clone()).is_err(),
+                "{weight}"
+            );
+        }
+        for weight in [1, i32::MAX] {
+            assert!(try_weight_registry(placement.clone(), json!(weight)).is_ok());
+        }
+    }
+
+    #[test]
+    fn structure_weights_wide_pick_matches_old_small_lists() {
+        for weights in [[1, 1, 1], [1, 2, 5], [7, 3, 1]] {
+            let options: Vec<_> = weights.into_iter().enumerate().collect();
+            for seed in -20..20 {
+                let mut old = LegacyRandom::new(seed);
+                let mut new = old.clone();
+                let mut choice = old.next_int_bound(weights.iter().sum()).unwrap();
+                let expected = weights.iter().position(|w| {
+                    choice -= w;
+                    choice < 0
+                });
+                assert_eq!(pick_structure(&options, &mut new), expected);
+                assert_eq!(new.next_long(), old.next_long());
+            }
+        }
+        let mut options = vec![(0, i32::MAX), (1, i32::MAX), (2, i32::MAX)];
+        let mut random = LegacyRandom::new(71);
+        while !options.is_empty() {
+            let index = pick_structure(&options, &mut random).unwrap();
+            options.remove(index);
+        }
     }
 
     #[test]
@@ -1878,5 +2214,398 @@ mod tests {
         assert!(avoid.near(ChunkPos::new(1, -1), |q| {
             BiomeId(if q == [18, 30, 10] { 2 } else { 0 })
         }));
+    }
+
+    #[test]
+    fn has_start_in_range_matches_bruteforce_across_placements_and_bounds() {
+        let mut r = registry(
+            &[("t:s", json!({"type": "minecraft:igloo", "biomes": []}))],
+            &[
+                (
+                    "t:linear",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 16, "separation": 4, "salt": 10387312}}),
+                ),
+                (
+                    "t:non_pow2",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 30, "separation": 7, "salt": 34222645}}),
+                ),
+                (
+                    "t:sep_zero",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 8, "separation": 0, "salt": 99112233}}),
+                ),
+                (
+                    "t:triangular",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 12, "separation": 3, "spread_type": "triangular",
+                            "salt": 14357617, "frequency": 0.45}}),
+                ),
+                (
+                    "t:excluded",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 6, "separation": 1, "salt": 777,
+                            "exclusion_zone": {"other_set": "t:sep_zero", "chunk_count": 3}}}),
+                ),
+                (
+                    "t:min_dist",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 6, "separation": 1, "salt": 778,
+                            "exclusion_zone": {"other_set": "t:sep_zero", "chunk_count": 3},
+                            "horizon:min_distance_from_world_origin": 64}}),
+                ),
+                (
+                    "t:origin",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:dimension_origin"}}),
+                ),
+                (
+                    "t:rings",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:concentric_rings",
+                            "distance": 32, "spread": 3, "count": 4, "preferred_biomes": [],
+                            "salt": 55, "frequency": 0.5}}),
+                ),
+                (
+                    "t:sep_eq",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 8, "separation": 0, "salt": 123}}),
+                ),
+                (
+                    "t:sep_gt",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 6, "separation": 0, "salt": 456}}),
+                ),
+                (
+                    "t:unsupported",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:dimension_origin"}}),
+                ),
+            ],
+        );
+        // Exercise defensive fallback paths for invalid separation >= spacing and Unsupported.
+        for set in &mut r.sets {
+            match set.name.as_str() {
+                "t:sep_eq" => {
+                    set.placement = Placement::RandomSpread {
+                        spacing: 8,
+                        separation: 8,
+                        triangular: false,
+                    };
+                }
+                "t:sep_gt" => {
+                    set.placement = Placement::RandomSpread {
+                        spacing: 6,
+                        separation: 9,
+                        triangular: false,
+                    };
+                }
+                "t:unsupported" => {
+                    set.placement = Placement::Unsupported;
+                }
+                _ => {}
+            }
+        }
+        r.set_dimension_origin(ChunkPos::new(-17, 23));
+        let mut rings = Rings::new();
+        rings.insert(
+            "t:rings".to_owned(),
+            vec![
+                ChunkPos::new(-12, 5),
+                ChunkPos::new(0, 0),
+                ChunkPos::new(41, -38),
+                ChunkPos::new(i32::MAX - 3, i32::MIN + 4),
+            ],
+        );
+
+        let brute_force = |name: &str, seed: i64, x: i32, z: i32, range: i32, zones: bool| {
+            let Some(other) = r.sets.iter().find(|s| s.name == name) else {
+                return false;
+            };
+            (x - range..=x + range).any(|tx| {
+                (z - range..=z + range)
+                    .any(|tz| r.structure_chunk(other, seed, tx, tz, &rings, zones))
+            })
+        };
+
+        let names = [
+            "t:linear",
+            "t:non_pow2",
+            "t:sep_zero",
+            "t:triangular",
+            "t:excluded",
+            "t:min_dist",
+            "t:origin",
+            "t:rings",
+            "t:sep_eq",
+            "t:sep_gt",
+            "t:unsupported",
+            "t:missing",
+        ];
+        let coords = [
+            (0, 0),
+            (-17, 23),
+            (-15, 20),
+            (-35, -28),
+            (19, -44),
+            (i32::MAX - 10, i32::MAX - 10),
+            (i32::MIN + 10, i32::MIN + 10),
+            // `min_x == i32::MIN`: with spacing 30, `i32::MIN.div_euclid(30) * 30 < i32::MIN`,
+            // so widening to i64 is required to match Java's 32-bit `gx * spacing + sx`.
+            (i32::MIN + 2, i32::MIN + 2),
+            (i32::MAX - 3, i32::MIN + 4),
+        ];
+        let mut saw_true = false;
+        let mut saw_false = false;
+        for seed in [0_i64, 12345, -987_654_321] {
+            for name in names {
+                for &(x, z) in &coords {
+                    // `min_distance` squares `x * 16` in `i64`; stay within its representable range.
+                    if name == "t:min_dist" && (x.unsigned_abs() > 100 || z.unsigned_abs() > 100) {
+                        continue;
+                    }
+                    for range in [-1_i32, 0, 2, 10] {
+                        let margin = if name == "t:excluded" {
+                            range.saturating_add(10)
+                        } else {
+                            range
+                        };
+                        if x.checked_sub(margin).is_none()
+                            || x.checked_add(margin).is_none()
+                            || z.checked_sub(margin).is_none()
+                            || z.checked_add(margin).is_none()
+                        {
+                            continue;
+                        }
+                        for zones in [false, true] {
+                            let actual =
+                                r.has_start_in_range(name, seed, x, z, range, &rings, zones);
+                            let expected = brute_force(name, seed, x, z, range, zones);
+                            assert_eq!(
+                                actual, expected,
+                                "mismatch for {name} seed={seed} ({x},{z}) range={range} zones={zones}"
+                            );
+                            saw_true |= actual;
+                            saw_false |= !actual;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_true && saw_false,
+            "test must cover both hits and misses"
+        );
+    }
+
+    #[test]
+    fn has_start_in_range_preserves_xz_order_for_recursive_exclusions() {
+        let r = registry(
+            &[("t:s", json!({"type": "minecraft:igloo", "biomes": []}))],
+            &[
+                // Linear RandomSpread mutual recursion: within `gx = 0`, `gz = 0`
+                // produces `(8, 11)` (recursive trap with `t:spread_b` at `(10, 11)`),
+                // while `gz = 1` produces `(5, 22)` (smaller `x`, matches first in
+                // `(x, z)` order and ends the scan without recursing into `(8, 11)`).
+                (
+                    "t:spread_a",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 16, "separation": 4, "salt": 35,
+                            "exclusion_zone": {"other_set": "t:spread_b", "chunk_count": 2}}}),
+                ),
+                (
+                    "t:spread_b",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 16, "separation": 4, "salt": 34,
+                            "exclusion_zone": {"other_set": "t:spread_a", "chunk_count": 2}}}),
+                ),
+                // Negative-coordinate RandomSpread with mutually recursive
+                // `horizon:exclusion_zone` (`their_zones: true`): within `gx = -1`,
+                // `gz = -1` produces `(-6, -6)` (recursive trap) while `gz = 0`
+                // produces `(-11, 4)` (smaller `x`, matches first).
+                (
+                    "t:neg_a",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                    "placement": {"type": "minecraft:random_spread",
+                        "spacing": 16, "separation": 4, "salt": 26,
+                        "horizon:exclusion_zone": {
+                            "other_sets": ["t:neg_b"], "chunk_count": 2, "their_zones": true
+                        }}}),
+                ),
+                (
+                    "t:neg_b",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                    "placement": {"type": "minecraft:concentric_rings",
+                        "distance": 32, "spread": 3, "count": 1, "preferred_biomes": [],
+                        "horizon:exclusion_zone": {
+                            "other_sets": ["t:neg_a"], "chunk_count": 2, "their_zones": true
+                        }}}),
+                ),
+                // Triangular RandomSpread with mutually recursive `exclusion_zone`:
+                // within `gx = 0`, `gz = 0` produces `(8, 8)` (recursive trap) while
+                // `gz = 1` produces `(5, 16)` (smaller `x`, matches first).
+                (
+                    "t:tri_a",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:random_spread",
+                            "spacing": 16, "separation": 4, "spread_type": "triangular",
+                            "salt": 40,
+                            "exclusion_zone": {"other_set": "t:tri_b", "chunk_count": 2}}}),
+                ),
+                (
+                    "t:tri_b",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:concentric_rings",
+                            "distance": 32, "spread": 3, "count": 1, "preferred_biomes": [],
+                            "exclusion_zone": {"other_set": "t:tri_a", "chunk_count": 2}}}),
+                ),
+                // ConcentricRings mutual recursion with unsorted ring order,
+                // duplicate entries, an earlier candidate rejected by `min_distance`,
+                // a middle candidate that matches, and a later recursive trap.
+                (
+                    "t:ring_x_a",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:concentric_rings",
+                            "distance": 32, "spread": 3, "count": 4, "preferred_biomes": [],
+                            "horizon:min_distance_from_world_origin": 32,
+                            "exclusion_zone": {"other_set": "t:ring_x_b", "chunk_count": 2}}}),
+                ),
+                (
+                    "t:ring_x_b",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:concentric_rings",
+                            "distance": 32, "spread": 3, "count": 1, "preferred_biomes": [],
+                            "exclusion_zone": {"other_set": "t:ring_x_a", "chunk_count": 2}}}),
+                ),
+                // ConcentricRings mutual recursion with equal `x` and unsorted `z`
+                // through `horizon:exclusion_zone` (`their_zones: true`).
+                (
+                    "t:ring_z_a",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                    "placement": {"type": "minecraft:concentric_rings",
+                        "distance": 32, "spread": 3, "count": 2, "preferred_biomes": [],
+                        "horizon:exclusion_zone": {
+                            "other_sets": ["t:ring_z_b"], "chunk_count": 2, "their_zones": true
+                        }}}),
+                ),
+                (
+                    "t:ring_z_b",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                    "placement": {"type": "minecraft:concentric_rings",
+                        "distance": 32, "spread": 3, "count": 1, "preferred_biomes": [],
+                        "horizon:exclusion_zone": {
+                            "other_sets": ["t:ring_z_a"], "chunk_count": 2, "their_zones": true
+                        }}}),
+                ),
+                // Public `is_structure_chunk` callers whose exclusion zones query
+                // the recursive sets above.
+                (
+                    "t:outer_spread",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:concentric_rings",
+                            "distance": 32, "spread": 3, "count": 1, "preferred_biomes": [],
+                            "exclusion_zone": {"other_set": "t:spread_a", "chunk_count": 6}}}),
+                ),
+                (
+                    "t:outer_ring",
+                    json!({"structures": [{"structure": "t:s", "weight": 1}],
+                        "placement": {"type": "minecraft:concentric_rings",
+                            "distance": 32, "spread": 3, "count": 1, "preferred_biomes": [],
+                            "exclusion_zone": {"other_set": "t:ring_x_a", "chunk_count": 5}}}),
+                ),
+            ],
+        );
+
+        let set = |name: &str| r.sets.iter().find(|s| s.name == name).unwrap();
+        // Pin the grid-sector candidates that invert `(gx, gz)` vs `(x, z)` order.
+        assert_eq!(
+            StructureRegistry::potential_chunk(set("t:spread_a"), 0, 0, 0),
+            Some(ChunkPos::new(8, 11))
+        );
+        assert_eq!(
+            StructureRegistry::potential_chunk(set("t:spread_a"), 0, 0, 16),
+            Some(ChunkPos::new(5, 22))
+        );
+        assert_eq!(
+            StructureRegistry::potential_chunk(set("t:spread_b"), 0, 0, 0),
+            Some(ChunkPos::new(10, 11))
+        );
+        assert_eq!(
+            StructureRegistry::potential_chunk(set("t:neg_a"), 0, -16, -16),
+            Some(ChunkPos::new(-6, -6))
+        );
+        assert_eq!(
+            StructureRegistry::potential_chunk(set("t:neg_a"), 0, -16, 0),
+            Some(ChunkPos::new(-11, 4))
+        );
+        assert_eq!(
+            StructureRegistry::potential_chunk(set("t:tri_a"), 0, 0, 0),
+            Some(ChunkPos::new(8, 8))
+        );
+        assert_eq!(
+            StructureRegistry::potential_chunk(set("t:tri_a"), 0, 0, 16),
+            Some(ChunkPos::new(5, 16))
+        );
+
+        let mut rings = Rings::new();
+        rings.insert("t:neg_b".to_owned(), vec![ChunkPos::new(-6, -6)]);
+        rings.insert("t:tri_b".to_owned(), vec![ChunkPos::new(8, 8)]);
+        rings.insert(
+            "t:ring_x_a".to_owned(),
+            vec![
+                ChunkPos::new(10, 0),
+                ChunkPos::new(5, 0),
+                ChunkPos::new(0, 0),
+                ChunkPos::new(5, 0),
+            ],
+        );
+        rings.insert("t:ring_x_b".to_owned(), vec![ChunkPos::new(10, 0)]);
+        rings.insert(
+            "t:ring_z_a".to_owned(),
+            vec![ChunkPos::new(0, 10), ChunkPos::new(0, 0)],
+        );
+        rings.insert("t:ring_z_b".to_owned(), vec![ChunkPos::new(0, 10)]);
+        rings.insert("t:outer_spread".to_owned(), vec![ChunkPos::new(6, 16)]);
+        rings.insert("t:outer_ring".to_owned(), vec![ChunkPos::new(5, 0)]);
+
+        let brute_force = |name: &str, x: i32, z: i32, range: i32| {
+            let other = set(name);
+            (x - range..=x + range).any(|tx| {
+                (z - range..=z + range).any(|tz| r.structure_chunk(other, 0, tx, tz, &rings, true))
+            })
+        };
+
+        for (name, x, z, range) in [
+            ("t:spread_a", 6, 16, 6),
+            ("t:neg_a", -9, -1, 5),
+            ("t:tri_a", 6, 12, 4),
+            ("t:ring_x_a", 5, 0, 5),
+            ("t:ring_z_a", 0, 5, 5),
+        ] {
+            assert!(
+                r.has_start_in_range(name, 0, x, z, range, &rings, true),
+                "{name} must stop at the earlier (x, z) match before reaching the recursive trap"
+            );
+            assert!(
+                brute_force(name, x, z, range),
+                "{name} brute-force (x, z) scan must agree"
+            );
+        }
+
+        // End-to-end through `is_structure_chunk`: both outer sets are excluded
+        // by the earlier `(x, z)` candidate without entering the recursive trap.
+        assert!(!r.is_structure_chunk(set("t:outer_spread"), 0, 6, 16, &rings));
+        assert!(!r.is_structure_chunk(set("t:outer_ring"), 0, 5, 0, &rings));
     }
 }

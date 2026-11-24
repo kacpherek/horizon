@@ -46,14 +46,16 @@
 //! buckets that can face the eye lie in at most `RUNS` runs: a draw each.
 //!
 //! The pass `apply`s the records that changed, then `cull` keeps the sections
-//! in view, writes their runs and counts their draws per page and block of ids,
-//! `scan` turns the counts into where each block's draws start, and `scatter`
-//! writes every block's draws there in id order, each section's in its runs'.
-//! Appended with atomics alone, a page's draws would come in the order the GPU
-//! happens to schedule them, and where faces of two sections meet at exactly
-//! the same depth the later draw keeps the pixel, so such pixels would flicker;
-//! in id order they differ from the CPU's front-to-back order only there, and
-//! stay put.
+//! in view, writes their runs and counts their draws per page, distance band
+//! (`BANDS`) and block of ids, `scan` turns the counts into where each block's
+//! draws start (band 0 through `BANDS - 1` front-to-back within each page), and
+//! `scatter` writes every block's draws there, ordered per page and phase by
+//! distance band, section id, and each section's runs. Appended with atomics
+//! alone, a page's draws would come in the order the GPU happens to schedule
+//! them, and where faces of two sections meet at exactly the same depth the
+//! later draw keeps the pixel, so such pixels would flicker; band-then-id order
+//! stays deterministic for a camera column while giving early-Z coarse
+//! front-to-back order.
 //!
 //! This is not `cull` (occlusion culling, `HORIZON_GPU_CULL`), which tests the
 //! CPU's lists against phase 1's depth: frames drawn from here leave it off.
@@ -315,6 +317,9 @@ const OCCLUDE: u32 = 8;
 const PROBE: u32 = 16;
 /// Ids per block (the shader's `BLOCK`), and the workgroup of the passes over ids.
 const WORKGROUP: u32 = 64;
+/// Front-to-back distance bands per page (the shader's `BANDS`: 0..4, 4..8,
+/// 8..16, and >=16 chunks from the camera).
+const BANDS: u64 = 4;
 /// Workgroups along x when there are more (the shader's `ROW`).
 const ROW: u32 = 65535;
 /// Changed records past which the whole table is written at once: their
@@ -349,7 +354,7 @@ pub(super) struct FrameInputs<'a> {
     /// The cave-culling graph, while cave culling runs and has one
     /// (`Occlusion::reach`); `None`: every section counts as reached.
     pub reach: Option<Reach<'a>>,
-    /// The eye (gfx.rs `projection_center`), while solid quads facing away
+    /// The eye (`view::projection_center`), while solid quads facing away
     /// from it are left out (`sides_on`); `None`: every solid quad is drawn. A
     /// GPU frame has no water mirror, whose eye below would see more of them.
     pub eye: Option<Vec3>,
@@ -542,6 +547,13 @@ pub(super) fn supported(
 /// shortcut: not offered there, until GPU culling's draws carry their base vertex otherwise.
 pub(super) fn loses_base_vertex(info: &wgpu::AdapterInfo, flat_page_groups: bool) -> bool {
     info.backend == wgpu::Backend::Dx12 && flat_page_groups
+}
+
+/// DX12's count draws also leave the quads' looks out of reach: a pack's terrain finds its quad's
+/// look by `vertex_index` (`looks`), so with looks on, the frame draws the CPU's lists, whose
+/// draws carry their base vertex.
+pub(super) fn looks_lose_base_vertex(info: &wgpu::AdapterInfo, looks: bool) -> bool {
+    looks && info.backend == wgpu::Backend::Dx12
 }
 
 /// What the settings offer (`graphics::GpuCullingOffer`): where `supported`
@@ -839,25 +851,56 @@ struct Readback {
     occluded: bool,
 }
 
-/// The occlusion test (`gpu_occlusion.wgsl`): its boxes' pipeline and bind
-/// group, and phase 2's passes (count2, scan2, scatter2).
+/// Early-depth fragment entry point appended only on the `Early` raster fallback
+/// (kept out of `gpu_occlusion.wgsl` so compute Hi-Z validates without `EARLY_DEPTH_TEST`
+/// on Metal, DirectX 12 and Adreno).
+const EARLY_FS_BOX: &str = "
+@fragment
+@early_depth_test(force)
+fn fs_box(in: BoxOut) -> @location(0) vec4<f32> {
+    let at = in.id * RUN_WORDS + SEEN_WORD;
+    if box_runs[at] != params.occl.x {
+        box_runs[at] = params.occl.x;
+    }
+    return vec4(0.0);
+}
+";
+
+/// Compute Hi-Z pipelines for GPU culling's occlusion test (`prepare_boxes` + `test_boxes`).
+struct HizTest {
+    prepare: wgpu::ComputePipeline,
+    test: wgpu::ComputePipeline,
+}
+
+/// Which occlusion test backend `GpuCulling` creates.
+enum OcclusionTest<'a> {
+    Early(wgpu::TextureFormat),
+    Hiz(&'a wgpu::BindGroupLayout),
+}
+
+/// The occlusion test (`gpu_occlusion.wgsl`): its boxes' pipeline (either compute
+/// Hi-Z or early-depth raster fallback) and bind group, and phase 2's passes
+/// (`count2`, `scan2`, `scatter2`).
 struct BoxTest {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: Option<wgpu::RenderPipeline>,
+    hiz: Option<HizTest>,
     layout: wgpu::BindGroupLayout,
     group: Option<wgpu::BindGroup>,
     phase2: [wgpu::ComputePipeline; 3],
 }
 
 impl BoxTest {
-    /// `color`: the world pass's colour format. `None` when the device fails to
-    /// make the pipelines: GPU culling then runs without the test.
+    /// `occlusion`: either the world pass's colour format (`Early` raster fallback)
+    /// or `Cull`'s Hi-Z read layout (`Compute` Hi-Z). `None` when the device fails
+    /// to make the pipelines: GPU culling then runs without the test.
     fn new(
         device: &wgpu::Device,
-        color: wgpu::TextureFormat,
+        occlusion: OcclusionTest<'_>,
         compute: &wgpu::BindGroupLayout,
     ) -> Option<Self> {
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility,
@@ -870,73 +913,122 @@ impl BoxTest {
         };
         let storage = |read_only| wgpu::BufferBindingType::Storage { read_only };
         use wgpu::ShaderStages as S;
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("GPU culling occlusion test"),
-            entries: &[
-                entry(0, S::VERTEX_FRAGMENT, wgpu::BufferBindingType::Uniform),
-                entry(9, S::VERTEX, storage(true)),
-                entry(10, S::VERTEX, storage(true)),
-                entry(11, S::FRAGMENT, storage(false)),
-                entry(12, S::VERTEX, storage(true)),
-            ],
-        });
-        let source = [
-            include_str!("gpu_culling.wgsl"),
-            include_str!("gpu_occlusion.wgsl"),
-        ]
-        .concat();
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("GPU culling occlusion test"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
-        let layouts = [Some(&layout)];
-        let box_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("GPU culling occlusion test"),
-            bind_group_layouts: &layouts,
-            ..Default::default()
-        });
-        // cull.rs's `Early` pipeline: front faces against the world pass's
-        // reversed depth, without writes.
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("GPU culling occlusion test"),
-            layout: Some(&box_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_box"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_box"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::empty(),
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
         let compute_layouts = [Some(compute)];
         let compute_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("GPU culling phase 2"),
             bind_group_layouts: &compute_layouts,
             ..Default::default()
         });
+        let (pipeline, hiz, layout, module) = match occlusion {
+            OcclusionTest::Hiz(hiz_read_layout) => {
+                let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("GPU culling Hi-Z test"),
+                    entries: &[
+                        entry(0, S::COMPUTE, wgpu::BufferBindingType::Uniform),
+                        entry(9, S::COMPUTE, storage(true)),
+                        entry(10, S::COMPUTE, storage(true)),
+                        entry(11, S::COMPUTE, storage(false)),
+                        entry(12, S::COMPUTE, storage(true)),
+                    ],
+                });
+                let source = [
+                    include_str!("gpu_culling.wgsl"),
+                    include_str!("gpu_occlusion.wgsl"),
+                ]
+                .concat();
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("GPU culling Hi-Z test"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                });
+                let prepare = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("GPU culling prepare boxes"),
+                    layout: Some(&compute_layout),
+                    module: &module,
+                    entry_point: Some("prepare_boxes"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+                let box_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("GPU culling Hi-Z test"),
+                    bind_group_layouts: &[Some(&layout), Some(hiz_read_layout)],
+                    ..Default::default()
+                });
+                let test = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("GPU culling Hi-Z test"),
+                    layout: Some(&box_layout),
+                    module: &module,
+                    entry_point: Some("test_boxes"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+                (None, Some(HizTest { prepare, test }), layout, module)
+            }
+            OcclusionTest::Early(color) => {
+                let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("GPU culling occlusion test"),
+                    entries: &[
+                        entry(0, S::VERTEX_FRAGMENT, wgpu::BufferBindingType::Uniform),
+                        entry(9, S::VERTEX, storage(true)),
+                        entry(10, S::VERTEX, storage(true)),
+                        entry(11, S::FRAGMENT, storage(false)),
+                        entry(12, S::VERTEX, storage(true)),
+                    ],
+                });
+                let source = [
+                    include_str!("gpu_culling.wgsl"),
+                    include_str!("gpu_occlusion.wgsl"),
+                    EARLY_FS_BOX,
+                ]
+                .concat();
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("GPU culling occlusion test"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                });
+                let layouts = [Some(&layout)];
+                let box_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("GPU culling occlusion test"),
+                    bind_group_layouts: &layouts,
+                    ..Default::default()
+                });
+                // cull.rs's `Early` pipeline: front faces against the world pass's
+                // reversed depth, without writes.
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("GPU culling occlusion test"),
+                    layout: Some(&box_layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs_box"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: Some(wgpu::Face::Back),
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs_box"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: color,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::empty(),
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                });
+                (Some(pipeline), None, layout, module)
+            }
+        };
         let phase2 = ["count2", "scan2", "scatter2"].map(|entry| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("GPU culling phase 2"),
@@ -947,13 +1039,16 @@ impl BoxTest {
                 cache: None,
             })
         });
+        let memory = pollster::block_on(memory.pop());
         let internal = pollster::block_on(internal.pop());
-        if let Some(e) = internal.or(pollster::block_on(validation.pop())) {
+        let validation = pollster::block_on(validation.pop());
+        if let Some(e) = memory.or(internal).or(validation) {
             log::warn!("Horizon renderer: GPU culling's occlusion test unavailable ({e})");
             return None;
         }
         Some(Self {
             pipeline,
+            hiz,
             layout,
             group: None,
             phase2,
@@ -1037,10 +1132,22 @@ pub(super) struct GpuCulling {
 impl GpuCulling {
     /// `None` when the device fails to make the pipelines or the memory for the
     /// buffers is missing (caught, not raised: raised errors are fatal). `test`:
-    /// the world pass's colour format, where frames can run the occlusion test.
+    /// the world pass's colour format, where frames run the `Early` raster test.
     pub fn new(device: &wgpu::Device, test: Option<wgpu::TextureFormat>) -> Option<Self> {
+        Self::create(device, test.map(OcclusionTest::Early))
+    }
+
+    /// As [`Self::new`], using `Cull`'s conservative reversed-Z Hi-Z compute
+    /// pyramid (`hiz_read_layout`) for occlusion testing across Vulkan, Metal
+    /// and DirectX 12.
+    pub fn new_hiz(device: &wgpu::Device, hiz_read_layout: &wgpu::BindGroupLayout) -> Option<Self> {
+        Self::create(device, Some(OcclusionTest::Hiz(hiz_read_layout)))
+    }
+
+    fn create(device: &wgpu::Device, test: Option<OcclusionTest<'_>>) -> Option<Self> {
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -1086,12 +1193,14 @@ impl GpuCulling {
                 cache: None,
             })
         });
+        let memory = pollster::block_on(memory.pop());
         let internal = pollster::block_on(internal.pop());
-        if let Some(e) = internal.or(pollster::block_on(validation.pop())) {
+        let validation = pollster::block_on(validation.pop());
+        if let Some(e) = memory.or(internal).or(validation) {
             log::warn!("Horizon renderer: GPU culling unavailable ({e})");
             return None;
         }
-        let test = test.and_then(|color| BoxTest::new(device, color, &layout));
+        let test = test.and_then(|occlusion| BoxTest::new(device, occlusion, &layout));
         use wgpu::BufferUsages as U;
         let readbacks = (0..READBACKS)
             .map(|_| {
@@ -1256,10 +1365,12 @@ impl GpuCulling {
         // A region has room for every draw of every record on its page.
         let total = RUNS * self.records.page_sections.iter().sum::<u32>();
         // The statistics, each page's count in both phases, each block's per
-        // page in both phases, then where the test exists the boxes to test.
+        // (page, distance band) in both phases, then where the test exists the
+        // boxes to test.
         let blocks = u64::from(ids.div_ceil(WORKGROUP));
-        let phase1_end = STATS + u64::from(pass_pages) * (2 + blocks);
-        let tests_at = phase1_end + u64::from(pass_pages) * blocks;
+        let buckets = u64::from(pass_pages) * BANDS;
+        let phase1_end = STATS + u64::from(pass_pages) * 2 + buckets * blocks;
+        let tests_at = phase1_end + buckets * blocks;
         let count_words = match self.test {
             Some(_) => tests_at + u64::from(ids),
             None => phase1_end,
@@ -1456,15 +1567,20 @@ impl GpuCulling {
         arena: &Arena,
         group: impl Fn(u32) -> Option<&'a wgpu::BindGroup>,
         phase: u64,
+        looks: Option<&super::looks::LookGroups>,
     ) {
         if self.pages.is_empty() {
             return;
         }
         pass.set_vertex_buffer(1, self.origins.buffer.slice(..));
         for &(page, first, size) in &self.pages {
-            pass.set_vertex_buffer(0, arena.buffer(page).slice(..));
             if let Some(group) = group(page) {
                 pass.set_bind_group(1, group, &[]);
+            } else {
+                pass.set_vertex_buffer(0, arena.buffer(page).slice(..));
+            }
+            if let Some(looks) = looks {
+                pass.set_bind_group(super::looks::GROUP, looks.page(page, false), &[]);
             }
             pass.multi_draw_indexed_indirect_count(
                 &self.draws.buffer,
@@ -1493,11 +1609,16 @@ impl GpuCulling {
         self.hidden.map(|h| (h, self.share.1))
     }
 
-    /// In the world pass after phase 1's draws: the listed boxes against its
-    /// depth. Leaves the pass's pipeline and group 0 changed.
+    /// Whether this pass's occlusion test runs in compute against `Cull`'s Hi-Z pyramid.
+    pub fn uses_hiz(&self) -> bool {
+        self.test.as_ref().is_some_and(|t| t.hiz.is_some())
+    }
+
+    /// In the world pass after phase 1's draws (`Early` fallback): the listed boxes
+    /// against its depth. Leaves the pass's pipeline and group 0 changed.
     pub fn test(&self, pass: &mut wgpu::RenderPass<'_>) {
         if let Some(BoxTest {
-            pipeline,
+            pipeline: Some(pipeline),
             group: Some(group),
             ..
         }) = &self.test
@@ -1507,6 +1628,47 @@ impl GpuCulling {
             pass.set_bind_group(0, group, &[]);
             pass.draw_indirect(&self.counts.buffer, BOX * 4);
         }
+    }
+
+    /// Between the world passes (compute Hi-Z): compute indirect dispatch dims for
+    /// queued boxes and test every queued box against `hiz_read_group`.
+    pub fn test_hiz(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        hiz_read_group: &wgpu::BindGroup,
+        timing: Option<&mut PassTiming>,
+    ) {
+        let (
+            Some(BoxTest {
+                hiz: Some(hiz),
+                group: Some(box_group),
+                ..
+            }),
+            Some(compute_group),
+        ) = (&self.test, &self.group)
+        else {
+            return;
+        };
+        if !self.occluding {
+            return;
+        }
+        let mut prepare = |pass: &mut wgpu::ComputePass<'_>| {
+            pass.set_pipeline(&hiz.prepare);
+            pass.set_bind_group(0, compute_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        };
+        let mut test = |pass: &mut wgpu::ComputePass<'_>| {
+            pass.set_pipeline(&hiz.test);
+            pass.set_bind_group(0, box_group, &[]);
+            pass.set_bind_group(1, hiz_read_group, &[]);
+            pass.dispatch_workgroups_indirect(&self.counts.buffer, (BOX + 2) * 4);
+        };
+        compute_parts(
+            encoder,
+            timing,
+            "GPU occlusion boxes",
+            &mut [("prepare_boxes", &mut prepare), ("test_boxes", &mut test)],
+        );
     }
 
     /// Between the world passes: phase 2's draws, of the sections the test saw,
@@ -1554,6 +1716,11 @@ impl GpuCulling {
     /// The frame's statistics to read back, started by calling it right after
     /// the frame's submission (gfx's after-submit hook, on the submit thread
     /// when the frame goes there), as `cull::Cull::submitted`.
+    /// The whole record table is uploaded again: a frame given up (#13624) dropped the
+    /// changed records' updates.
+    pub fn forget(&mut self) {
+        self.records.all_dirty = true;
+    }
     pub fn submitted(&mut self) -> Option<impl FnOnce() + Send + 'static> {
         let i = self.current.take()?;
         let r = &self.readbacks[i];
@@ -1724,7 +1891,7 @@ mod tests {
     /// The frustum `draw_frame` culls with for the view and projection `m`, and
     /// the eye it leaves out the faces turned away from (`projection_center`).
     fn through(m: Mat4) -> (Frustum, Vec3) {
-        let eye = super::super::projection_center(m).expect("a perspective");
+        let eye = super::super::view::projection_center(m).expect("a perspective");
         let planes = super::super::frustum(m);
         (Frustum { planes }, eye)
     }
@@ -1880,19 +2047,267 @@ mod tests {
         runs
     }
 
-    /// The pass's module validates without the early depth test, and the
-    /// occlusion test's (the pass's with `gpu_occlusion.wgsl`) with it.
+    /// The pass's module and the compute Hi-Z occlusion module validate without
+    /// the early depth test (Metal, DirectX 12, Adreno), and the `Early` raster
+    /// fallback validates with it.
     #[test]
     fn the_shaders_validate() {
+        let _gpu = crate::gfx::test_gpu::lock();
         use naga::valid::Capabilities as C;
+        let no_early = C::all() - C::EARLY_DEPTH_TEST;
         let pass = include_str!("gpu_culling.wgsl");
-        let test = [pass, include_str!("gpu_occlusion.wgsl")].concat();
-        for (source, capabilities) in [(pass, C::all() - C::EARLY_DEPTH_TEST), (&test, C::all())] {
+        let hiz = [pass, include_str!("gpu_occlusion.wgsl")].concat();
+        let early = [pass, include_str!("gpu_occlusion.wgsl"), EARLY_FS_BOX].concat();
+        for (source, capabilities) in [(pass, no_early), (&hiz, no_early), (&early, C::all())] {
             let module = naga::front::wgsl::parse_str(source).unwrap();
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
                 .validate(&module)
                 .unwrap();
         }
+        let module = naga::front::wgsl::parse_str(&hiz).unwrap();
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), no_early)
+            .validate(&module)
+            .unwrap();
+        let stage = naga::ShaderStage::Compute;
+        for entry in ["prepare_boxes", "test_boxes"] {
+            let mut hlsl = String::new();
+            naga::back::hlsl::Writer::new(
+                &mut hlsl,
+                &naga::back::hlsl::Options::default(),
+                &naga::back::hlsl::PipelineOptions {
+                    entry_point: Some((stage, entry.to_owned())),
+                },
+            )
+            .write(&module, &info, None)
+            .unwrap_or_else(|e| panic!("{entry} HLSL: {e}"));
+            assert!(!hlsl.is_empty());
+
+            let (msl, _) = naga::back::msl::write_string(
+                &module,
+                &info,
+                &naga::back::msl::Options {
+                    fake_missing_bindings: true,
+                    ..Default::default()
+                },
+                &naga::back::msl::PipelineOptions {
+                    entry_point: Some((stage, entry.to_owned())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{entry} MSL: {e}"));
+            assert!(!msl.is_empty());
+        }
+    }
+
+    /// `GpuCulling::new_hiz` + `Cull`'s Hi-Z pyramid occludes a section behind a
+    /// reversed-Z wall while keeping sections in front of the wall or over sky.
+    #[test]
+    fn hiz_occlusion_culls_hidden_section_and_keeps_visible_sections() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(adapter) = crate::gfx::test_gpu::adapter() else {
+            return;
+        };
+        if !crate::gfx::test_gpu::supports_depth_load(&adapter) {
+            return;
+        }
+        let (device, queue) = crate::gfx::test_gpu::device(&adapter);
+        if !super::super::cull::compute_hiz_supported(&adapter, &device)
+            || device.limits().max_storage_buffers_per_shader_stage < 8
+        {
+            eprintln!("skipped: adapter lacks compute Hi-Z or 8 compute storage buffers");
+            return;
+        }
+        let mut cull = super::super::cull::Cull::try_new(
+            &device,
+            wgpu::TextureFormat::Rgba8Unorm,
+            super::super::cull::DepthTest::Compute,
+        )
+        .unwrap_or_else(|e| panic!("Cull::new(Compute) failed on qualifying adapter: {e}"));
+        let hiz_layout = cull
+            .hiz_read_layout()
+            .expect("Compute cull must expose hiz_read_layout");
+        let mut gpu = GpuCulling::new_hiz(&device, hiz_layout)
+            .expect("GpuCulling::new_hiz must succeed on qualifying adapter");
+        assert!(gpu.uses_hiz());
+
+        // Populate a 64x36 reversed-Z depth buffer: clear to 0.0 (sky) and write a
+        // solid occluder wall at depth 0.001 over the right half (ndc.x in [0, 1]).
+        const WALL_WGSL: &str = "
+@vertex fn vs(@builtin(vertex_index) v: u32) -> @builtin(position) vec4<f32> {
+    let x = select(0.0, 1.0, v == 1u || v == 2u || v == 5u);
+    let y = select(-1.0, 1.0, v == 2u || v == 4u || v == 5u);
+    return vec4<f32>(x, y, 0.001, 1.0);
+}
+";
+        let wall_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu hiz test wall"),
+            source: wgpu::ShaderSource::Wgsl(WALL_WGSL.into()),
+        });
+        let wall_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gpu hiz test wall"),
+            bind_group_layouts: &[],
+            ..Default::default()
+        });
+        let wall_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("gpu hiz test wall"),
+            layout: Some(&wall_pl),
+            vertex: wgpu::VertexState {
+                module: &wall_mod,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
+        let depth = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("gpu hiz test depth"),
+                size: wgpu::Extent3d {
+                    width: 64,
+                    height: 36,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+
+        let proj = Mat4::perspective_rh(70f32.to_radians(), 64.0 / 36.0, 256.0, 0.05);
+        let (frustum, _) = through(proj);
+        let section_box = rounded_box(None);
+        // Three sections all in frustum and neither near nor big:
+        // - (2, 0, -5): right half behind wall (max_z ~ 0.00060 < 0.001) -> occluded
+        // - (1, 0, -3): right half in front of wall (max_z ~ 0.00142 > 0.001) -> visible
+        // - (-3, 0, -5): left half over sky (0.0) -> visible
+        let occluded_id = gpu
+            .records
+            .insert(Record::new((2, 0, -5), 0, 0, 16, section_box));
+        let front_id = gpu
+            .records
+            .insert(Record::new((1, 0, -3), 0, 256, 16, section_box));
+        let sky_id = gpu
+            .records
+            .insert(Record::new((-3, 0, -5), 0, 512, 16, section_box));
+
+        let mut uploads = Uploads::new(&device);
+        let queue_wrap = Queue::new(queue, false);
+        cull.bind_depth(&device, &depth);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let input = FrameInputs {
+            camera: DVec3::new(0.0, 8.0, 0.0),
+            min_y: 0,
+            sections: 16,
+            radius: 8,
+            frustum: &frustum,
+            reach: None,
+            eye: None,
+            view_proj: proj,
+            occlude: true,
+        };
+        let prepared = gpu.prepare(
+            &device,
+            &queue_wrap,
+            &mut uploads,
+            &mut encoder,
+            &input,
+            None,
+        );
+        assert_eq!(prepared, Prepared::Gpu);
+        assert!(gpu.occluding());
+        gpu.dispatch(&mut encoder, None);
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gpu hiz wall"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&wall_pipe);
+            pass.draw(0..6, 0..1);
+        }
+        cull.build_hiz(&mut encoder, None);
+        let hiz_group = cull.hiz_read_group().expect("hiz read group");
+        gpu.test_hiz(&mut encoder, hiz_group, None);
+        gpu.compact(&mut encoder, None);
+        uploads.finish(&encoder);
+        queue_wrap.submit([encoder.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        let pages = u64::from(gpu.pass_pages);
+        let counts = read(
+            &device,
+            &queue_wrap,
+            &gpu.counts.buffer,
+            (STATS + 2 * pages) * 4,
+        );
+        let tested = counts[BOX as usize + 1];
+        let hidden = counts[HIDDEN];
+        let drawn2 = counts[10];
+        assert_eq!(tested, 3, "all 3 sections queued for Hi-Z test: {counts:?}");
+        assert_eq!(
+            hidden, 1,
+            "exactly 1 section occluded behind wall: {counts:?}"
+        );
+        assert_eq!(
+            drawn2, 2,
+            "2 visible sections emitted to phase 2: {counts:?}"
+        );
+        // Inspect the emitted phase-2 indirect draws so an inverted horizontal UV
+        // (which would hide sky and keep occluded while preserving counts) fails.
+        let total_slots = gpu
+            .pages
+            .iter()
+            .map(|&(_, first, size)| u64::from(first) + u64::from(size))
+            .max()
+            .unwrap_or(0);
+        assert!(total_slots > 0, "phase 2 must have active page draw slots");
+        let draws = read(&device, &queue_wrap, &gpu.draws.buffer, total_slots * 20);
+        let mut emitted = Vec::new();
+        for &(page, first, size) in &gpu.pages {
+            let count = counts[(STATS + pages + u64::from(page)) as usize];
+            assert!(
+                count <= size,
+                "page {page}: phase-2 draw count {count} exceeds region {size}"
+            );
+            let slice = &draws[first as usize * 5..][..count as usize * 5];
+            let (entries, rem) = slice.as_chunks::<5>();
+            assert!(rem.is_empty());
+            for d in entries {
+                assert_eq!([d[0], d[1], d[2]], [16 * 6, 1, 0], "phase-2 draw: {d:?}");
+                emitted.push((d[4], d[3]));
+            }
+        }
+        emitted.sort_unstable();
+        let mut expected = [(front_id, 256), (sky_id, 512)];
+        expected.sort_unstable();
+        assert_eq!(
+            emitted.as_slice(),
+            expected.as_slice(),
+            "phase 2 must draw front ({front_id}) and sky ({sky_id}) only, not occluded ({occluded_id})"
+        );
     }
 
     /// Ids, page counts, flags and changes against a plain list of what each id
@@ -1904,6 +2319,7 @@ mod tests {
     /// mark the whole table.
     #[test]
     fn records_keep_ids_page_counts_and_moves() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let mut records = Records::default();
         let a = records.insert(Record::new((0, 0, 0), 0, 0, 1, 7));
         let b = records.insert(Record::new((1, 0, 0), 0, 256, 2, 9));
@@ -2058,6 +2474,7 @@ mod tests {
     /// finite, are `UNBOUNDED`; no bounds are the cell.
     #[test]
     fn boxes_round_outward_and_meet_their_cell() {
+        let _gpu = crate::gfx::test_gpu::lock();
         // Each axis's low and high ends.
         let ends = |packed: u32| -> [[i32; 2]; 3] {
             std::array::from_fn(|axis| {
@@ -2095,6 +2512,7 @@ mod tests {
     /// constants both sides use.
     #[test]
     fn params_and_records_match_the_shader() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let module = naga::front::wgsl::parse_str(include_str!("gpu_culling.wgsl")).unwrap();
         let mut layouter = naga::proc::Layouter::default();
         layouter.update(module.to_ctx()).unwrap();
@@ -2174,6 +2592,7 @@ mod tests {
             ("STEP_BITS", u64::from(step.to_bits())),
             ("ROW", u64::from(ROW)),
             ("BLOCK", u64::from(WORKGROUP)),
+            ("BANDS", BANDS),
             ("STATS", STATS),
             ("UNBOUNDED", u64::from(UNBOUNDED)),
             ("REACH", u64::from(REACH)),
@@ -2184,14 +2603,19 @@ mod tests {
         ] {
             assert_eq!(constant(name), value, "{name}");
         }
-        // A section's draws fit below its page in its first `runs` word.
-        assert!(u64::from(RUNS) < 1 << constant("PAGE_SHIFT"));
+        // A section's draws and flags fit below its distance band, and its
+        // band fits below its page in its first `runs` word.
+        let band_shift = constant("BAND_SHIFT");
+        let page_shift = constant("PAGE_SHIFT");
+        assert!(u64::from(RUNS) < 1 << band_shift);
+        assert!(BANDS <= 1 << (page_shift - band_shift));
     }
 
     /// The shader's `near` is `in_view_distance`, on every column out to 140
     /// from the camera's at every render distance to 130.
     #[test]
     fn the_shaders_near_is_in_view_distance() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let (cam_x, cam_z) = (-37, 1_234_567);
         for r in 0..=130 {
             let params = Params {
@@ -2220,6 +2644,7 @@ mod tests {
     /// float's key passes a NaN threshold's, either way.
     #[test]
     fn order_keys_compare_as_their_floats() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let mut floats = Vec::new();
         for x in [
             0.0,
@@ -2265,6 +2690,7 @@ mod tests {
     /// which GPU culling never meets, is drawn whole.
     #[test]
     fn the_shaders_runs_are_facing_runs() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let mut rng = Rng(0xBB67_AE85_84CA_A73B);
         let mut meshes: Vec<Sides> = (0..2_000).map(|_| sorted_sides(&mut rng)).collect();
         let special = [
@@ -2364,6 +2790,7 @@ mod tests {
     /// exactly the quads of the buckets seen.
     #[test]
     fn a_section_has_at_most_four_runs() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let eye = [order_key(0.0); 3];
         let mut most = 0;
         // Each bucket empty (0), seen (1) or left out (2); the other never left out.
@@ -2402,6 +2829,7 @@ mod tests {
     /// infinity.
     #[test]
     fn planes_past_i32_take_the_cpu_path() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let mut rng = Rng(0x0F1E_2D3C_4B5A_6978);
         let mut words = Vec::new();
         for _ in 0..500 {
@@ -2452,6 +2880,7 @@ mod tests {
     /// origin, the difference facing compares.
     #[test]
     fn the_integer_test_keeps_what_the_walk_keeps() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let mut rng = Rng(0x5DEE_CE66_D1CE_4E5B);
         let mut words = Vec::new();
         let (mut listed, mut near_sections, mut rejected, mut inside) = (0, 0, 0, 0);
@@ -2605,6 +3034,7 @@ mod tests {
     /// somewhere: the margin is needed.
     #[test]
     fn the_margin_covers_production_rounding() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let mut rng = Rng(0x1405_7B7E_F767_814F);
         let min_y = crate::chunk::MIN_Y;
         let mut words = Vec::new();
@@ -2814,6 +3244,7 @@ mod tests {
     /// them to the CPU.
     #[test]
     fn the_gpu_draws_what_the_integer_test_keeps() {
+        let _gpu = crate::gfx::test_gpu::lock();
         on_each_device(draws_match);
     }
 
@@ -3097,6 +3528,17 @@ mod tests {
             let draws = read(device, queue, &gpu.draws.buffer, gpu.draws.bytes);
             let origins = read(device, queue, &gpu.origins.buffer, u64::from(gpu.ids) * 16);
             let mut got = Vec::new();
+            let band_of = |key: (i32, i32, i32)| -> u32 {
+                let dx = (key.0 - params.cam_x).abs();
+                let dz = (key.2 - params.cam_z).abs();
+                let d2 = (dx * dx + dz * dz) as u32;
+                match d2 {
+                    0..16 => 0,
+                    16..64 => 1,
+                    64..256 => 2,
+                    _ => 3,
+                }
+            };
             for &(page, first, size) in &gpu.pages {
                 let count = counts[(STATS + u64::from(page)) as usize];
                 assert!(
@@ -3105,13 +3547,15 @@ mod tests {
                 );
                 let mut last = None;
                 for d in draws[first as usize * 5..][..count as usize * 5].chunks(5) {
-                    // In id order and each section's in its runs' order, the
-                    // same every frame.
+                    // Front-to-back by distance band, then id order and each
+                    // section's runs' order.
+                    let key = held[&d[4]].0.0;
+                    let key_order = (band_of(key), d[4], d[3]);
                     assert!(
-                        last < Some((d[4], d[3])),
-                        "case {case}, page {page}: out of order"
+                        last < Some(key_order),
+                        "case {case}, page {page}: out of order ({last:?} vs {key_order:?})"
                     );
-                    last = Some((d[4], d[3]));
+                    last = Some(key_order);
                     assert_eq!([d[1], d[2]], [1, 0], "case {case}: one instance, index 0");
                     let instance = &origins[d[4] as usize * 4..][..4];
                     let instance: [u32; 4] = instance.try_into().unwrap();
@@ -3176,6 +3620,7 @@ mod tests {
     /// Detail times both phases and the uploads and leaves counts and draws as an untimed frame's.
     #[test]
     fn detail_times_both_phases_and_leaves_the_draws_alone() {
+        let _gpu = crate::gfx::test_gpu::lock();
         on_each_device(|device, queue| {
             let mut rng = Rng(0x1F83_D9AB_FB41_BD6B);
             let (frustum, _) = view(&mut rng);
@@ -3288,6 +3733,7 @@ mod tests {
     /// or unmapped again (as `timing::GpuTimer`'s), so the statistics stop.
     #[test]
     fn the_statistics_come_back_with_their_frame() {
+        let _gpu = crate::gfx::test_gpu::lock();
         use super::super::submit::{AfterSubmit, Job};
         on_each_device(|device, queue| {
             for threaded in [false, true] {
@@ -3359,6 +3805,7 @@ mod tests {
     /// pixel clear.
     #[test]
     fn the_count_draws_draw_each_kept_section_with_its_origin() {
+        let _gpu = crate::gfx::test_gpu::lock();
         on_each_device(draws_land);
     }
 
@@ -3481,7 +3928,7 @@ struct Quad {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let indices = super::super::Renderer::quad_indices(device, 4);
+        let indices = super::super::Renderer::quad_indices(device, 4).expect("quad indices");
         let mut uploads = Uploads::new(device);
         // The first frame's planes reject nothing: it keeps every section within
         // the distance, and draws all their quads. The second, from another
@@ -3564,7 +4011,7 @@ struct Quad {
             });
             pass.set_pipeline(&pipeline);
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            gpu.draw(&mut pass, &arena, |_| None, 0);
+            gpu.draw(&mut pass, &arena, |_| None, 0, None);
             drop(pass);
             encoder.copy_texture_to_buffer(
                 target.as_image_copy(),

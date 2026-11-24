@@ -14,8 +14,8 @@ use super::{
     spawner::{self, SpawnData, SpawnDataExt, SpawnerLevel, SpawnerSpawn},
 };
 pub use crate::chunk::block_entity::{ConfigSlot, TrialConfig, TrialSpawner};
+use horizon_core::nbt::{Compound, JavaString, Tag};
 use horizon_core::{position::BlockPos, random::RandomSource};
-use horizon_world::nbt::{Compound, JavaString, Tag};
 use std::{collections::HashMap, path::Path, sync::OnceLock};
 
 /// An entity's UUID as its four ints (`UUIDUtil.CODEC`).
@@ -215,6 +215,14 @@ pub fn load_registry(root: &Path) {
 /// A config of the registry by id.
 pub fn registry_config(id: &str) -> Option<TrialConfig> {
     REGISTRY.get()?.get(id).cloned()
+}
+/// The accepted, decoded trial-spawner registry identities, without cloning configurations.
+pub fn registry_contains(id: &str) -> Option<bool> {
+    Some(REGISTRY.get()?.contains_key(id))
+}
+/// The identities of the same immutable registry gameplay reads.
+pub fn registry_ids() -> Option<Vec<&'static str>> {
+    Some(REGISTRY.get()?.keys().map(String::as_str).collect())
 }
 
 fn float(t: &Tag) -> Option<f32> {
@@ -516,19 +524,25 @@ impl TrialSpawnerExt for TrialSpawner {
             ..Self::default()
         };
         // FullConfig.MAP_CODEC, partial result kept: a field that fails to
-        // decode takes its default.
+        // decode takes its default, and an inline config equal to
+        // `TrialSpawnerConfig.DEFAULT` is omitted on save (`optionalFieldOf`).
         let slot = |k: &str| -> ConfigSlot {
-            let config = match tag.get(k) {
-                Some(Tag::String(id)) => {
-                    spawner::normalize_id(&id.to_string_lossy()).and_then(|id| registry(&id))
-                }
-                Some(t) => TrialConfig::decode(t),
-                None => None,
-            };
-            config.map_or_else(ConfigSlot::default, |config| ConfigSlot {
-                saved: tag.get(k).cloned(),
-                config,
-            })
+            match tag.get(k) {
+                Some(Tag::String(id)) => spawner::normalize_id(&id.to_string_lossy())
+                    .and_then(|id| {
+                        let config = registry(&id)?;
+                        Some(ConfigSlot {
+                            saved: Some(Tag::String(id.as_str().into())),
+                            config,
+                        })
+                    })
+                    .unwrap_or_default(),
+                Some(t) => TrialConfig::decode(t).map_or_else(ConfigSlot::default, |config| {
+                    let saved = (config != TrialConfig::default()).then(|| config.encode());
+                    ConfigSlot { saved, config }
+                }),
+                None => ConfigSlot::default(),
+            }
         };
         let int = |k: &str, default: i32, lo: i32, hi: i32| {
             spawner::number(tag.get(k))
@@ -1069,15 +1083,7 @@ impl TrialSpawnerExt for TrialSpawner {
             return None;
         }
         let block = at.map(|v| v.floor() as i32);
-        if !spawn_rules::check_spawn_rules(
-            species,
-            l,
-            Reason::TrialSpawner,
-            random,
-            block[0],
-            block[1],
-            block[2],
-        ) {
+        if !spawn_rules::check_spawn_rules(&id, species, l, Reason::TrialSpawner, random, block) {
             return None;
         }
         if let Some(rules) = data.custom_spawn_rules
@@ -1096,15 +1102,21 @@ impl TrialSpawnerExt for TrialSpawner {
             width * scale,
             height * scale,
         );
-        if !spawn_selection::spawn_obstruction(
-            species,
-            l,
-            bounds,
-            Some(&[]),
-            own[0],
-            own[1],
-            own[2],
-        ) {
+        let pending = spawn_selection::Pending {
+            yaw,
+            fresh: data.unconfigured(),
+        };
+        if !spawn_selection::position_ok(l, &id, Reason::TrialSpawner, placed, pending, || {
+            spawn_selection::spawn_obstruction(
+                species,
+                l,
+                bounds,
+                Some(&[]),
+                own[0],
+                own[1],
+                own[2],
+            )
+        }) {
             return None;
         }
         let request = SpawnerSpawn {
@@ -1160,7 +1172,7 @@ mod tests {
     use super::*;
 
     fn tag(snbt: &str) -> Tag {
-        horizon_world::nbt::parse_snbt(snbt).expect("snbt").0
+        horizon_core::nbt::parse_snbt(snbt).expect("snbt").0
     }
 
     #[test]
@@ -1239,6 +1251,26 @@ mod tests {
         assert_eq!(c.spawn_range, 4);
         assert_eq!(c.total_mobs, 3.0);
         assert_eq!(c.spawn_potentials.len(), 1);
+    }
+
+    #[test]
+    fn inline_config_omits_default_and_normalizes_non_default() {
+        let default_inline = TrialSpawner::load_with(
+            &tag(r#"{normal_config:{spawn_range:4,total_mobs:6.0f}}"#),
+            &|_| None,
+        );
+        assert_eq!(default_inline.normal, ConfigSlot::default());
+        assert!(default_inline.save().is_empty());
+
+        let custom_inline = TrialSpawner::load_with(
+            &tag(r#"{normal_config:{spawn_range:5,total_mobs:6.0f}}"#),
+            &|_| None,
+        );
+        assert_eq!(custom_inline.normal.config.spawn_range, 5);
+        assert_eq!(
+            custom_inline.save(),
+            vec![("normal_config", tag(r#"{spawn_range:5}"#))]
+        );
     }
 
     #[test]

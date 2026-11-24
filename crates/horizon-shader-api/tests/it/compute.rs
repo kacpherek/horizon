@@ -246,7 +246,7 @@ fn the_design_s_example_reads_as_declared() {
     assert_eq!(m.post[0].dispatch, Some(Dispatch::Pixels));
     assert_eq!(k.resets, [("bounces".to_owned(), Keep::World)]);
     assert!(m.computes());
-    // The kept output is no post target of its own: the two R-relative textures take all four.
+    // The kept output is no post target of its own.
     assert!(m.post_targets().is_empty());
     assert!(m.files().contains(&"cache_update.wgsl"));
     assert!(!parse("").unwrap().computes());
@@ -534,6 +534,18 @@ fn a_compute_file_keeps_the_api_s_rules() {
     );
 }
 
+/// `storageBarrier()` is WGSL's, as `workgroupBarrier()` is: the check takes it in a compute
+/// pass, reached by every invocation, between a write to a kept buffer and a read of it.
+#[test]
+fn a_compute_pass_may_order_its_buffer_writes_with_a_storage_barrier() {
+    let ordered = "override bounces: i32 = 1;\nfn compute(input: ComputeInput) {\n    \
+                   if input.in_bounds {\n        cache[input.cell.x] = vec4<u32>(1u);\n    }\n    \
+                   storageBarrier();\n    \
+                   if input.in_bounds && input.local == 0u {\n        \
+                   cache[input.cell.x] = cache[input.cell.x] + vec4<u32>(1u);\n    }\n}\n";
+    check(&example_with("cache_update.wgsl", ordered)).unwrap();
+}
+
 #[test]
 fn pass_counts_are_bounded() {
     let before = |i: usize| {
@@ -624,7 +636,7 @@ fn a_compute_entry_is_a_dispatch_in_the_chain() {
     );
     for key in [
         "compute = true",
-        "reads = [\"tex\"]",
+        "writes = [\"buf\"]",
         "dispatch = \"pixels\"",
     ] {
         refused(
@@ -739,15 +751,21 @@ fn compute_work_is_capped_per_dispatch_and_per_frame() {
     );
 }
 
-/// An `rgba32uint` kept texture: written by a compute pass as storage, read as
-/// `texture_2d<u32>` with `textureLoad`, `_previous` too.
+/// An integer kept texture, `rgba32uint` or `r32uint`: written by a compute pass as storage,
+/// read as `texture_2d<u32>` with `textureLoad`, `_previous` too.
 #[test]
-fn an_rgba32uint_texture_is_written_by_compute_and_loaded_as_u32() {
+fn an_integer_texture_is_written_by_compute_and_loaded_as_u32() {
+    for format in ["rgba32uint", "r32uint"] {
+        integer_texture(format);
+    }
+}
+
+fn integer_texture(format: &str) {
     let manifest = format!(
         "{}[[post]]\nfile = \"c.wgsl\"\ncompute = true\ndispatch = [4, 4, 1]\n\
          workgroup = [4, 4, 1]\nwrites = [\"ints\"]\n\
          [[post]]\nfile = \"last.wgsl\"\nreads = [\"ints\", \"ints_previous\"]\n",
-        resource("ints", "format = \"rgba32uint\"\nsize = [4, 4]")
+        resource("ints", &format!("format = \"{format}\"\nsize = [4, 4]"))
     );
     let write = "fn compute(input: ComputeInput) {\n    \
                  if input.in_bounds { textureStore(ints, input.cell.xy, vec4<u32>(input.cell.x)); }\n}\n";
@@ -761,8 +779,8 @@ fn an_rgba32uint_texture_is_written_by_compute_and_loaded_as_u32() {
         let c = compose(&p, kind, file);
         c.text[c.parts[0].1.clone()].to_owned()
     };
-    let written = "@group(3) @binding(64) var ints: texture_storage_2d<rgba32uint, write>;";
-    assert!(prelude(StageKind::Compute, "c.wgsl").contains(written));
+    let written = format!("@group(3) @binding(64) var ints: texture_storage_2d<{format}, write>;");
+    assert!(prelude(StageKind::Compute, "c.wgsl").contains(&written));
     let last = prelude(StageKind::Post, "last.wgsl");
     assert!(last.contains("@group(3) @binding(64) var ints: texture_2d<u32>;"));
     assert!(last.contains("@group(3) @binding(65) var ints_previous: texture_2d<u32>;"));
@@ -799,4 +817,108 @@ fn before_world_work_shares_the_frame_cap() {
         &format!("{before}{post}"),
         "the compute passes run 67108928 invocations a frame",
     );
+}
+
+/// Under `[ray_tracing]`, a `[[before_world]]` pass that traces the sun and a compute `[[post]]`
+/// pass that reads a hit's maps.
+const TRACING: &str = "[ray_tracing]\n[[resource]]\nname = \"hits\"\nbuffer = 64\nelement = \"f32\"\n\
+                       keep = \"view\"\n[[before_world]]\nfile = \"w.wgsl\"\ndispatch = [16, 1, 1]\n\
+                       workgroup = [16, 1, 1]\nwrites = [\"hits\"]\n[[post]]\nfile = \"c.wgsl\"\n\
+                       compute = true\ndispatch = \"pixels\"\nworkgroup = [8, 8, 1]\nreads = [\"hits\"]\n";
+const TRACES_BEFORE_WORLD: &str = "\
+fn compute(input: ComputeInput) {
+    if input.in_bounds {
+        let hit = trace_layers(vec3<f32>(0.0), frame.sun_direction, frame.ray_distance, RAY_SOLID);
+        hits[input.cell.x] = hit.distance + f32(trace_any(vec3<f32>(0.0), vec3<f32>(0.0, -1.0, 0.0), 4.0));
+    }
+}
+";
+const TRACES_POST: &str = "\
+fn compute(input: ComputeInput) {
+    let hit = trace(vec3<f32>(0.0), vec3<f32>(0.0, -1.0, 0.0), hits[0]);
+    let maps = hit_normal_map(hit) * hit_specular_map(hit) * f32(block_pbr_maps());
+    _ = maps + vec4<f32>(f32(trace_any_layers(hit.position, hit.normal, 8.0, RAY_TRANSLUCENT)));
+}
+";
+const PLAIN: &str = "fn compute(input: ComputeInput) {}\n";
+const PICTURE: &str = "fn post(input: PostInput) -> vec4<f32> { return input.color; }\n";
+
+/// A compute or `[[before_world]]` file that calls a trace function gets them under
+/// `[ray_tracing]`, and the check builds it a second time against the scene, which needs ray
+/// queries; one that calls none is built once, as without the scene.
+#[test]
+fn compute_files_that_trace_are_built_against_the_scene() {
+    for (before_world, post, traced) in [
+        (TRACES_BEFORE_WORLD, TRACES_POST, true),
+        (PLAIN, PLAIN, false),
+    ] {
+        let files = [
+            ("w.wgsl", before_world),
+            ("c.wgsl", post),
+            ("last.wgsl", PICTURE),
+        ];
+        let pack = pack(&format!("{TRACING}{LAST}"), &files);
+        let report = check(&pack).unwrap();
+        for kind in [StageKind::BeforeWorld, StageKind::Compute] {
+            let stage = report.stages.iter().find(|s| s.kind == kind).unwrap();
+            assert_eq!(stage.scene.is_some(), traced, "{kind:?}");
+            let file = if kind == StageKind::Compute {
+                "c.wgsl"
+            } else {
+                "w.wgsl"
+            };
+            let (stub, scene) = (
+                compose(&pack, kind, file).text,
+                horizon_shader_api::compose_scene(&pack, kind, file).text,
+            );
+            assert!(!stub.contains("ray_query"), "{kind:?}");
+            assert_eq!(scene.contains("ray_query"), traced, "{kind:?}");
+            assert_eq!(stub.contains("fn trace("), traced, "{kind:?}");
+        }
+    }
+}
+
+/// With `[ray_tracing] lights = true`, a `[[before_world]]` pass and a compute `[[post]]` pass
+/// that name the light functions, and no trace function, are built against the scene with the
+/// light sources (binding 80); the pass of the same pack that names none is built without them.
+#[test]
+fn compute_files_that_name_the_light_sources_get_them() {
+    let counts = "fn compute(input: ComputeInput) {\n    \
+                  if input.in_bounds { hits[input.cell.x] = f32(ray_light_count()); }\n}\n";
+    let near = "fn compute(input: ComputeInput) {\n    \
+                let n = ray_lights_near(vec3<f32>(hits[0]));\n    \
+                let l: RayLight = ray_light(ray_light_at(n.x));\n    \
+                _ = l.position * l.level + l.color * f32(l.material + n.y);\n}\n";
+    let manifest = TRACING.replace("[ray_tracing]\n", "[ray_tracing]\nlights = true\n");
+    let files = [("w.wgsl", counts), ("c.wgsl", near), ("last.wgsl", PICTURE)];
+    let report = check(&pack(&format!("{manifest}{LAST}"), &files)).unwrap();
+    for (kind, lights) in [
+        (StageKind::BeforeWorld, true),
+        (StageKind::Compute, true),
+        (StageKind::Post, false),
+    ] {
+        let stage = report.stages.iter().find(|s| s.kind == kind).unwrap();
+        assert_eq!(stage.traces_lights(), lights, "{kind:?}");
+    }
+}
+
+/// `[ray_tracing]` with only a `[[before_world]]` pass to trace from (and a sky to draw) is a
+/// pack that traces.
+#[test]
+fn a_before_world_pass_is_enough_for_ray_tracing() {
+    let tracing = TRACING.split("[[post]]").next().unwrap();
+    let manifest = format!(
+        "{tracing}[sky]
+file = \"s.wgsl\"
+"
+    );
+    let sky = "fn sky(input: SkyInput) -> vec4<f32> { return input.color; }
+";
+    let files = [("w.wgsl", TRACES_BEFORE_WORLD), ("s.wgsl", sky)];
+    let report = check(&pack(&manifest, &files)).unwrap();
+    let stage = report
+        .stages
+        .iter()
+        .find(|s| s.kind == StageKind::BeforeWorld);
+    assert!(stage.unwrap().scene.is_some());
 }

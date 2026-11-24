@@ -3,6 +3,7 @@ use crate::gfx::hud_coverage;
 
 #[test]
 fn standalone_picture_draw_order_and_screen_exit_release() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(mut gpu) = Gpu::new() else { return };
     let image = Arc::new(pictures::Picture {
         id: u64::MAX,
@@ -12,7 +13,7 @@ fn standalone_picture_draw_order_and_screen_exit_release() {
         flags: TextureFlags::default(),
     });
     let weak = Arc::downgrade(&image);
-    let mut batch = HudBatch::new([4, 2]);
+    let mut batch = HudBatch::scratch([4, 2]);
     batch.pictures.push(image.clone());
     let rect = Rect {
         u0: 0.0,
@@ -56,7 +57,7 @@ fn standalone_picture_draw_order_and_screen_exit_release() {
         &gpu.device,
         &mut uploads,
         &mut encoder,
-        &HudBatch::new([4, 2]),
+        &HudBatch::scratch([4, 2]),
     );
     assert!(gpu.hud.pictures.is_empty());
     assert!(
@@ -246,6 +247,7 @@ fn quad(batch: &mut HudBatch, blend: Blend, color: u32, x: f32, uv: f32) {
 
 #[test]
 fn coverage_follows_hud_blends_discard_scissor_and_depth_without_changing_colour() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = Gpu::new() else {
         return;
     };
@@ -256,7 +258,13 @@ fn coverage_follows_hud_blends_discard_scissor_and_depth_without_changing_colour
         (Blend::EndPortal, rgba(255, 255, 255, 255), 0.0, 1, 255),
         (Blend::Vignette, rgba(102, 102, 102, 255), 0.0, 1, 102),
     ] {
-        let mut batch = HudBatch::new([4, 2]);
+        let mut batch = HudBatch::new(
+            [4, 2],
+            crate::hud::GuiScale {
+                requested: 1,
+                unicode: false,
+            },
+        );
         for _ in 0..count {
             quad(&mut batch, blend, color, 0.0, 0.25);
         }
@@ -275,7 +283,13 @@ fn coverage_follows_hud_blends_discard_scissor_and_depth_without_changing_colour
             ],
         );
     }
-    let mut batch = HudBatch::new([4, 2]);
+    let mut batch = HudBatch::new(
+        [4, 2],
+        crate::hud::GuiScale {
+            requested: 1,
+            unicode: false,
+        },
+    );
     for depth in [0.25, 0.75] {
         quad(
             &mut batch,
@@ -297,10 +311,11 @@ fn coverage_follows_hud_blends_discard_scissor_and_depth_without_changing_colour
 /// next blends over it: a text highlight added over a light backdrop, then a 50% black panel.
 #[test]
 fn each_hud_draw_clips_at_white_as_on_an_8_bit_frame() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = Gpu::new() else {
         return;
     };
-    let mut batch = HudBatch::new([4, 2]);
+    let mut batch = HudBatch::scratch([4, 2]);
     quad(
         &mut batch,
         Blend::Additive,
@@ -335,6 +350,7 @@ fn each_hud_draw_clips_at_white_as_on_an_8_bit_frame() {
 
 #[test]
 fn coverage_preserves_each_cit_blend_and_its_destination_alpha() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(mut gpu) = Gpu::new() else {
         return;
     };
@@ -368,7 +384,13 @@ fn coverage_preserves_each_cit_blend_and_its_destination_alpha() {
         };
         gpu.hud
             .set_cit_glints(&gpu.device, &gpu.queue, Some(&textures));
-        let mut batch = HudBatch::new([4, 2]);
+        let mut batch = HudBatch::new(
+            [4, 2],
+            crate::hud::GuiScale {
+                requested: 1,
+                unicode: false,
+            },
+        );
         quad(
             &mut batch,
             Blend::CitGlint(0),
@@ -389,6 +411,7 @@ fn coverage_preserves_each_cit_blend_and_its_destination_alpha() {
 
 #[test]
 fn coverage_uses_pack_texts_final_alpha_and_discard() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(mut gpu) = Gpu::new() else {
         return;
     };
@@ -400,7 +423,13 @@ fn coverage_uses_pack_texts_final_alpha_and_discard() {
     };
     gpu.hud.set_text_shader(&gpu.device, Some(&program));
     assert!(gpu.hud.pack_text.is_some());
-    let mut batch = HudBatch::new([4, 2]);
+    let mut batch = HudBatch::new(
+        [4, 2],
+        crate::hud::GuiScale {
+            requested: 1,
+            unicode: false,
+        },
+    );
     for x in [0.0, 2.0, 0.0, 2.0] {
         quad(&mut batch, Blend::Alpha, rgba(255, 255, 255, 255), x, 0.25);
     }
@@ -412,6 +441,7 @@ fn coverage_uses_pack_texts_final_alpha_and_discard() {
 
 #[test]
 fn a_pack_text_shader_without_a_colour_output_is_dropped_not_wrapped() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(mut gpu) = Gpu::new() else {
         return;
     };
@@ -422,4 +452,61 @@ fn a_pack_text_shader_without_a_colour_output_is_dropped_not_wrapped() {
     };
     gpu.hud.set_text_shader(&gpu.device, Some(&program));
     assert!(gpu.hud.pack_text.is_none());
+}
+
+/// A pack's `position_tex_color` draws a `PackBlit` with its picture as `Sampler0`, in place of
+/// the native tiles before it (where it discards, nothing shows); without the shader the tiles
+/// draw and the quad doesn't.
+#[test]
+fn a_pack_blit_replaces_its_native_tiles_only_with_the_packs_shader() {
+    let _gpu = crate::gfx::test_gpu::lock();
+    let Some(mut gpu) = Gpu::new() else { return };
+    let image = Arc::new(pictures::Picture {
+        id: u64::MAX - 1,
+        width: 1,
+        height: 1,
+        pixels: vec![255, 0, 0, 255],
+        flags: TextureFlags::default(),
+    });
+    let mut batch = HudBatch::scratch([4, 2]);
+    batch.pictures.push(image.clone());
+    let rect = Rect {
+        u0: 0.0,
+        v0: 0.0,
+        u1: 0.5,
+        v1: 1.0,
+        w: 1,
+        h: 1,
+    };
+    batch.rect_uv(0.0, 0.0, 4.0, 2.0, rect, rgba(0, 255, 0, 255));
+    batch.blend_since(0, Blend::PackBlitNative(image.id));
+    let start = batch.vertices.len();
+    batch.rect_uv(0.0, 0.0, 4.0, 2.0, rect, u32::MAX);
+    batch.blend_since(start, Blend::PackBlit(image.id));
+    let draw = |gpu: &mut Gpu| {
+        let mut uploads = crate::gfx::upload::Uploads::new(&gpu.device);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        gpu.hud
+            .prepare_pictures(&gpu.device, &mut uploads, &mut encoder, &batch);
+        uploads.finish(&encoder);
+        gpu.queue.submit([encoder.finish()]);
+        gpu.draw(&batch, 0.0, 0.0, true).0
+    };
+    assert!(
+        draw(&mut gpu)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [0, 255, 0, 255])
+    );
+    let program = crate::core_shader::CoreProgram {
+        vertex: naga::front::wgsl::parse_str("@vertex fn main(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4(p.x / 2.0 - 1.0, 1.0 - p.y, 0.0, 1.0); }").unwrap(),
+        fragment: naga::front::wgsl::parse_str("@group(0) @binding(4) var t: texture_2d<f32>; @group(0) @binding(5) var s: sampler; @fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> { if p.x > 2.0 { discard; } return textureSample(t, s, vec2(0.5)); }").unwrap(),
+        other: Vec::new(),
+    };
+    gpu.hud.set_blit_shader(&gpu.device, Some(&program));
+    for row in draw(&mut gpu).as_chunks::<16>().0 {
+        assert_eq!(&row[..8], &[255, 0, 0, 255, 255, 0, 0, 255]);
+        assert_eq!(&row[8..], &[0; 8]);
+    }
 }

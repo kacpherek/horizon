@@ -1,6 +1,6 @@
 //! Where a block's textures are in the block sprite arrays, side by side, for drawing the block
 //! somewhere the mesher does not: a native mod's own pass drawing blocks as voxels
-//! (`native_block_sprites`, `WorldDrawn::block_sprites`; docs/native-mods.md). The answer is the
+//! (`block_sprites`, `WorldDrawn::block_sprites`; docs/modding/src/how-to/native-mods.md). The answer is the
 //! model's own faces, as the mesher bakes them: each face's sprite (its array and layer), where on
 //! the block's side it lies and how its texture runs across it, and its tint source.
 //!
@@ -10,50 +10,7 @@ use crate::{mesher::TintSource, models::catalog::BakedFace, streaming::WorkerCon
 use horizon_assets::model::Direction;
 use horizon_core::position::BlockPos;
 use horizon_world::registry::{BlockRegistry, BlockStateId};
-
-/// A sprite: its array (0 for every vanilla texture on most GPUs; past the first array's layers in
-/// 1 to 7) and its layer in that array.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SpriteRef {
-    pub array: u32,
-    pub layer: u32,
-    /// It animates (water, lava, fire, sea lanterns...): the arrays always hold the frame being shown.
-    pub animated: bool,
-    /// Some of its pixels are clear (alpha 0): leaves, glass, flowers. Draw those as holes.
-    pub cutout: bool,
-}
-
-/// One face of a block's model on one of its sides.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FaceSprite {
-    pub sprite: SpriteRef,
-    /// Where the face lies on the side, in the side's two axes ([`side_axes`]), from 0 to 1 across the block:
-    /// `[a0, b0, a1, b1]`. `[0, 0, 1, 1]` for a whole face.
-    pub rect: [f32; 4],
-    /// How deep into the block the face lies from the side's own plane (0 for a cube's face, 0.5 for a slab's top).
-    pub inset: f32,
-    /// The texture across the side: the point (a, b) on it shows `uv = [u0, v0] + a * [du_u, du_v] + b * [dv_u,
-    /// dv_v]` of the sprite, `[u0, v0, du_u, du_v, dv_u, dv_v]`. Rotations and mirrors (a log on its side, a
-    /// model's `rotation` and `uvlock`) are in it.
-    pub uv: [f32; 6],
-    /// Its colour source, none for an untinted face: multiply the texture by the source's colour.
-    pub tint: Option<TintSource>,
-    /// It has partly clear pixels: drawn sorted and blended.
-    pub translucent: bool,
-}
-
-/// What a block draws on each side, in [`Direction::ALL`]'s order (down, up, north, south, west, east).
-#[derive(Clone, Debug, PartialEq)]
-pub struct BlockSprites {
-    /// The faces on each side, in the model's order: the one drawn first first (a grass block's side: its dirt
-    /// and grass, then the grass overlay tinted over it). A side with none is empty. Faces that do not lie flat
-    /// on a side (a flower's crossed planes, a rotated element) are left out.
-    pub sides: [Vec<FaceSprite>; 6],
-    /// The model's particle sprite (what breaking it scatters, a flower's whole picture), if it has one.
-    pub particle: Option<SpriteRef>,
-    /// The model is a plain cube: one whole face on each side, at its plane.
-    pub cube: bool,
-}
+pub use mod_api::block::block_sprites::{BlockSprites, FaceSprite, SpriteRef};
 
 /// The two axes a side's `rect` and `uv` count along, as indices into (x, y, z): down and up across x then z; north
 /// and south across x then y; west and east across z then y. (The block's corner at 0, 0, 0 is 0 on each.)
@@ -99,17 +56,48 @@ pub fn parse_state(registry: &BlockRegistry, text: &str) -> Option<BlockStateId>
     registry.resolve(&state).ok()
 }
 
-/// The sprites `context`'s resources hold, `split` layers to an array (`Renderer::sprite_split`).
+/// What a fluid block (`minecraft:water`, a bubble column, lava) shows on every side instead of a model:
+/// its still texture, its tint source (water's is the biome's, `MeshTables::water_tint`, at tint index 0)
+/// and whether it is translucent. None for any other block.
+pub fn fluid_faces(block: &str) -> Option<(&'static str, Option<TintSource>, bool)> {
+    match block {
+        "minecraft:water" | "minecraft:bubble_column" => {
+            Some(("block/water_still", Some(TintSource::Water), true))
+        }
+        "minecraft:lava" => Some(("block/lava_still", None, false)),
+        _ => None,
+    }
+}
+
+/// Each sprite layer's texture name, as `native_draw_cube` and `native_draw_quad` take it: vanilla's
+/// without its namespace (`block/stone`), a mod's with it (`mymod:block/gear`).
+pub fn texture_names(
+    sprite_layers: &std::collections::BTreeMap<String, u32>,
+) -> std::collections::HashMap<u32, String> {
+    sprite_layers
+        .iter()
+        .map(|(name, layer)| (*layer, name.trim_start_matches("minecraft:").to_owned()))
+        .collect()
+}
+
+/// The sprites `context`'s resources hold, `split` layers to an array (`Renderer::sprite_split`), and
+/// their names (`texture_names`).
 pub struct Lookup<'a> {
     context: &'a WorkerContext,
     split: u32,
+    names: &'a std::collections::HashMap<u32, String>,
 }
 
 impl<'a> Lookup<'a> {
-    pub fn new(context: &'a WorkerContext, split: u32) -> Self {
+    pub fn new(
+        context: &'a WorkerContext,
+        split: u32,
+        names: &'a std::collections::HashMap<u32, String>,
+    ) -> Self {
         Self {
             context,
             split: split.max(1),
+            names,
         }
     }
     /// The sprite at `layer` of all the layers.
@@ -136,6 +124,21 @@ impl<'a> Lookup<'a> {
         Some(self.sprite(*layer))
     }
 
+    /// Each sprite's pixels as the resources loaded them ([`sprite_pixels`]). The store is uncompressed once for
+    /// the whole call, not per sprite.
+    pub fn pixels(&self, sprites: &[SpriteRef]) -> Vec<Option<Vec<u8>>> {
+        if sprites.is_empty() {
+            return Vec::new();
+        }
+        let render = &self.context.render;
+        sprite_pixels(
+            &render.pixels.get(),
+            render.sprite_size,
+            self.split,
+            sprites,
+        )
+    }
+
     /// What block `name` (`minecraft:oak_log[axis=x]`; properties left out take the default) draws on each side;
     /// none for a block the game does not know.
     pub fn block(&self, name: &str) -> Option<BlockSprites> {
@@ -155,19 +158,15 @@ impl<'a> Lookup<'a> {
             .registry
             .state(state)
             .map_or("", |s| s.name.as_str());
-        let fluid = match block {
-            "minecraft:water" | "minecraft:bubble_column" => {
-                Some(("block/water_still", Some(TintSource::Water), true))
-            }
-            "minecraft:lava" => Some(("block/lava_still", None, false)),
-            _ => None,
-        };
+        let fluid = fluid_faces(block);
         if let Some((texture, tint, translucent)) = fluid {
             let sprite = self.texture(texture);
             if let Some(sprite) = sprite {
                 for side in &mut sides {
                     side.push(FaceSprite {
                         sprite,
+                        texture: texture.to_owned(),
+                        tint_index: if tint.is_some() { 0 } else { -1 },
                         rect: [0.0, 0.0, 1.0, 1.0],
                         inset: 0.0,
                         uv: [0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
@@ -242,6 +241,8 @@ impl<'a> Lookup<'a> {
             side,
             FaceSprite {
                 sprite: self.sprite(face.layer),
+                texture: self.names.get(&face.layer).cloned().unwrap_or_default(),
+                tint_index: q.tint_index,
                 rect: [a0, b0, a1, b1].map(snap),
                 inset: snap((depth - plane).abs()),
                 uv: uv.map(snap),
@@ -282,9 +283,58 @@ fn affine(ab: &[[f32; 2]; 4], uv: &[[f32; 2]; 4]) -> Option<[f32; 6]> {
     None
 }
 
+/// Each sprite's RGBA8, rows top to bottom, `size` × `size` (every layer of the arrays has the same edge), from
+/// `pixels`: the block sprites' layers as `RenderAssets::pixels` holds them, one after another, `split` layers to an
+/// array (`Renderer::sprite_split`). An animated sprite's is the frame it starts on. None for a sprite past the
+/// layers `pixels` holds, all of them when it holds none (a server loads no pixels).
+pub fn sprite_pixels(
+    pixels: &[u8],
+    size: u32,
+    split: u32,
+    sprites: &[SpriteRef],
+) -> Vec<Option<Vec<u8>>> {
+    let bytes = size as usize * size as usize * 4;
+    sprites
+        .iter()
+        .map(|sprite| {
+            let layer = sprite
+                .array
+                .checked_mul(split.max(1))?
+                .checked_add(sprite.layer)?;
+            let start = (layer as usize).checked_mul(bytes)?;
+            (bytes > 0)
+                .then(|| pixels.get(start..start.checked_add(bytes)?))
+                .flatten()
+                .map(<[u8]>::to_vec)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sprites_pixels_are_its_own_layer_of_its_array() {
+        // Five 2x2 layers, two to an array: each pixel holds its layer's number.
+        let pixels: Vec<u8> = (0..5u8).flat_map(|layer| [layer; 16]).collect();
+        let at = |array, layer| SpriteRef {
+            array,
+            layer,
+            animated: false,
+            cutout: false,
+        };
+        let got = sprite_pixels(&pixels, 2, 2, &[at(0, 1), at(2, 0), at(1, 1), at(2, 1)]);
+        assert_eq!(got[0], Some(vec![1; 16]));
+        assert_eq!(got[1], Some(vec![4; 16]), "array 2 starts at layer 4");
+        assert_eq!(got[2], Some(vec![3; 16]));
+        assert_eq!(got[3], None, "past the last layer");
+        // No renderer: one array holds every layer, and an array past it is none rather than an overflow.
+        let single = sprite_pixels(&pixels, 2, u32::MAX, &[at(0, 3), at(1, 0)]);
+        assert_eq!(single, [Some(vec![3; 16]), None]);
+        // A server's store holds no pixels.
+        assert_eq!(sprite_pixels(&[], 16, 2, &[at(0, 0)]), [None]);
+    }
 
     #[test]
     fn a_faces_texture_runs_across_its_side() {
@@ -308,7 +358,7 @@ mod tests {
     /// The game's own blocks from real prepared resources: a cube, a grass block's tinted top and overlaid sides, a
     /// log on its side (its texture turned), leaves (cut out, foliage), water, a slab and a flower.
     #[test]
-    #[ignore = "requires prepared models/textures in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn real_blocks_name_their_sprites() -> crate::Result<()> {
         use crate::{
             assets::Assets, biome::Biomes, blocks::BlockFacts, light::LightTables,
@@ -319,32 +369,42 @@ mod tests {
             std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES"),
         );
         let assets = Arc::new(Assets::load(&root)?);
-        let render = Arc::new(assets.reload(&root)?);
+        let render = Arc::new(assets.reload(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        )?);
         let facts = BlockFacts::load(&root, assets.registry)?;
         let tables = Arc::new(MeshTables::new(
             &assets,
             &render,
             &facts,
             crate::models::load_visibility(&root, assets.registry)?,
+            None,
         )?);
         let context = WorkerContext {
             light: Arc::new(LightTables::load(&root, assets.registry, &facts)?),
             tables,
             assets: assets.clone(),
             render,
-            biomes: Arc::new(Biomes::load(&root)?),
+            biomes: Arc::new(Biomes::load(
+                &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+            )?),
+            hidden_states: Arc::from([]),
+            part_tables: Default::default(),
         };
-        let lookup = Lookup::new(&context, 2048);
+        let names = texture_names(&context.render.sprite_layers);
+        let lookup = Lookup::new(&context, 2048, &names);
         let whole = [0.0, 0.0, 1.0, 1.0];
         let upright = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
 
         let stone = lookup.block("minecraft:stone").unwrap();
         assert!(stone.cube);
-        let top = stone.sides[Direction::Up as usize][0];
+        let top = &stone.sides[Direction::Up as usize][0];
         assert_eq!(
             (top.rect, top.inset, top.tint, top.sprite.array),
             (whole, 0.0, None, 0)
         );
+        // By the name the drawing helpers take, untinted.
+        assert_eq!((top.texture.as_str(), top.tint_index), ("block/stone", -1));
         assert_eq!(lookup.texture("minecraft:block/stone"), Some(top.sprite));
         assert_eq!(lookup.texture("block/stone"), Some(top.sprite));
         assert!(!top.sprite.animated && !top.sprite.cutout);
@@ -399,18 +459,23 @@ mod tests {
         );
 
         let leaves = lookup.block("oak_leaves").unwrap();
-        let leaf = leaves.sides[Direction::Up as usize][0];
+        let leaf = &leaves.sides[Direction::Up as usize][0];
         assert!(leaf.sprite.cutout);
         assert_eq!(leaf.tint, Some(TintSource::Foliage));
+        assert_eq!(
+            (leaf.texture.as_str(), leaf.tint_index),
+            ("block/oak_leaves", 0)
+        );
         assert!(matches!(
             lookup.block("spruce_leaves").unwrap().sides[0][0].tint,
             Some(TintSource::Fixed(0x61_9961))
         ));
 
         let water = lookup.block("water").unwrap();
-        let w = water.sides[Direction::Up as usize][0];
+        let w = &water.sides[Direction::Up as usize][0];
         assert!(w.sprite.animated && w.translucent);
         assert_eq!(w.tint, Some(TintSource::Water));
+        assert_eq!(w.texture, "block/water_still");
 
         let slab = lookup.block("stone_slab").unwrap();
         assert!(!slab.cube);

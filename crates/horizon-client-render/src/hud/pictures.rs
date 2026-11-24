@@ -16,14 +16,17 @@ pub struct Picture {
 
 #[derive(Default)]
 pub(super) struct Cache {
-    roots: [PathBuf; 2],
+    roots: Vec<crate::resource_source::ResourceSource>,
     entries: HashMap<String, Option<Weak<Picture>>>,
 }
 
 impl Cache {
-    pub(super) fn new(root: &Path, defaults: &Path) -> Self {
+    pub(super) fn new(
+        root: &crate::resource_source::ResourceSource,
+        defaults: &crate::resource_source::ResourceSource,
+    ) -> Self {
         Self {
-            roots: [root.into(), defaults.into()],
+            roots: vec![root.clone(), defaults.clone()],
             entries: HashMap::new(),
         }
     }
@@ -38,15 +41,14 @@ impl Cache {
             .roots
             .iter()
             .find_map(|root| {
-                let path = root.join(format!("assets/minecraft/textures/{name}.png"));
-                let image = decode(&path).ok()?;
-                let flags = horizon_core::prepared_files::read_to_string(
-                    &path.with_extension("png.mcmeta"),
-                )
-                .ok()
-                .as_deref()
-                .and_then(TextureFlags::from_mcmeta)
-                .unwrap_or_default();
+                let path = crate::atlas_sources::texture_resource(name, "textures");
+                let image = decode_resource(root, &path).ok()?;
+                let flags = root
+                    .read_to_string(&format!("{path}.mcmeta"))
+                    .ok()
+                    .as_deref()
+                    .and_then(TextureFlags::from_mcmeta)
+                    .unwrap_or_default();
                 Some((image, flags))
             })
             .map(|((width, height, pixels), flags)| {
@@ -101,6 +103,47 @@ impl HudBatch {
             self.pictures.push(picture);
         }
     }
+
+    /// `GuiGraphicsExtractor.blit(GUI_TEXTURED, texture, x, y, u, v, w, h, tw, th)`. `native`
+    /// draws it from the atlas. When the packs replace `core/position_tex_color`, vanilla's one
+    /// quad follows (UVs `u / tw` to `(u + w) / tw`, the texture repeating), which the renderer
+    /// draws with that shader and `texture` alone instead of `native`'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_blit(
+        &mut self,
+        atlas: &HudAtlas,
+        texture: &str,
+        [x, y, w, h]: [f32; 4],
+        [u, v]: [f32; 2],
+        [tw, th]: [f32; 2],
+        color: u32,
+        native: impl FnOnce(&mut Self),
+    ) {
+        let start = self.vertices.len();
+        native(self);
+        if atlas.blit_shader.is_none() || w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let Some(picture) = atlas.pictures.lock().unwrap().get(texture) else {
+            return;
+        };
+        self.blend_since(start, Blend::PackBlitNative(picture.id));
+        let start = self.vertices.len();
+        self.quad(
+            [[x, y], [x + w, y], [x + w, y + h], [x, y + h]],
+            [
+                [u / tw, v / th],
+                [(u + w) / tw, v / th],
+                [(u + w) / tw, (v + h) / th],
+                [u / tw, (v + h) / th],
+            ],
+            color,
+        );
+        self.blend_since(start, Blend::PackBlit(picture.id));
+        if !self.pictures.iter().any(|p| p.id == picture.id) {
+            self.pictures.push(picture);
+        }
+    }
 }
 
 impl HudRenderer {
@@ -127,6 +170,8 @@ impl HudRenderer {
         batch: &HudBatch,
     ) {
         self.pictures
+            .retain(|id, _| batch.pictures.iter().any(|p| p.id == *id));
+        self.pack_blit_groups
             .retain(|id, _| batch.pictures.iter().any(|p| p.id == *id));
         for picture in &batch.pictures {
             if picture.width > device.limits().max_texture_dimension_2d
@@ -174,6 +219,10 @@ impl HudRenderer {
                     address_mode_v: address,
                     ..Default::default()
                 });
+                if let Some(pack) = &self.pack_blit {
+                    self.pack_blit_groups
+                        .insert(picture.id, pack.texture_group(device, &view, &sampler));
+                }
                 let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("GUI picture"),
                     layout: &self.layout,

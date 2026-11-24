@@ -2,11 +2,15 @@
 //! port and who may join, imports an existing `server.properties`, finds the game, and writes `server.toml`.
 //! Every question has a flag, so it also runs unattended (Docker, scripts).
 
-use crate::{config, config::Config, engine};
+use crate::engine;
+use horizon_platform::java_properties::now_millis;
 use horizon_platform::server_files::{
     eula,
-    java_properties::now_millis,
     user_lists::{OpEntry, OpList, WhiteEntry, WhiteList},
+};
+use horizon_server_launch::{
+    self as launch,
+    config::{self, Config},
 };
 use std::{
     io::{BufRead, IsTerminal, Write},
@@ -31,13 +35,28 @@ pub struct Answers {
 
 impl Answers {
     /// The answers in the environment, for containers: `HORIZON_EULA=true`, `HORIZON_WORLD`,
-    /// `HORIZON_SEED`, `HORIZON_PORT`, `HORIZON_WHITELIST=true|false`, `HORIZON_PLAYERS` (names separated by
+    /// `HORIZON_SEED`, `HORIZON_PORT`, `HORIZON_WHITELIST=true|false` (also on/off, yes/no, 1/0), `HORIZON_PLAYERS` (names separated by
     /// commas), `HORIZON_OP` and `HORIZON_ONLINE=true|false`. Flags given on the command line win.
     pub fn from_env() -> Result<Self, String> {
-        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-        let flag = |name: &str| var(name).map(|v| v.eq_ignore_ascii_case("true"));
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// `from_env` over any source of variables, so tests need not touch the process environment.
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let var = |name: &str| get(name).filter(|v| !v.is_empty());
+        // The words `config set` takes, plus 1/0. Anything else is an error: reading `HORIZON_ONLINE=1` as
+        // false would open the server to unauthenticated players.
+        let flag = |name: &str| -> Result<Option<bool>, String> {
+            var(name)
+                .map(|v| match v.to_ascii_lowercase().as_str() {
+                    "true" | "on" | "yes" | "1" => Ok(true),
+                    "false" | "off" | "no" | "0" => Ok(false),
+                    _ => Err(format!("{name} is {v:?}: use true or false")),
+                })
+                .transpose()
+        };
         Ok(Self {
-            eula: flag("HORIZON_EULA").unwrap_or(false),
+            eula: flag("HORIZON_EULA")?.unwrap_or(false),
             world: var("HORIZON_WORLD"),
             seed: var("HORIZON_SEED"),
             port: var("HORIZON_PORT")
@@ -46,7 +65,7 @@ impl Answers {
                         .map_err(|_| format!("HORIZON_PORT is {p:?}: use a port number"))
                 })
                 .transpose()?,
-            whitelist: flag("HORIZON_WHITELIST"),
+            whitelist: flag("HORIZON_WHITELIST")?,
             players: var("HORIZON_PLAYERS")
                 .map(|p| {
                     p.split([',', ' '])
@@ -56,7 +75,7 @@ impl Answers {
                 })
                 .unwrap_or_default(),
             op: var("HORIZON_OP"),
-            online: flag("HORIZON_ONLINE"),
+            online: flag("HORIZON_ONLINE")?,
             yes: false,
         })
     }
@@ -167,9 +186,10 @@ pub fn run(dir: &Path, answers: Answers) -> Result<(), String> {
             .parse()
             .map_err(|_| "the port must be a number from 1 to 65535".to_owned())?,
     };
-    // What `server.toml` will hold is checked as every start checks it: a port or a world name it would
-    // refuse is refused here, before anything is written, not at the first `run`.
-    cfg.check()?;
+    // Validate the prospective server.toml through the launch crate's owning parse boundary,
+    // just as a server start does, before writing it or adding players. Config's internal
+    // checks stay private to that crate rather than becoming a second public validation API.
+    cfg = Config::parse(&config::render(&cfg))?;
     if std::net::TcpListener::bind(("0.0.0.0", cfg.server.port)).is_err() {
         println!(
             "Port {} is in use right now: stop what uses it, or change server.port in server.toml.",
@@ -212,13 +232,13 @@ pub fn run(dir: &Path, answers: Answers) -> Result<(), String> {
     )?;
 
     // 5. The game and its files.
-    match engine::program(&cfg, dir) {
+    match launch::program(&cfg, dir) {
         Ok(program) => {
             println!("Game: {}", program.display());
             if let Err(e) = engine::check_starts(&program) {
                 println!("Warning: {e}");
             }
-            match engine::resources(&cfg, dir, Some(&program)) {
+            match launch::resources(&cfg, dir, Some(&program)) {
                 Ok(resources) => {
                     println!("Game files: {}", resources.display());
                     if let Err(e) = engine::check_prepared(&resources) {
@@ -287,6 +307,39 @@ fn add_players(
 mod tests {
     use super::*;
 
+    fn env_of(pairs: &[(&str, &str)]) -> Result<Answers, String> {
+        Answers::from_lookup(|name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        })
+    }
+
+    #[test]
+    fn environment_booleans_take_the_words_of_config_set() {
+        let on = env_of(&[
+            ("HORIZON_EULA", "1"),
+            ("HORIZON_ONLINE", "Yes"),
+            ("HORIZON_WHITELIST", "on"),
+        ])
+        .unwrap();
+        assert!(on.eula);
+        assert_eq!(on.online, Some(true));
+        assert_eq!(on.whitelist, Some(true));
+        let off = env_of(&[("HORIZON_ONLINE", "0"), ("HORIZON_WHITELIST", "FALSE")]).unwrap();
+        assert_eq!(off.online, Some(false));
+        assert_eq!(off.whitelist, Some(false));
+        assert_eq!(env_of(&[]).unwrap().online, None);
+    }
+
+    #[test]
+    fn an_unknown_environment_boolean_is_an_error_naming_the_variable() {
+        let err = env_of(&[("HORIZON_ONLINE", "maybe")]).err().unwrap();
+        assert!(err.contains("HORIZON_ONLINE"), "{err}");
+        assert!(env_of(&[("HORIZON_EULA", "ture")]).is_err());
+    }
+
     #[test]
     fn a_whitelist_init_cannot_read_is_left_alone() {
         let dir =
@@ -304,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn unattended_init_writes_everything() {
         let dir = std::env::temp_dir().join(format!("horizon-server-init-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -347,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn no_eula_no_server() {
         let dir = std::env::temp_dir().join(format!("horizon-server-eula-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -362,6 +417,7 @@ mod tests {
 
     /// `Config::check` refuses these at every start, so `init` must not write a `server.toml` that holds them.
     #[test]
+    #[ignore = "daily"]
     fn init_refuses_a_port_or_world_name_the_server_would_refuse() {
         for (label, world, port, refusal) in [
             ("port-0", None, Some(0), "server.port"),
@@ -396,6 +452,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn init_op_gets_the_op_permission_level_of_the_imported_properties() {
         // `PlayerList.op` writes `operatorUserPermissions()`, the level of `op-permission-level`.
         let dir = std::env::temp_dir().join(format!(

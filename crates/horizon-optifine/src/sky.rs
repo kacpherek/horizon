@@ -12,8 +12,8 @@
 //! Written from OptiFine's public documentation of the format (`OptiFineDoc/doc/sky.properties`
 //! and the Custom Sky page of OptiDocs, with its skybox template); no OptiFine code was read.
 
+use horizon_assets::resource_source::ResourceSource;
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use crate::matchers::{IdList, RangeList};
 use crate::paths::{properties_files, resolve};
@@ -186,9 +186,12 @@ impl Fade {
         })
     }
 
-    /// The brightness at `day_time` (ticks; any day).
+    /// The brightness at `day_time` (ticks; any day, `i64::MIN` and `i64::MAX` included: a client
+    /// mod's `sky_environment` may give any).
     pub fn brightness(&self, day_time: i64) -> f32 {
-        let since = |t: i64| (t - self.start_in).rem_euclid(DAY);
+        // Widened, so a time near either end doesn't overflow; the result is under a day.
+        let since =
+            |t: i64| (i128::from(t) - i128::from(self.start_in)).rem_euclid(DAY.into()) as i64;
         let now = since(day_time);
         let (end_in, start_out) = (since(self.end_in), since(self.start_out));
         // A fade out that ends where the fade in starts ends a whole day later, not at once.
@@ -299,12 +302,13 @@ impl SkyLayer {
     /// How far the layer has turned around its axis, in turns, when the sun stands at
     /// `sun_turns` (vanilla's sun angle over 360°: `0` at noon). A turn a day at speed 1, so the
     /// layer keeps pace with the sun; counted from noon of day 0, so a slower speed carries on
-    /// across days. `0` for a layer that does not rotate.
+    /// across days. `0` for a layer that does not rotate. Any `day_time`, `i64::MIN` included.
     pub fn turns(&self, day_time: i64, sun_turns: f32) -> f32 {
         if !self.rotate {
             return 0.0;
         }
-        let days = (day_time - 6000).div_euclid(DAY);
+        // Widened, so `i64::MIN` doesn't overflow; a whole day count fits an i64 again.
+        let days = (i128::from(day_time) - 6000).div_euclid(DAY.into()) as i64;
         // Whole turns only matter at a speed that is not whole; keep the f32 small.
         let days = (days as f64 * f64::from(self.speed)).rem_euclid(1.0);
         (days + f64::from(sun_turns) * f64::from(self.speed)).rem_euclid(1.0) as f32
@@ -358,16 +362,22 @@ impl Transition {
 impl Skies {
     /// Every `sky/world<N>/` of the pack under `root`. Layers draw in the order of their number
     /// (`sky1` before `sky10`); a file that fails to parse is skipped with a warning.
-    pub fn scan(root: &Path) -> Self {
+    pub fn scan(root: &ResourceSource) -> Self {
         let mut out = Self::default();
         for ns in ["minecraft"] {
             for top in ["optifine", "mcpatcher"] {
                 let base = format!("assets/{ns}/{top}/sky");
-                let Ok(dirs) = std::fs::read_dir(root.join(&base)) else {
-                    continue;
-                };
-                for dir in dirs.flatten() {
-                    let name = dir.file_name().to_string_lossy().into_owned();
+                let prefix = format!("{base}/");
+                let dirs: std::collections::BTreeSet<_> = root
+                    .list(&prefix)
+                    .into_iter()
+                    .filter_map(|file| {
+                        file.strip_prefix(&prefix)?
+                            .split_once('/')
+                            .map(|(name, _)| name.to_owned())
+                    })
+                    .collect();
+                for name in dirs {
                     let Some(world) = name.strip_prefix("world").and_then(|n| n.parse().ok())
                     else {
                         continue;
@@ -392,9 +402,9 @@ impl Skies {
 
 impl WorldSky {
     /// The layers and bodies of the folder at resource path `dir`.
-    fn scan(root: &Path, dir: &str) -> Self {
+    fn scan(root: &ResourceSource, dir: &str) -> Self {
         let read = |file: &str| {
-            std::fs::read_to_string(root.join(file))
+            root.read_to_string(file)
                 .ok()
                 .map(|t| Properties::parse(&t))
         };
@@ -414,7 +424,7 @@ impl WorldSky {
             };
             let Some(p) = read(&file) else { continue };
             match SkyLayer::parse(&file, &p) {
-                Some(layer) if root.join(&layer.source).is_file() => layers.push((n, layer)),
+                Some(layer) if root.contains(&layer.source) => layers.push((n, layer)),
                 Some(layer) => log::warn!("{file}: no texture {}", layer.source),
                 None => log::warn!("{file}: unknown blend or bad source; skipped"),
             }
@@ -427,7 +437,7 @@ impl WorldSky {
                 Some(s) => with_png(&resolve(&props, s)?),
                 None => format!("{dir}/{name}.png"),
             };
-            if !root.join(&source).is_file() {
+            if !root.contains(&source) {
                 return None;
             }
             let blend = p
@@ -595,6 +605,24 @@ mod tests {
         assert_eq!(l.turns(54000, 0.0), 0.0);
     }
 
+    /// A client mod may draw any time (`sky_environment`): the ends of an i64 neither overflow
+    /// nor leave the ranges, and a fade reads only the time of day.
+    #[test]
+    fn the_ends_of_the_clock_neither_overflow_nor_leave_the_ranges() {
+        let night = layer("startFadeIn=18:00\nendFadeIn=20:00\nendFadeOut=6:00");
+        for day_time in [i64::MIN, i64::MIN + 1, i64::MAX] {
+            assert_eq!(
+                night.brightness(day_time),
+                night.brightness(day_time.rem_euclid(DAY)),
+                "{day_time}"
+            );
+            for l in [layer(""), layer("speed=0.5"), layer("speed=0.3")] {
+                let turns = l.turns(day_time, 0.25);
+                assert!((0.0..1.0).contains(&turns), "{day_time}: {turns}");
+            }
+        }
+    }
+
     #[test]
     fn transitions_ease_linearly() {
         let mut t = Transition::default();
@@ -625,7 +653,22 @@ mod tests {
         }
         std::fs::write(end.join("sky1.properties"), "").unwrap();
         std::fs::write(end.join("sky1.png"), b"png").unwrap();
-        let skies = Skies::scan(&root);
+        let source = ResourceSource::directory(root.clone());
+        let skies = Skies::scan(&source);
+        let indexed = ResourceSource::indexed(
+            source
+                .list("assets/")
+                .into_iter()
+                .map(|name| {
+                    let bytes = source.read(&name).unwrap();
+                    (
+                        name,
+                        horizon_assets::resource_source::Resource::bytes(bytes),
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(Skies::scan(&indexed), skies);
         let _ = std::fs::remove_dir_all(&root);
         let o = &skies.worlds[&0];
         assert_eq!(

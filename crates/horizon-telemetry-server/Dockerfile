@@ -5,8 +5,11 @@ WORKDIR /src
 COPY Cargo.toml Cargo.toml
 # Every crate the server's Cargo.lock builds from a path (tests/test_service_images.py checks the list).
 COPY crates/horizon-addresses crates/horizon-addresses
+COPY crates/horizon-bench crates/horizon-bench
 COPY crates/horizon-core crates/horizon-core
+COPY crates/horizon-guest-stack crates/horizon-guest-stack
 COPY crates/horizon-hooks crates/horizon-hooks
+COPY crates/horizon-perf-format crates/horizon-perf-format
 COPY crates/horizon-platform crates/horizon-platform
 COPY crates/horizon-system crates/horizon-system
 COPY crates/horizon-telemetry crates/horizon-telemetry
@@ -15,8 +18,7 @@ RUN cargo build --release --locked --manifest-path crates/horizon-telemetry-serv
 
 FROM debian:stable-slim
 COPY --from=build /src/crates/horizon-telemetry-server/target/release/horizon-telemetry-server /usr/local/bin/
-# Railway's proxy sets X-Real-IP to the client's address; it is the header the server read first before
-# HORIZON_TELEMETRY_CLIENT_IP_HEADER existed, so this keeps the same address for the rate limits (README "Hosting").
+# Behind Cloudflare (README "Hosting"): its edge sets CF-Connecting-IP to the client's address.
 ENV HORIZON_TELEMETRY_DB=/data/telemetry.sqlite3 HORIZON_TELEMETRY_TRUST_PROXY=1 \
-    HORIZON_TELEMETRY_CLIENT_IP_HEADER=x-real-ip
+    HORIZON_TELEMETRY_CLIENT_IP_HEADER=cf-connecting-ip
 CMD ["horizon-telemetry-server"]

@@ -108,9 +108,10 @@ fn capped_lanes(requested: usize, hardware: Option<usize>) -> usize {
     requested.clamp(1, 8).min(hardware.unwrap_or(1).max(1))
 }
 
-/// The threads the loop may run on, capped at the machine's available parallelism.
+/// The threads the loop may run on, capped at the machine's available parallelism: the whole
+/// CPU set, as the lanes other than the server's leave its reserved core.
 fn lanes() -> usize {
-    let hardware = std::thread::available_parallelism().ok().map(usize::from);
+    let hardware = horizon_threads::available_parallelism().ok().map(usize::from);
     #[cfg(test)]
     if let Some(lanes) = LANES.with(Cell::get) {
         return capped_lanes(lanes, hardware);
@@ -393,12 +394,9 @@ impl Islands<'_> {
             };
             let mut base = rebuild();
             base.who_lookup = Some(&lookup);
-            // The despawn checks look up no mob, as the serial loop's.
-            let despawn = base.despawn_view();
             base.foreign = Some(&foreign);
             let mut turns = Turns {
                 base: &base,
-                despawn,
                 ticking: &*ticking,
                 nearest,
                 single_player,
@@ -447,6 +445,10 @@ impl Islands<'_> {
                 let handle = std::thread::Builder::new()
                     .name("mob-island".into())
                     .spawn_scoped(s, move || {
+                        // Born on the server thread, so on its reserved core when one is held:
+                        // off it, or every lane would share the server's two CPUs. The keeper's
+                        // scan never sees a thread that lives one tick.
+                        horizon_threads::server_core::leave_reserved();
                         let _done = done;
                         #[cfg(test)]
                         if let Some(failure) = &failure
@@ -1445,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn startup_and_turn_failures_release_lanes_and_preserve_payload() {
         let (sent, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1469,7 +1471,6 @@ mod tests {
                 let nearest = super::super::prep::MobsNearest::new(&players, &mobs, false);
                 let mut turns = Turns {
                     base: &base,
-                    despawn: base.despawn_view(),
                     ticking: &|_, _| true,
                     nearest: &nearest,
                     single_player: Some(None),
@@ -1537,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn verification_detects_snapshot_and_gaussian_only_differences() {
         use horizon_core::random::RandomSource;
         let mut game = super::super::super::native_machines::tests::server_game();
@@ -1691,7 +1692,7 @@ mod tests {
 
     /// Exercise the actual Mob/Seen-to-reach conversion, not just hand-built planner boxes.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn actual_reaches_cover_links_villages_and_bounded_moves() {
         let mut game = super::super::super::native_machines::tests::server_game();
         game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true)
@@ -1717,7 +1718,6 @@ mod tests {
         let nearest = super::super::prep::MobsNearest::new(&players, &mobs, false);
         let turns = Turns {
             base: &base,
-            despawn: base.despawn_view(),
             ticking: &|_, _| true,
             nearest: &nearest,
             single_player: Some(None),
@@ -1851,7 +1851,7 @@ mod tests {
     /// A later id is visible frozen without waiting; an earlier id waits for its publication,
     /// and a lane that unwinds without publishing releases the lookup instead of hanging it.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn foreign_lookup_observes_serial_visibility_and_unwind() {
         let mut game = super::super::super::native_machines::tests::server_game();
         game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true)
@@ -1926,7 +1926,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn moved_riders_use_loaded_and_ticking_state_at_their_turn() {
         let mut game = super::super::super::native_machines::tests::server_game();
         game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true)
@@ -1964,7 +1964,6 @@ mod tests {
         let ticking = |x: i32, _: i32| x.rem_euclid(1000) >= 1;
         let mut turns = Turns {
             base: &base,
-            despawn: base.despawn_view(),
             ticking: &ticking,
             nearest: &nearest,
             single_player: Some(None),
@@ -2103,7 +2102,7 @@ mod tests {
     /// other, some with brains that draw from the level random (no villagers: their village reads
     /// reach the next herd).
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn islands_tick_their_mobs_as_one_thread_does() {
         struct Reset;
         impl Drop for Reset {
@@ -2282,7 +2281,7 @@ mod tests {
     /// it with the herd around its owner, and the herd far from both still ticks in a group of its
     /// own.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn a_pet_teleports_to_its_owner_while_a_far_herd_ticks_apart() {
         let mut game = separated_herds_game();
         // Keep the neighbors in place while pets cross the 96-block gap.
@@ -2317,7 +2316,7 @@ mod tests {
     /// herd tick in groups beside the other herds and leave the mobs and the level random as the
     /// serial loop does, since the serial loop draws the same way while the switch is on.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn villagers_on_their_own_random_tick_in_groups_as_serial() {
         struct Reset;
         impl Drop for Reset {
@@ -2370,7 +2369,7 @@ mod tests {
     /// the level's stream, so no lane waits for it: the school leaders' rolls, which move the
     /// level random otherwise, leave it where a tick without them does.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn mobs_on_their_own_random_leave_the_level_stream_alone() {
         assert_ne!(
             level_random_after_ticks(false, 3),
@@ -2386,7 +2385,7 @@ mod tests {
     /// The raiders of one raid order their hurts across it (`raids.rs`): one in each of two herds
     /// joins them, and the herd between ticks in a group of its own.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn a_raid_shares_one_group_beside_a_herd() {
         let mut game = separated_herds_game();
         for x in [2.5, 194.5] {
@@ -2405,7 +2404,7 @@ mod tests {
     /// item's diameter, a fall of any length: 85 blocks above one herd, it joins that herd's
     /// island, and the two others tick apart.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn a_fox_eating_chorus_fruit_joins_the_herd_below() {
         let mut game = separated_herds_game();
         for m in &mut game.mobs {
@@ -2450,7 +2449,7 @@ mod tests {
     /// 96 blocks on: its locomotion bound joins that herd, not the one past it, and the pushes
     /// at the destination come out as serially.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn a_fast_mob_joins_only_the_herds_its_bound_reaches() {
         let mut game = separated_herds_game();
         for m in &mut game.mobs {

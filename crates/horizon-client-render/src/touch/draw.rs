@@ -6,7 +6,8 @@
 //! Drawing the touch controls on the HUD, in GUI pixels. Buttons use the
 //! resource pack's own button sprite (`widget/button`, highlighted while held)
 //! with a short label; the joystick, the D-pad and the tap marker are plain
-//! shapes. No art of its own ships with the game.
+//! shapes. No art of its own ships with the game. Custom buttons draw
+//! the same way (see `custom.rs`).
 use super::{Control, Mode, Placement, Role, TouchControls, layout};
 use crate::gamepad::{Button, PadState};
 use crate::hud::{HudAtlas, HudBatch, rgba};
@@ -38,6 +39,7 @@ impl TouchControls {
                     .any(|(_, point)| layout::contains(rect, *point));
             button(b, a, bounds, &self.label(control), pressed, color);
         }
+        self.draw_custom(b, a);
         if let Some(point) = self.pointer() {
             let center = [point[0] * b.width, point[1] * b.height];
             let radius = self.settings.circle_size / 2.0;
@@ -54,7 +56,18 @@ impl TouchControls {
 
     /// Whether a control shows as held: its button is down, or it latched.
     fn held(&self, control: Control, state: &PadState) -> bool {
-        if control == Control::Sneak && self.sneaking {
+        let sneaking = if self.inventory_mode {
+            self.inventory_shift
+        } else {
+            self.sneaking
+        };
+        if control == Control::Sneak && sneaking {
+            return true;
+        }
+        if self.inventory_mode
+            && Self::inventory_token(control)
+                .is_some_and(|token| self.held_custom_tokens().any(|held| held == token))
+        {
             return true;
         }
         Self::button(control).is_some_and(|button| match button {
@@ -148,7 +161,7 @@ fn knob(middle: [f32; 2], left: [f32; 2], size: f32) -> [f32; 2] {
 }
 
 /// A placement's square in GUI pixels, `[x, y, size, size]`.
-fn square(b: &HudBatch, center: [f32; 2], size: f32) -> [f32; 4] {
+pub(super) fn square(b: &HudBatch, center: [f32; 2], size: f32) -> [f32; 4] {
     let size = size * b.height;
     [
         center[0] * b.width - size / 2.0,
@@ -158,13 +171,13 @@ fn square(b: &HudBatch, center: [f32; 2], size: f32) -> [f32; 4] {
     ]
 }
 
-fn alpha(opacity: f32) -> u8 {
+pub(super) fn alpha(opacity: f32) -> u8 {
     (opacity.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 /// A labelled button: the pack's button sprite, or a plain frame when the
 /// pack has none. A held button darkens and its label drops a pixel.
-fn button(
+pub(super) fn button(
     b: &mut HudBatch,
     a: &HudAtlas,
     bounds: [f32; 4],
@@ -279,11 +292,20 @@ mod tests {
     use super::*;
 
     fn atlas() -> HudAtlas {
-        HudAtlas::build(std::path::Path::new("/nonexistent/horizon-touch-draw")).unwrap()
+        HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            std::path::PathBuf::from("/nonexistent/horizon-touch-draw"),
+        ))
+        .unwrap()
     }
 
     fn vertices(t: &TouchControls, a: &HudAtlas) -> usize {
-        let mut b = HudBatch::new([1920, 1080]);
+        let mut b = HudBatch::new(
+            [1920, 1080],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         t.draw(&mut b, a);
         b.vertices.len()
     }
@@ -373,7 +395,13 @@ mod tests {
 
     /// One button drawn alone, as `button` draws it in `draw`.
     fn one(a: &HudAtlas, bounds: [f32; 4], label: &str, pressed: bool) -> HudBatch {
-        let mut b = HudBatch::new([1920, 1080]);
+        let mut b = HudBatch::new(
+            [1920, 1080],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         button(&mut b, a, bounds, label, pressed, rgba(255, 255, 255, 128));
         b
     }
@@ -416,7 +444,13 @@ mod tests {
             b.vertices.iter().map(|v| v.color).collect::<Vec<_>>()
         };
         let (idle, held) = (colours(false), colours(true));
-        let mut fill = HudBatch::new([1920, 1080]);
+        let mut fill = HudBatch::new(
+            [1920, 1080],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         fill.fill(&a, 0.0, 0.0, 1.0, 1.0, 0);
         let quad = fill.vertices.len();
         // The backdrop, then the four one-pixel edges in the button's colour.

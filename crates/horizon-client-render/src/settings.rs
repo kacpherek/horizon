@@ -18,13 +18,15 @@ pub fn set_source_volumes(volumes: [f32; 11]) {
 pub fn sound_source(event: &str) -> usize {
     let e = event.trim_start_matches("minecraft:");
     let index = |name: &str| SOUND_SOURCES.iter().position(|n| *n == name).unwrap_or(0);
-    const HOSTILE: [&str; 34] = [
+    const HOSTILE: [&str; 35] = [
         "zombie",
         "skeleton",
         "creeper",
         "spider",
         "cave_spider",
         "enderman",
+        // EnderDragon.getSoundSource: HOSTILE, so muting hostile silences it.
+        "ender_dragon",
         "witch",
         "slime",
         "magma_cube",
@@ -58,16 +60,38 @@ pub fn sound_source(event: &str) -> usize {
     if e == "block.potent_sulfur.noxious_gas" {
         // PotentSulfurBlock.animateTick, its only caller, plays it as AMBIENT.
         index("ambient")
+    } else if e == "item.bottle.fill_dragonbreath" {
+        // BottleItem.use: SoundSource.NEUTRAL, even though the id starts with `item.`.
+        index("neutral")
+    } else if e == "item.bottle.empty" {
+        // PotionItem / CauldronInteractions / DispenseItemBehavior: SoundSource.BLOCKS.
+        index("block")
+    } else if e == "item.llama_carpet.unequip" {
+        // Equippable.shearingSound, played by Mob.playSound on the llama's NEUTRAL.
+        index("neutral")
     } else if e.starts_with("music_disc.") {
         index("record")
     } else if e.starts_with("item.goat_horn.") {
         // InstrumentItem.play: SoundSource.RECORDS.
         index("record")
+    } else if matches!(
+        e,
+        "item.honeycomb.wax_on" | "item.bone_meal.use" | "item.book.put"
+    ) {
+        // Vanilla plays these on SoundSource.BLOCKS at every call site:
+        // HoneycombItem.java:83,88,104, CopperGolem.java:233,
+        // DispenseItemBehavior.java:357, LevelEventHandler.java:285 and LecternBlock.java:137.
+        index("block")
     } else if e.starts_with("music.") {
         index("music")
     } else if e.starts_with("weather.") || e.starts_with("entity.lightning_bolt") {
         index("weather")
-    } else if e.starts_with("block.") {
+    } else if e.starts_with("block.note_block.") {
+        // NoteBlock.triggerEvent plays every instrument on RECORDS.
+        index("record")
+    } else if e.starts_with("block.") || e == "entity.generic.explode" {
+        // Block interactions (fence gates, redstone, etc.) and ServerExplosion's GENERIC_EXPLODE
+        // play on SoundSource.BLOCKS.
         index("block")
     } else if e.starts_with("ambient.") {
         index("ambient")
@@ -217,6 +241,9 @@ pub struct Settings {
     pub shader_packs: Vec<crate::shader_pack_list::Entry>,
     /// The picked pack's options while its Shader Options page is open.
     pub shader_options: Option<crate::shader_options::ShaderOptions>,
+    /// The name of the Horizon shader pack the renderer has loaded, from its manifest (set by
+    /// the game, not saved): `shader_packs` holds no titles until its page was opened.
+    pub running_pack: Option<String>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -302,6 +329,7 @@ impl Default for Settings {
             mods: Default::default(),
             shader_packs: Vec::new(),
             shader_options: None,
+            running_pack: None,
         }
     }
 }
@@ -347,6 +375,8 @@ impl Settings {
     pub fn load_stores(path: &Path) {
         let dir = path.parent();
         horizon_hooks::settings::engine::load(&mut |file| fs::read_to_string(dir?.join(file)).ok());
+        // The controller's lines end their load: the settings made from P1's already hold them.
+        crate::gamepad::store::loaded();
     }
     pub fn load(path: &Path) -> Self {
         let mut horizon = path
@@ -364,10 +394,6 @@ impl Settings {
                 horizon.save(dir);
             }
         }
-        let controller = path
-            .parent()
-            .map(crate::gamepad::PadSettings::load)
-            .unwrap_or_default();
         let extras_text = path
             .parent()
             .and_then(|dir| fs::read_to_string(dir.join(crate::extras::FILE)).ok())
@@ -380,6 +406,8 @@ impl Settings {
             Some(dir) => fs::read_to_string(dir.join(file)).ok(),
             None => None,
         });
+        // `horizon-controller.txt`, through its store, as the seat whose turn it is.
+        let controller = crate::gamepad::store::loaded();
         // The enabled mods are the game folder's, shared by its players (`--player-dir`).
         let mods = path
             .parent()
@@ -389,12 +417,16 @@ impl Settings {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
                 extras.read_old_options(&extras_text, &text);
+                let parsed = Self::parse(&text);
+                if horizon.api == crate::graphics::GraphicsApi::Auto {
+                    horizon.api = parsed.horizon.api;
+                }
                 Self {
                     horizon,
                     controller,
                     extras,
                     mods,
-                    ..Self::parse(&text)
+                    ..parsed
                 }
             }
             Err(_) => Self {
@@ -408,6 +440,10 @@ impl Settings {
         // Horizon's own key bindings live in horizon-extras.txt, not in options.txt.
         let emote = settings.extras.emote_key.clone();
         settings.keys.set("key.emote", &emote);
+        let fullbright = settings.extras.fullbright_key.clone();
+        settings.keys.set("key.fullbright", &fullbright);
+        // The loaded set is the active one: `keybind` text components show its keys.
+        settings.keys.sync_action_bindings();
         // `Options.load`: `sharePresence` decides what the friends service posts.
         crate::social::set_share_presence(crate::social::SharePresence::of(
             settings.file.int("sharePresence").clamp(0, 2) as u8,
@@ -515,8 +551,19 @@ impl Settings {
             operator_items_tab: f.bool("operatorItemsTab"),
             quit_shortcuts: f.bool("quitShortcuts"),
             ctrl_click_emulates_right_click: f.bool("ctrlClickEmulatesRightClick"),
-            horizon: Default::default(),
-            startup_api: Default::default(),
+            horizon: crate::graphics::Graphics {
+                api: match f.name("preferredGraphicsBackend").as_str() {
+                    "opengl" => crate::graphics::GraphicsApi::OpenGl,
+                    "vulkan" => crate::graphics::GraphicsApi::Vulkan,
+                    _ => crate::graphics::GraphicsApi::Auto,
+                },
+                ..Default::default()
+            },
+            startup_api: match f.name("preferredGraphicsBackend").as_str() {
+                "opengl" => crate::graphics::GraphicsApi::OpenGl,
+                "vulkan" => crate::graphics::GraphicsApi::Vulkan,
+                _ => crate::graphics::GraphicsApi::Auto,
+            },
             video_modes: Vec::new(),
             fullbright_held: false,
             controller: Default::default(),
@@ -524,6 +571,7 @@ impl Settings {
             mods: Default::default(),
             shader_packs: Vec::new(),
             shader_options: None,
+            running_pack: None,
             auto_jump: f.bool("autoJump"),
             language: f.string("lang"),
             force_unicode: f.bool("forceUnicodeFont"),
@@ -595,6 +643,15 @@ impl Settings {
         put_b(&mut f, "entityShadows", self.entity_shadows);
         put_i(&mut f, "biomeBlendRadius", self.biome_blend);
         put_name(&mut f, "graphicsPreset", &self.graphics_preset);
+        put_name(
+            &mut f,
+            "preferredGraphicsBackend",
+            match self.horizon.api {
+                crate::graphics::GraphicsApi::OpenGl => "opengl",
+                crate::graphics::GraphicsApi::Vulkan => "vulkan",
+                _ => "default",
+            },
+        );
         put_i(&mut f, "mipmapLevels", self.mipmap_levels);
         put_i(&mut f, "weatherRadius", self.weather_radius);
         put_f(&mut f, "chunkSectionFadeInTime", self.chunk_fade);
@@ -682,16 +739,23 @@ impl Settings {
     pub fn with_option(&self, key: &str, value: &str) -> Result<Self, String> {
         let mut file = self.to_file();
         file.set_text(key, value)?;
+        let parsed = Self::from_file(file);
+        let mut horizon = self.horizon.clone();
+        if key == "preferredGraphicsBackend" {
+            horizon.api = parsed.horizon.api;
+        }
         let mut next = Self {
-            horizon: self.horizon.clone(),
+            horizon,
             controller: self.controller.clone(),
             extras: self.extras.clone(),
             mods: self.mods.clone(),
             video_modes: self.video_modes.clone(),
-            ..Self::from_file(file)
+            ..parsed
         };
         // Horizon's own bindings aren't in options.txt.
         next.keys.set("key.emote", self.keys.get("key.emote"));
+        next.keys
+            .set("key.fullbright", self.keys.get("key.fullbright"));
         Ok(next)
     }
     /// The `options.txt` text (Options.save).
@@ -705,9 +769,11 @@ impl Settings {
         }
         if let Some(dir) = path.parent() {
             self.horizon.save(dir);
-            self.controller.save(dir);
+            // Written by its store below, with the other stores' own files.
+            crate::gamepad::store::keep(&self.controller);
             let mut extras = self.extras.clone();
             extras.emote_key = self.keys.get("key.emote").to_owned();
+            extras.fullbright_key = self.keys.get("key.fullbright").to_owned();
             extras.save(dir);
             horizon_hooks::settings::engine::save_own(dir, &[crate::extras::FILE]);
             self.mods.save(&crate::logging::shared_dir(dir));
@@ -778,6 +844,8 @@ pub enum Opt {
     InvertY,
     AllowCursorChanges,
     Volume(usize),
+    /// Setting `.1` of the native mod in row `.0` of Options > Mods, a range on a slider.
+    ModSetting(u16, u16),
     SoundDevice,
     GuiScale,
     ViewBobbing,
@@ -903,6 +971,16 @@ pub enum Opt {
     MaxAnisotropy,
 }
 
+impl Settings {
+    /// GUI scaling inputs for this settings owner.
+    pub fn gui_scale_inputs(&self) -> crate::hud::GuiScale {
+        crate::hud::GuiScale {
+            requested: self.gui_scale,
+            unicode: self.force_unicode,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,12 +997,62 @@ mod tests {
             horizon_narrator::Status::Off
         );
     }
+
+    /// `BottleItem.use` and `PotionItem` name their sounds `item.*` but play
+    /// them on NEUTRAL and BLOCKS. The name-family rule alone puts both on
+    /// PLAYER, so muting `soundCategory_player` would silence sounds vanilla
+    /// keeps audible.
+    #[test]
+    fn bottle_sounds_keep_their_vanilla_category() {
+        assert_eq!(
+            super::sound_source("minecraft:item.bottle.fill_dragonbreath"),
+            6
+        );
+        assert_eq!(super::sound_source("item.bottle.fill_dragonbreath"), 6);
+        assert_eq!(super::sound_source("minecraft:item.bottle.empty"), 4);
+        assert_eq!(super::sound_source("item.bottle.empty"), 4);
+        // Another `item.*` sound still follows the family rule.
+        assert_eq!(super::sound_source("minecraft:item.book.page_turn"), 7);
+    }
+
+    /// `Equippable.shearingSound` for a llama carpet is played by `Mob.playSound`
+    /// on the llama's NEUTRAL source, not on PLAYER like most `item.*` ids.
+    #[test]
+    fn llama_carpet_unequip_keeps_neutral_category() {
+        assert_eq!(
+            super::sound_source("minecraft:item.llama_carpet.unequip"),
+            6
+        );
+        assert_eq!(super::sound_source("item.llama_carpet.unequip"), 6);
+        assert_eq!(super::sound_source("minecraft:item.book.page_turn"), 7);
+    }
+
+    /// These item id events play on SoundSource.BLOCKS in pinned vanilla 26.3.
+    #[test]
+    fn item_sounds_played_on_blocks_keep_their_category() {
+        for event in [
+            "item.honeycomb.wax_on",
+            "item.bone_meal.use",
+            "item.book.put",
+        ] {
+            assert_eq!(sound_source(event), 4, "{event}");
+        }
+        // An ordinary item event still follows the family rule.
+        assert_eq!(sound_source("item.flintandsteel.use"), 7);
+    }
+
     /// `Monster.getSoundSource`: the verified families and inherited common sounds.
     #[test]
     fn hostile_families_keep_their_sound_category() {
         for (event, source) in [
             ("entity.zombie.hurt", 5),
+            ("block.note_block.harp", 2),
+            ("block.note_block.imitate.creeper", 2),
+            ("block.note_block.trumpet_exposed", 2),
             ("entity.cow.hurt", 6),
+            ("entity.ender_dragon.flap", 5),
+            ("entity.ender_dragon.growl", 5),
+            ("entity.ender_dragon.hurt", 5),
             ("block.stone.break", 4),
             ("entity.player.hurt", 7),
             ("entity.arrow.hit", 7),
@@ -936,7 +1064,11 @@ mod tests {
             assert_eq!(sound_source(event), source, "{event}");
         }
         // Explicit sources still take precedence, including H331's arrow route.
-        let mut audio = crate::audio::Audio::silent(Path::new("/nonexistent/h068-audio"));
+        let mut audio = crate::audio::Audio::silent(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                Path::new("/nonexistent/h068-audio").to_path_buf(),
+            ),
+        );
         audio.capture = Some(Vec::new());
         audio.play_on(6, "minecraft:entity.arrow.hit", Some([1.0; 3]), 1.0, 1.0);
         audio.play_on(4, "minecraft:entity.warden.hurt", Some([1.0; 3]), 1.0, 1.0);
@@ -1218,5 +1350,107 @@ mod tests {
         assert_eq!(again.sound_device, "Headphones");
         let empty = Settings::parse("");
         assert_eq!(empty.sound_device, "");
+    }
+    #[test]
+    fn options_txt_carries_the_graphics_api_and_the_launchers_graphics_file_wins_at_startup() {
+        use crate::graphics::GraphicsApi;
+        let version = horizon_world::DATA_VERSION;
+
+        // `Options.preferredGraphicsBackend`: written and read back through options.txt.
+        for (stored, expected_api) in [
+            ("opengl", GraphicsApi::OpenGl),
+            ("vulkan", GraphicsApi::Vulkan),
+            ("default", GraphicsApi::Auto),
+        ] {
+            let text = format!("version:{version}\npreferredGraphicsBackend:{stored}\n");
+            let s = Settings::parse(&text);
+            assert_eq!(s.horizon.api, expected_api, "{stored} is read back");
+            assert_eq!(
+                s.startup_api, expected_api,
+                "{stored} is what it started with"
+            );
+
+            let written = Settings::parse(&s.serialize());
+            assert_eq!(
+                written.file.name("preferredGraphicsBackend"),
+                stored,
+                "options.txt stores vanilla's name for {stored}"
+            );
+            assert_eq!(written.horizon.api, expected_api);
+        }
+
+        // Horizon's own page can also pick DirectX 12, which vanilla's option has no name for.
+        let mut s = Settings::default();
+        s.horizon.api = GraphicsApi::Dx12;
+        assert_eq!(
+            Settings::parse(&s.serialize())
+                .file
+                .name("preferredGraphicsBackend"),
+            "default"
+        );
+
+        // A change made through the option keeps the typed field with the file.
+        s.horizon.api = GraphicsApi::OpenGl;
+        s.file.set_name("preferredGraphicsBackend", "opengl");
+        assert_eq!(
+            Settings::parse(&s.serialize()).horizon.api,
+            GraphicsApi::OpenGl
+        );
+        let updated = s.with_option("preferredGraphicsBackend", "vulkan").unwrap();
+        assert_eq!(updated.horizon.api, GraphicsApi::Vulkan);
+
+        // At startup the launcher's `graphicsApi` picks the API; `auto` leaves it to options.txt.
+        let dir = std::env::temp_dir().join(format!("horizon-graphics-api-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let options = dir.join("options.txt");
+        fs::write(
+            &options,
+            format!("version:{version}\npreferredGraphicsBackend:opengl\n"),
+        )
+        .unwrap();
+        fs::write(dir.join(crate::graphics::FILE), "graphicsApi:auto\n").unwrap();
+        let loaded = Settings::load(&options);
+        assert_eq!(loaded.horizon.api, GraphicsApi::OpenGl);
+        assert_eq!(loaded.startup_api, GraphicsApi::OpenGl);
+        fs::write(dir.join(crate::graphics::FILE), "graphicsApi:vulkan\n").unwrap();
+        let loaded = Settings::load(&options);
+        assert_eq!(loaded.horizon.api, GraphicsApi::Vulkan);
+        assert_eq!(loaded.startup_api, GraphicsApi::Vulkan);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocks_category_covers_explosions_fence_gates_and_redstone() {
+        let blocks = super::SOUND_SOURCES
+            .iter()
+            .position(|&name| name == "block")
+            .unwrap();
+        for event in [
+            "entity.generic.explode",
+            "minecraft:entity.generic.explode",
+            "block.fence_gate.open",
+            "minecraft:block.fence_gate.close",
+            "block.cherry_wood_fence_gate.open",
+            "block.lever.click",
+            "block.stone_button.click_on",
+            "block.comparator.click",
+            "block.piston.extend",
+            "block.redstone_torch.burnout",
+        ] {
+            assert_eq!(sound_source(event), blocks, "{event}");
+        }
+        // Explicit Blocks source keeps custom event IDs on the Blocks slider.
+        let mut audio = crate::audio::Audio::silent(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                Path::new("/nonexistent/sp39-audio").to_path_buf(),
+            ),
+        );
+        audio.capture = Some(Vec::new());
+        audio.play_on(blocks, "gates:custom.open", Some([1.0; 3]), 1.0, 1.0);
+        assert_eq!(
+            audio.capture.as_ref().unwrap().first().map(|s| s.source),
+            Some(blocks)
+        );
     }
 }

@@ -4,7 +4,9 @@
 //! joined presentation forms (ICU's `ArabicShaping` with `LETTERS_SHAPE`), the
 //! text is reordered by the Unicode bidirectional algorithm, and characters in
 //! right-to-left runs are mirrored. Left-to-right text comes back unchanged.
+mod sequence;
 use crate::text::{Span, Text};
+pub use sequence::visual_characters;
 use std::borrow::Cow;
 use unicode_bidi::{
     BidiClass, Direction, Level, ParagraphBidiInfo, bidi_class, get_base_direction,
@@ -89,10 +91,27 @@ const MIRRORED: &str = "\
 
 fn join(c: char) -> Join {
     let c = c as u32;
+    // `JOINS` is sorted and its ranges are disjoint.
+    let at = JOINS.partition_point(|&(_, to, _)| to < c);
     JOINS
-        .iter()
-        .find(|&&(from, to, _)| (from..=to).contains(&c))
+        .get(at)
+        .filter(|&&(from, _, _)| from <= c)
         .map_or(Join::None, |&(_, _, join)| join)
+}
+
+/// For each character, whether the nearest non-mark character after it joins
+/// the one before it. One pass from the end, so a run of marks stays linear.
+fn next_joins(chars: &[char]) -> Vec<bool> {
+    let mut out = vec![false; chars.len()];
+    let mut next = false;
+    for (i, &c) in chars.iter().enumerate().rev() {
+        out[i] = next;
+        let j = join(c);
+        if j != Mark {
+            next = j != Join::None;
+        }
+    }
+    out
 }
 
 /// The letter whose joined form `c` is (ICU shapes the forms again), or `c`.
@@ -151,13 +170,10 @@ fn shape(text: &[char]) -> Vec<char> {
     // Whether the nearest letter before joins the next one, and the joins of
     // the nearest letter after.
     let mut joins_next = false;
+    let next_joins = next_joins(&chars);
     let mut out = Vec::with_capacity(chars.len());
     for (i, &c) in chars.iter().enumerate() {
-        let next_joins = chars[i + 1..]
-            .iter()
-            .map(|&n| join(n))
-            .find(|&j| j != Mark)
-            .is_some_and(|j| j != Join::None);
+        let next_joins = next_joins[i];
         let kind = join(c);
         let shaped = match kind {
             Join::None => {
@@ -243,7 +259,7 @@ fn unchanged(mut chars: impl Iterator<Item = char>, default_rtl: bool) -> bool {
 /// character's position in the shaped text. A character's style is the one at
 /// its position in the shaped text, as `SubStringSource` takes it (the text
 /// shrinks at a lam-alef ligature).
-fn reorder(chars: &[char], default_rtl: bool) -> Vec<(char, usize)> {
+fn reorder(chars: &[char], default_rtl: bool) -> Vec<(char, usize, u8)> {
     let shaped = shape(chars);
     let plain: String = shaped.iter().collect();
     // DEFAULT_RTL only changes text without a strong character.
@@ -259,7 +275,7 @@ fn reorder(chars: &[char], default_rtl: bool) -> Vec<(char, usize)> {
             } else {
                 shaped[i]
             };
-            (c, i)
+            (c, i, levels[i].number())
         })
         .collect()
 }
@@ -272,18 +288,21 @@ pub fn visual(text: &Text) -> Cow<'_, Text> {
         return Cow::Borrowed(text);
     }
     let chars: Vec<char> = text.chars().map(|(c, _)| c).collect();
-    let styles: Vec<_> = text.chars().map(|(_, style)| style).collect();
-    let mut out = Text::default();
-    for (c, at) in reorder(&chars, default_rtl) {
-        match out.spans.last_mut() {
-            Some(span) if span.style == *styles[at] => span.text.push(c),
-            _ => out.spans.push(Span {
-                text: c.to_string(),
-                style: styles[at].clone(),
-            }),
+    let spans: Vec<_> = text
+        .spans
+        .iter()
+        .flat_map(|span| span.text.chars().map(move |_| span))
+        .collect();
+    let mut out: Vec<Span> = Vec::new();
+    for (c, at, _) in reorder(&chars, default_rtl) {
+        match out.last_mut() {
+            Some(span) if span.style == spans[at].style && span.origin() == spans[at].origin() => {
+                span.text.push(c)
+            }
+            _ => out.push(spans[at].with_text(c.to_string())),
         }
     }
-    Cow::Owned(out)
+    Cow::Owned(Text::from_spans(out))
 }
 
 /// The same for a plain string.
@@ -296,7 +315,101 @@ pub fn visual_str(s: &str) -> Cow<'_, str> {
     Cow::Owned(
         reorder(&chars, default_rtl)
             .into_iter()
-            .map(|(c, _)| c)
+            .map(|(c, _, _)| c)
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    #[test]
+    fn visual_order_preserves_origin_when_equal_styles_cross() {
+        let text = Text::literal("א").append(Text::untrusted("ב"));
+        let reordered = visual(&text);
+        assert_eq!(reordered.plain(), "בא");
+        assert_eq!(reordered.spans.len(), 2);
+        assert_eq!(reordered.spans[0].origin(), crate::text::Origin::Remote);
+        assert_eq!(reordered.spans[1].origin(), crate::text::Origin::Local);
+    }
+}
+
+#[cfg(test)]
+mod shaping_tests {
+    use super::*;
+
+    /// The scan this pass replaced: forward over every following mark.
+    fn next_joins_reference(chars: &[char]) -> Vec<bool> {
+        (0..chars.len())
+            .map(|i| {
+                chars[i + 1..]
+                    .iter()
+                    .map(|&n| join(n))
+                    .find(|&j| j != Mark)
+                    .is_some_and(|j| j != Join::None)
+            })
+            .collect()
+    }
+
+    /// The linear table search `join` used before the binary search.
+    fn join_reference(c: char) -> Join {
+        let c = c as u32;
+        JOINS
+            .iter()
+            .find(|&&(from, to, _)| (from..=to).contains(&c))
+            .map_or(Join::None, |&(_, _, join)| join)
+    }
+
+    fn marks(n: usize) -> String {
+        // Fatha, damma, shadda, sukun and the superscript alef.
+        ['\u{64E}', '\u{64F}', '\u{651}', '\u{652}', '\u{670}']
+            .iter()
+            .cycle()
+            .take(n)
+            .collect()
+    }
+
+    #[test]
+    fn join_finds_the_same_class_as_the_table_scan() {
+        for c in (0..0x11000).filter_map(char::from_u32) {
+            assert!(join(c) == join_reference(c), "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn next_joins_matches_the_forward_scan_around_long_mark_runs() {
+        let long = marks(1000);
+        let texts = [
+            String::new(),
+            marks(5),
+            format!("\u{628}{long}\u{628}"),
+            format!("\u{628}{long}\u{627}{long}\u{644}{long}\u{627}"),
+            format!("a{long}\u{62F}{long}b {long}\u{633}\u{644}\u{627}\u{645}{long}"),
+            format!("{long}\u{628}\u{64E}\u{644}{long}"),
+            format!("\u{628}{long}"),
+            format!("{long}{long}\u{200D}{long}\u{628}"),
+        ];
+        for text in texts {
+            let chars: Vec<char> = text.chars().collect();
+            assert_eq!(next_joins(&chars), next_joins_reference(&chars));
+            // The shaped text keeps one character per mark run character.
+            let shaped = shape(&chars);
+            assert!(shaped.len() <= chars.len());
+        }
+    }
+
+    #[test]
+    fn marks_between_joined_letters_take_the_tatweel_form() {
+        // Beh, fatha, beh: the fatha sits between two joined letters.
+        let shaped = shape(&['\u{628}', '\u{64E}', '\u{628}']);
+        assert_eq!(shaped, ['\u{FE91}', '\u{FE77}', '\u{FE90}']);
+        // The same through a long run: only the mark's form changes.
+        let mut text = vec!['\u{628}'];
+        text.extend(marks(2000).chars().filter(|&c| c == '\u{64E}'));
+        text.push('\u{628}');
+        let shaped = shape(&text);
+        assert_eq!(shaped.first(), Some(&'\u{FE91}'));
+        assert_eq!(shaped.last(), Some(&'\u{FE90}'));
+        assert!(shaped[1..shaped.len() - 1].iter().all(|&c| c == '\u{FE77}'));
+    }
 }

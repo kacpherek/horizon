@@ -7,12 +7,13 @@ use crate::game_tools::{self, GameTools};
 use horizon_launcher::account::{self, Accounts, SignIn, SignInState};
 use horizon_launcher::backend::{self, Job, Logged};
 use horizon_launcher::instances;
+use horizon_launcher::jars::{self, Permission};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// What an agent reads before its first call.
-const INSTRUCTIONS: &str = "Manage Horizon, a Rust reimplementation of Minecraft Java Edition: install versions, prepare them from the player's own Minecraft, start the client or a dedicated server. Every tool is a horizon-launcher CLI command of the same name (mods_search is horizon-launcher mods search). Once play started the game, or the player turned on Agent Control in a game they started, the game_* tools play it: game_state, game_ui (every widget of the open screen), game_click, game_goto, game_screenshot...";
+const INSTRUCTIONS: &str = concat!("Manage Horizon, a Rust reimplementation of Minecraft Java Edition: install versions, prepare them from the player's own Minecraft, start the client or a dedicated server. Every tool is a horizon-launcher CLI command of the same name (mods_search is horizon-launcher mods search). Once play started the game, or the player turned on Agent Control in a game they started, the game_* tools play it: game_state, game_ui (every widget of the open screen), game_click, game_goto, game_screenshot... ", horizon_mcp::untrusted_rule!());
 
 /// The revisions this server advertises: `horizon_mcp` serves them (`2026-07-28` stateless,
 /// `2025-06-18` for the clients that still open with `initialize`).
@@ -33,9 +34,11 @@ struct Session {
 fn session_tools() -> Value {
     let version = json!({ "type": "string", "description": "An installed version tag such as v2026.10.13. Default: the selected version (play: the instance's own first)." });
     let none = json!({ "type": "object", "properties": {} });
+    let jar_downloads = json!({ "type": "boolean", "description": "Explicit consent to download missing original Java asset/data jars from Modrinth for this launch. Default: false; verified cached jars work offline." });
     json!([
         { "name": "play", "description": "Start the Horizon client (a game window on the player's screen) under agent control: the game_* tools then play it. Returns once it has started; game_wait_ready waits for the world. CLI: horizon-launcher play",
           "inputSchema": { "type": "object", "properties": { "version": version,
+            "allow_jar_downloads": jar_downloads,
             "instance": { "type": "string", "description": "The instance to play, by name or id (instance_list). Default: the selected one." },
             "world": { "type": "string", "description": "Open or create this world (a folder under saves) at once." },
             "creative": { "type": "boolean", "description": "Creative mode for a new world." },
@@ -44,7 +47,7 @@ fn session_tools() -> Value {
             "offscreen": { "type": "boolean", "description": "Render without showing a window (game_screenshot still works)." },
             "arg": { "type": "array", "items": { "type": "string" }, "description": "Extra game arguments, passed through as-is (for example \"--server-thread\")." } } } },
         { "name": "server", "description": "Start a Horizon dedicated server. It runs until server_stop or the end of this MCP session. Requires agreeing to the Minecraft EULA. CLI: horizon-launcher server",
-          "inputSchema": { "type": "object", "properties": { "version": version, "dir": { "type": "string", "description": "The server's folder. Default: the launcher's server folder." }, "accept_eula": { "type": "boolean", "description": "Agree to the Minecraft EULA (https://aka.ms/MinecraftEULA) on the player's behalf. Only with their consent." } } } },
+          "inputSchema": { "type": "object", "properties": { "version": version, "allow_jar_downloads": jar_downloads, "dir": { "type": "string", "description": "The server's folder. Default: the launcher's server folder." }, "accept_eula": { "type": "boolean", "description": "Agree to the Minecraft EULA (https://aka.ms/MinecraftEULA) on the player's behalf. Only with their consent." } } } },
         { "name": "server_command", "description": "Send a console command to the server started with server (for example \"list\" or \"say hello\"), and return the lines it printed in reply.",
           "inputSchema": { "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] } },
         { "name": "server_log", "description": "The most recent lines of the server's console.",
@@ -70,15 +73,16 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 impl Session {
     fn call(&mut self, name: &str, args: &Value) -> Result<String, String> {
+        let allow_jar_downloads = args
+            .get("allow_jar_downloads")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         match name {
             "play" => {
                 if self.client.as_ref().is_some_and(|c| c.finished().is_none()) {
                     return Err("The client is already running.".into());
                 }
-                let instance = match arg_str(args, "instance") {
-                    Some(name) => instances::find(name)?,
-                    None => instances::selected(),
-                };
+                let instance = instances::for_launch(arg_str(args, "instance"))?;
                 let tag = instance.resolve_version(arg_str(args, "version"))?;
                 let mut cmd = backend::client(&tag)?;
                 instances::apply(&mut cmd, &instance)?;
@@ -103,6 +107,12 @@ impl Session {
                 if let Some(extra) = args.get("arg").and_then(Value::as_array) {
                     cmd.args(extra.iter().filter_map(Value::as_str));
                 }
+                jars::prepare_launch(
+                    &mut cmd,
+                    &Default::default(),
+                    Permission::headless(allow_jar_downloads),
+                )
+                .map_err(|error| error.to_string())?;
                 let client = Logged::start(Job::Client, cmd)?;
                 // Started once its control socket answers, as horizon-ctl launch waits.
                 let deadline = std::time::Instant::now() + Duration::from_secs(120);
@@ -137,7 +147,14 @@ impl Session {
                     .get("accept_eula")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let server = Logged::start(Job::Server, backend::server(&tag, &dir, accept)?)?;
+                let mut cmd = backend::server(&tag, &dir, accept)?;
+                jars::prepare_launch(
+                    &mut cmd,
+                    &Default::default(),
+                    Permission::headless(allow_jar_downloads),
+                )
+                .map_err(|error| error.to_string())?;
+                let server = Logged::start(Job::Server, cmd)?;
                 std::thread::sleep(Duration::from_secs(3));
                 let tail = server.tail(15).join("\n");
                 if let Some(result) = server.finished() {
@@ -251,9 +268,13 @@ impl Session {
     /// The game's tools, starting the selected version's horizon-ctl the first time.
     fn game(&mut self) -> Option<&mut GameTools> {
         if self.game.is_none() {
-            self.game = backend::resolve_version(None)
-                .and_then(|tag| GameTools::start(&tag))
-                .ok();
+            // The selected instance's version, as Play starts it.
+            let selected = instances::selected();
+            let tag = match selected.java {
+                None => selected.resolve_version(None),
+                Some(_) => backend::resolve_version(None),
+            };
+            self.game = tag.and_then(|tag| GameTools::start(&tag)).ok();
         }
         self.game.as_mut()
     }
@@ -307,7 +328,25 @@ impl Session {
                     Ok(text) => (text, false),
                     Err(e) => (e, true),
                 };
-                Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": error }))
+                let mut result =
+                    json!({ "content": [{ "type": "text", "text": text }], "isError": error });
+                // The server's console and its replies hold other people's chat and names; a
+                // launcher error is the launcher's own text.
+                if !error
+                    && matches!(
+                        name,
+                        "server"
+                            | "server_stop"
+                            | "play"
+                            | "server_log"
+                            | "server_command"
+                            | "mods_search"
+                            | "logs"
+                    )
+                {
+                    horizon_mcp::mark_untrusted(&mut result);
+                }
+                Ok(result)
             }
             _ => Err((-32601, format!("Method not found: {method}"))),
         }
@@ -332,6 +371,24 @@ pub fn serve() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launcher_error_carries_no_untrusted_notice() {
+        let mut session = Session {
+            server: None,
+            client: None,
+            sign_in: None,
+            game: None,
+        };
+        // With no server started, the reply is the launcher's own error: no notice.
+        for name in ["server_log", "server_stop"] {
+            let reply = session
+                .handle("tools/call", &json!({ "name": name, "arguments": {} }))
+                .unwrap();
+            assert_eq!(reply["isError"], true, "{name}");
+            assert_eq!(reply["content"].as_array().unwrap().len(), 1, "{name}");
+        }
+    }
 
     #[test]
     fn the_server_advertises_what_it_serves() {

@@ -5,7 +5,7 @@ use crate::{Result, sprites::Sprites};
 use horizon_assets::{
     bake::{BlockModelTransform, ModelQuad, RenderType, bake_block_model},
     blockstate::{
-        BlockStateDefinition, Variant, VariantSet,
+        BlockStateDefinition, BlockStateFile, Variant, VariantSet,
         bind::{Properties, PropertySchema, PropertyValues, SelectedModels},
         choice::CompiledChoices,
     },
@@ -23,7 +23,6 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::Path,
     sync::OnceLock,
 };
 
@@ -132,6 +131,58 @@ pub struct BakedModel {
     pub faces: Vec<BakedFace>,
     pub cube: Option<[super::cube::CubeStyle; 6]>,
 }
+/// Compact 1-byte summary of a [`BakedModel`]'s face cull directions.
+///
+/// Bit layout:
+/// - bits `0..6`: `cull_mask`, bit `d` set if any face has `quad.cull == Some(d)`
+/// - bit `6`: `has_uncullable`, set if any face has `quad.cull.is_none()`
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CullFlags(u8);
+impl CullFlags {
+    const CULL_MASK_BITS: u8 = 0b0011_1111;
+    const HAS_UNCULLABLE_BIT: u8 = 1 << 6;
+
+    /// Empty model flags (no culled faces and no uncullable faces).
+    pub const EMPTY: Self = Self(0);
+
+    /// Computes the cull flags for a slice of baked faces.
+    pub fn from_faces(faces: &[BakedFace]) -> Self {
+        let mut bits = 0u8;
+        for face in faces {
+            match face.quad.cull {
+                Some(d) => bits |= 1u8 << (d as u8),
+                None => bits |= Self::HAS_UNCULLABLE_BIT,
+            }
+        }
+        Self(bits)
+    }
+
+    /// Bitmask of `face.quad.cull` directions present (`1 << (d as u8)`).
+    #[inline]
+    pub const fn cull_mask(self) -> u8 {
+        self.0 & Self::CULL_MASK_BITS
+    }
+
+    /// Whether any face has `face.quad.cull.is_none()`.
+    #[inline]
+    pub const fn has_uncullable(self) -> bool {
+        self.0 & Self::HAS_UNCULLABLE_BIT != 0
+    }
+
+    /// Combines the cull flags of two models (e.g. multipart parts).
+    #[inline]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+const _: () = {
+    assert!((Direction::Down as u8) < 6);
+    assert!((Direction::Up as u8) < 6);
+    assert!((Direction::North as u8) < 6);
+    assert!((Direction::South as u8) < 6);
+    assert!((Direction::West as u8) < 6);
+    assert!((Direction::East as u8) < 6);
+};
 type VariantKey = (String, [u8; 3], bool);
 /// Empty by default: no state has a model (a dedicated server, which draws
 /// nothing).
@@ -141,6 +192,8 @@ pub struct StateModels {
     choices: Vec<CompiledChoices<u32>>,
     /// All baked alternatives per definition, invalidated before mutable model access.
     bounds: OnceLock<Vec<Option<[[f32; 3]; 2]>>>,
+    /// Precomputed cull flags per `baked` slot, invalidated before mutable model access.
+    cull_flags: OnceLock<Vec<CullFlags>>,
     /// By state id: its definition in `choices` and the models it selects.
     states: Vec<Option<(usize, SelectedModels)>>,
     single_models: Vec<Option<u32>>,
@@ -154,18 +207,16 @@ fn key(variant: &Variant) -> VariantKey {
 }
 /// Bakes model `name` of `library`, turned and UV-locked as a variant says.
 fn bake_variant(
-    root: &Path,
     sprites: &mut Sprites,
     library: &horizon_assets::resolve::ModelLibrary,
     name: &str,
     turns: [u8; 3],
     lock: bool,
 ) -> Result<BakedModel> {
-    bake_resolved(root, sprites, &library.resolve(name)?, turns, lock)
+    bake_resolved(sprites, &library.resolve(name)?, turns, lock)
 }
 /// Bakes a resolved `model`, turned and UV-locked as a variant says.
 fn bake_resolved(
-    root: &Path,
     sprites: &mut Sprites,
     model: &horizon_assets::resolve::ResolvedCuboidModel,
     turns: [u8; 3],
@@ -173,12 +224,12 @@ fn bake_resolved(
 ) -> Result<BakedModel> {
     let particle = model
         .material("particle")?
-        .map(|material| sprites.insert(root, &material.sprite))
+        .map(|material| sprites.insert(&material.sprite))
         .transpose()?;
     let faces: Vec<BakedFace> = bake_block_model(model, BlockModelTransform::new(turns, lock))?
         .into_iter()
         .map(|quad| {
-            let layer = sprites.insert(root, &quad.material.sprite)?;
+            let layer = sprites.insert(&quad.material.sprite)?;
             // A model's `render_type` replaces the pass its sprite would pick.
             let (translucent, opaque) = match quad.render_type {
                 Some(RenderType::Translucent | RenderType::Tripwire) => (true, false),
@@ -200,6 +251,47 @@ fn bake_resolved(
         cube,
     })
 }
+
+/// `FaceBakery.bakeQuad`: use the same centered geometry and inverse face UV
+/// transformation as a blockstate variant, not the draw-time pose.
+fn bake_form(
+    root: &crate::resource_source::ResourceSource,
+    sprites: &mut Sprites,
+    models: &crate::model_library::ParsedModels,
+    form: &mod_api::StandaloneModelForm,
+) -> Result<BakedModel> {
+    use mod_api::StandaloneModelForm;
+    match form {
+        StandaloneModelForm::Rotated {
+            model,
+            turns,
+            uvlock,
+            ..
+        } => {
+            let library = models.block_library(root, vec![model.clone()])?;
+            bake_variant(sprites, &library, model, *turns, *uvlock)
+        }
+        StandaloneModelForm::Combined { parts, .. } => {
+            let library = models.block_library(root, parts.clone())?;
+            let mut combined = BakedModel {
+                ambient_occlusion: true,
+                particle: None,
+                faces: Vec::new(),
+                cube: None,
+            };
+            for part in parts {
+                let baked = bake_variant(sprites, &library, part, [0; 3], false)?;
+                if combined.particle.is_none() {
+                    combined.particle = baked.particle;
+                }
+                combined.ambient_occlusion &= baked.ambient_occlusion;
+                combined.faces.extend(baked.faces);
+            }
+            combined.cube = super::cube::cube_styles(&combined.faces);
+            Ok(combined)
+        }
+    }
+}
 /// The definitions a blockstate file holds, bottom first: the layers of a
 /// file the pack overlay stacked (`packs::BLOCKSTATE_LAYERS`), else the
 /// file itself.
@@ -211,6 +303,27 @@ fn definition_layers(text: &str) -> std::result::Result<Vec<String>, String> {
     match value.get(crate::packs::BLOCKSTATE_LAYERS) {
         Some(Value::Array(layers)) => Ok(layers.iter().map(Value::to_string).collect()),
         _ => Ok(vec![text.to_owned()]),
+    }
+}
+/// One layer of block `block`'s blockstate file, read and bound to its `possible` states:
+/// vanilla's variants and multipart, or the picks of the definition type a mod registered.
+fn bind_layer(
+    text: &str,
+    block: &str,
+    schema: &PropertySchema,
+    possible: &[Properties],
+) -> std::result::Result<(BlockStateDefinition, Vec<Option<SelectedModels>>), String> {
+    match BlockStateFile::from_json(text).map_err(|e| e.to_string())? {
+        BlockStateFile::Vanilla(definition) => {
+            let bound = definition
+                .bind(schema, possible)
+                .map_err(|e| e.to_string())?;
+            Ok((definition, bound))
+        }
+        BlockStateFile::Typed { kind, config } => {
+            crate::mod_block_state_models::instantiate(&kind, block, &config, possible)
+                .map(BlockStateDefinition::from_picks)
+        }
     }
 }
 /// Each state's model from definitions bound bottom first: the topmost one
@@ -231,18 +344,18 @@ fn topmost(layers: Vec<Vec<Option<SelectedModels>>>) -> Vec<Option<(usize, Selec
 }
 impl StateModels {
     pub fn load(
-        root: &Path,
+        root: &crate::resource_source::ResourceRoot,
         registry: &BlockRegistry,
         blocks: &[&str],
         sprites: &mut Sprites,
     ) -> Result<Self> {
         let facts: BTreeMap<String, Value> =
-            serde_json::from_slice(&fs::read(root.join("model-states.json"))?)?;
-        Self::from_facts(root, registry, blocks, sprites, &facts)
+            serde_json::from_slice(&fs::read(root.prepared().join("model-states.json"))?)?;
+        Self::from_facts(root.source(), registry, blocks, sprites, &facts)
     }
     /// Bind and bake models using an already parsed model-state document.
     pub fn from_facts(
-        root: &Path,
+        root: &crate::resource_source::ResourceSource,
         registry: &BlockRegistry,
         blocks: &[&str],
         sprites: &mut Sprites,
@@ -258,7 +371,7 @@ impl StateModels {
         )
     }
     pub(crate) fn from_facts_with_models(
-        root: &Path,
+        root: &crate::resource_source::ResourceSource,
         registry: &BlockRegistry,
         blocks: &[&str],
         sprites: &mut Sprites,
@@ -322,35 +435,23 @@ impl StateModels {
             // gets no model, and the other blocks still load. A file several
             // packs provide binds each pack's definition on its own, bottom
             // first (`loadBlockStateDefinitionStack`).
-            let layers = match horizon_core::prepared_files::read_to_string(
-                &root.join(format!("assets/{namespace}/blockstates/{path}.json")),
-            )
-            .map_err(|e| e.to_string())
-            .and_then(|text| definition_layers(&text))
+            let file = format!("assets/{namespace}/blockstates/{path}.json");
+            let layers = match root
+                .read_to_string(&file)
+                .map_err(|e| e.to_string())
+                .and_then(|text| definition_layers(&text))
             {
                 Ok(layers) => layers,
                 Err(e) => {
-                    log::warn!(
-                        "Horizon: blockstate definition of {namespace}:{path} not loaded: {e}"
-                    );
+                    log::warn!("Horizon: blockstate definition {file} not loaded: {e}");
                     continue;
                 }
             };
             let mut loaded = Vec::with_capacity(layers.len());
             for text in &layers {
-                let layer = BlockStateDefinition::from_json(text)
-                    .map_err(|e| e.to_string())
-                    .and_then(|definition| {
-                        let bound = definition
-                            .bind(&schema, &possible)
-                            .map_err(|e| e.to_string())?;
-                        Ok((definition, bound))
-                    });
-                match layer {
+                match bind_layer(text, &name, &schema, &possible) {
                     Ok(layer) => loaded.push(layer),
-                    Err(e) => log::warn!(
-                        "Horizon: blockstate definition of {namespace}:{path} not loaded: {e}"
-                    ),
+                    Err(e) => log::warn!("Horizon: blockstate definition {file} not loaded: {e}"),
                 }
             }
             if loaded.is_empty() {
@@ -412,24 +513,33 @@ impl StateModels {
                 models.block_library_or_missing(root, names)?
             }
         };
+        // A model that reads but does not resolve (a cycle, a composite past its budget) is the
+        // missing model for its variants only, as an item's is; the other blocks still bake.
         let resolved: Vec<_> = variants
             .iter()
-            .map(|(name, ..)| library.resolve(name))
+            .map(|(name, ..)| {
+                library.resolve(name).or_else(|e| {
+                    log::warn!(
+                        "Horizon: block model {name} not resolved ({e}); using the missing model"
+                    );
+                    library.resolve(horizon_assets::resolve::MISSING_MODEL)
+                })
+            })
             .collect();
         // Every texture the models name, decoded side by side before the bake adds them one
-        // by one in its own order.
-        sprites.prefetch(
-            root,
-            resolved
-                .iter()
-                .flatten()
-                .flat_map(|model| model.textures.values())
-                .map(|material| material.sprite.as_str()),
-        );
+        // by one in its own order, as many as the renderer's arrays hold.
+        let named: Vec<&str> = resolved
+            .iter()
+            .flatten()
+            .flat_map(|model| model.textures.values())
+            .map(|material| material.sprite.as_str())
+            .collect();
+        sprites.plan_within_capacity(named.iter().copied());
+        sprites.prefetch(named);
         let mut baked = Vec::with_capacity(variants.len());
         let mut index = BTreeMap::new();
         for ((name, turns, lock), model) in variants.into_iter().zip(resolved) {
-            let model = bake_resolved(root, sprites, &model?, turns, lock)?;
+            let model = bake_resolved(sprites, &model?, turns, lock)?;
             index.insert((name.clone(), turns, lock), baked.len() as u32);
             let variant = Variant {
                 model: name,
@@ -450,6 +560,7 @@ impl StateModels {
         Ok(Self {
             choices,
             bounds: OnceLock::new(),
+            cull_flags: OnceLock::new(),
             states,
             single_models,
             baked,
@@ -464,7 +575,7 @@ impl StateModels {
     /// is; the others still bake.
     pub(crate) fn bake_standalone(
         &mut self,
-        root: &Path,
+        root: &crate::resource_source::ResourceSource,
         sprites: &mut Sprites,
         models: &crate::model_library::ParsedModels,
         names: &[String],
@@ -483,7 +594,7 @@ impl StateModels {
             }
             let model = models
                 .block_library(root, vec![name.clone()])
-                .and_then(|library| bake_variant(root, sprites, &library, name, [0; 3], false));
+                .and_then(|library| bake_variant(sprites, &library, name, [0; 3], false));
             match model {
                 Ok(model) => {
                     self.standalone
@@ -493,6 +604,7 @@ impl StateModels {
                         rotations: [0; 3],
                         uv_lock: false,
                     };
+                    self.cull_flags.take();
                     self.baked.push((variant, model));
                 }
                 Err(e) => log::warn!("Horizon: standalone model {name} not loaded: {e}"),
@@ -500,17 +612,76 @@ impl StateModels {
         }
         Ok(())
     }
+    /// Bake dependencies atomically into one standalone slot; never publish a partial form.
+    pub(crate) fn bake_standalone_forms(
+        &mut self,
+        root: &crate::resource_source::ResourceSource,
+        sprites: &mut Sprites,
+        models: &crate::model_library::ParsedModels,
+        forms: &[super::StandaloneFormRegistration],
+    ) {
+        for entry in forms {
+            let id = entry.form.id();
+            if self.standalone.contains_key(id) {
+                continue;
+            }
+            let result = bake_form(root, sprites, models, &entry.form);
+            match result {
+                Ok(model) => {
+                    self.standalone
+                        .insert(id.to_owned(), self.baked.len() as u32);
+                    self.cull_flags.take();
+                    self.baked.push((
+                        Variant {
+                            model: id.to_owned(),
+                            rotations: [0; 3],
+                            uv_lock: false,
+                        },
+                        model,
+                    ));
+                }
+                Err(error) => log::warn!(
+                    "Horizon: mod {} standalone form {id} not loaded: {error}",
+                    entry.owner
+                ),
+            }
+        }
+    }
     /// Every baked model with the variant it was baked from, to change its faces.
     pub fn models_mut(&mut self) -> impl Iterator<Item = (&Variant, &mut BakedModel)> {
         self.bounds.take();
+        self.cull_flags.take();
         self.baked
             .iter_mut()
             .map(|(variant, model)| (&*variant, model))
     }
+    /// Precomputed cull flags for every slot in this catalog's baked store,
+    /// lazily built and invalidated before mutable access via [`Self::models_mut`].
+    pub fn cull_flags(&self) -> &[CullFlags] {
+        self.cull_flags
+            .get_or_init(|| {
+                self.baked
+                    .iter()
+                    .map(|(_, model)| CullFlags::from_faces(&model.faces))
+                    .collect()
+            })
+            .as_slice()
+    }
     /// A model baked by [`Self::bake_standalone`], by id (`mymod:block/shaft_half`).
     pub fn standalone(&self, name: &str) -> Option<&BakedModel> {
-        let &i = self.standalone.get(name)?;
-        Some(&self.baked[i as usize].1)
+        self.model_by_slot(self.standalone_slot(name)?)
+    }
+    /// Resolve a standalone name once, without copying its baked geometry.
+    pub fn standalone_slot(&self, name: &str) -> Option<u32> {
+        self.standalone.get(name).copied()
+    }
+    /// Slots of registered standalone models, including models shared with block states.
+    pub fn standalone_slots(&self) -> impl Iterator<Item = u32> + '_ {
+        self.standalone.values().copied()
+    }
+    /// Geometry in this catalog's existing baked store.
+    pub fn model_by_slot(&self, slot: u32) -> Option<&BakedModel> {
+        self.baked.get(slot as usize).map(|(_, model)| model)
     }
     pub fn collect(
         &self,
@@ -584,18 +755,42 @@ impl StateModels {
         }
         self.each_seeded(state, position_seed(position), |(_, model)| out.push(model))
     }
+    /// Like [`Self::models_at`], writing baked-model slot indices into a stack-backed
+    /// `SmallVec` so single-variant and small multipart blocks avoid heap allocation
+    /// and can inspect [`Self::cull_flags`] before reading [`BakedModel`] geometry.
+    pub fn model_slots_at_small<A: smallvec::Array<Item = u32>>(
+        &self,
+        state: BlockStateId,
+        position: BlockPos,
+        out: &mut smallvec::SmallVec<A>,
+    ) -> Result<()> {
+        out.clear();
+        if let Some(Some(model)) = self.single_models.get(state.0 as usize) {
+            out.push(*model);
+            return Ok(());
+        }
+        self.each_slot_seeded(state, position_seed(position), |model| out.push(model))
+    }
+    fn each_slot_seeded(
+        &self,
+        state: BlockStateId,
+        seed: i64,
+        mut f: impl FnMut(u32),
+    ) -> Result<()> {
+        let (choice, selected) = self.state(state).ok_or("unbound gallery block state")?;
+        let mut random = LegacyRandom::new(seed);
+        self.choices[*choice].for_each(selected, &mut random, |&model| {
+            f(model);
+        })?;
+        Ok(())
+    }
     fn each_seeded<'a>(
         &'a self,
         state: BlockStateId,
         seed: i64,
         mut f: impl FnMut(&'a (Variant, BakedModel)),
     ) -> Result<()> {
-        let (choice, selected) = self.state(state).ok_or("unbound gallery block state")?;
-        let mut random = LegacyRandom::new(seed);
-        self.choices[*choice].for_each(selected, &mut random, |&model| {
-            f(&self.baked[model as usize]);
-        })?;
-        Ok(())
+        self.each_slot_seeded(state, seed, |model| f(&self.baked[model as usize]))
     }
     fn state(&self, state: BlockStateId) -> Option<&(usize, SelectedModels)> {
         self.states.get(state.0 as usize)?.as_ref()
@@ -673,6 +868,207 @@ mod tests {
     }
 
     #[test]
+    fn archive_models_bind_prepared_states_and_load_world_texture_features_in_place() -> Result<()>
+    {
+        use crate::resource_source::{ResourceRoot, ResourceSource};
+        use std::io::Write;
+        use {horizon_core::nbt::Tag, horizon_world::DATA_VERSION};
+        let fixture = Fixture(
+            std::env::temp_dir().join(format!("horizon-world-archive-{}", std::process::id())),
+        );
+        let prepared = fixture.0.join("prepared");
+        fs::create_dir_all(&prepared)?;
+        fs::write(
+            prepared.join("model-states.json"),
+            br#"{"demo:stone":{"schema":{},"states":[{}]}}"#,
+        )?;
+        let state = BlockState {
+            name: "demo:stone".into(),
+            properties: Default::default(),
+        };
+        let registry = BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(DATA_VERSION)),
+            ("states", Tag::List(vec![state.to_nbt()])),
+            ("defaults", Tag::compound([("demo:stone", Tag::Int(0))])),
+        ]))?;
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 16, 16);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()?
+                .write_image_data(&[10, 20, 30, 255].repeat(256))?;
+        }
+        let jar = fixture.0.join("world.jar");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&jar)?);
+        for (name, bytes) in [
+            ("model-states.json", b"this is not the prepared schema".as_slice()),
+            ("assets/demo/blockstates/stone.json", br#"{"variants":{"":{"model":"demo:block/child"}}}"#),
+            ("assets/demo/models/block/child.json", br#"{"loader":"fusion:model","type":"fusion:connecting","parent":"demo:block/base"}"#),
+            ("assets/demo/models/block/base.json", br##"{"textures":{"all":"demo:block/stone","particle":"#all"},"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"north":{"texture":"#all"}}}]}"##),
+            ("assets/demo/textures/block/stone.png.mcmeta", br#"{"fusion":{"type":"connecting","layout":"simple"}}"#),
+            ("assets/demo/optifine/ctm/stone.properties", b"matchBlocks=demo:stone\nmethod=fixed\ntiles=./tile\n"),
+        ] {
+            writer.start_file(name, zip::write::SimpleFileOptions::default())?;
+            writer.write_all(bytes)?;
+        }
+        for (name, color) in [
+            ("assets/demo/textures/block/stone.png", [10, 20, 30, 255]),
+            ("assets/demo/textures/block/stone_e.png", [30, 40, 50, 255]),
+            ("assets/demo/optifine/ctm/tile.png", [50, 60, 70, 255]),
+            ("assets/demo/optifine/ctm/tile_e.png", [70, 80, 90, 255]),
+            (
+                "assets/demo/textures/emissive/glow.png",
+                [90, 100, 110, 255],
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut bytes, 16, 16);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()?
+                    .write_image_data(&color.repeat(256))?;
+            }
+            writer.start_file(name, zip::write::SimpleFileOptions::default())?;
+            writer.write_all(&bytes)?;
+        }
+        writer.finish()?;
+        let root = ResourceRoot::new(
+            prepared.clone(),
+            fixture.0.join("cache"),
+            ResourceSource::archive(&jar)?,
+        );
+        let mut sprites = Sprites::with_disk_cache(&root);
+        let mut catalog = StateModels::load(&root, &registry, &["demo:stone"], &mut sprites)?;
+        let base = sprites.layers["demo:block/stone"];
+        let picked = catalog.collect(BlockStateId(0), BlockPos::new(0, 0, 0))?;
+        assert_eq!(picked.len(), 1);
+        assert_eq!(
+            picked[0].1.faces.len(),
+            1,
+            "parent geometry loaded from the jar"
+        );
+        assert_eq!(picked[0].1.faces[0].layer, base);
+        assert_eq!(picked[0].1.particle, Some(base));
+        assert!(
+            sprites
+                .try_insert_limited("demo:block/stone", png.len() as u64 - 1)
+                .is_err(),
+            "the byte limit also applies to cached layers"
+        );
+        assert_eq!(
+            sprites.try_insert_limited("demo:block/stone", png.len() as u64)?,
+            base
+        );
+        let _fusion = crate::fusion::FusionTextures::load(
+            root.source(),
+            &registry,
+            &mut sprites,
+            &mut catalog,
+        );
+        assert!(
+            catalog.collect(BlockStateId(0), BlockPos::new(0, 0, 0))?[0]
+                .1
+                .faces[0]
+                .fusion
+                .is_some()
+        );
+        let connected = crate::connected::ConnectedTextures::load(
+            root.source(),
+            horizon_optifine::ctm::load(root.source()),
+            &registry,
+            &mut sprites,
+            |_, _| Some(base),
+        );
+        assert!(!connected.is_empty());
+        crate::native_emissive::load(root.source(), &mut sprites);
+        assert!(sprites.layers.contains_key("demo:emissive/glow"));
+        let pairs = crate::native_emissive::load_optifine(root.source(), &mut sprites);
+        assert!(pairs.contains(&("demo:block/stone".into(), "demo:block/stone_e".into())));
+        assert!(pairs.contains(&(
+            "assets/demo/optifine/ctm/tile.png".into(),
+            "assets/demo/optifine/ctm/tile_e.png".into()
+        )));
+        sprites.save_disk_cache();
+        sprites.finish();
+        let offset = base as usize * (sprites.size * sprites.size * 4) as usize;
+        assert_eq!(sprites.pixels[offset..offset + 4], [10, 20, 30, 255]);
+        assert!(!prepared.join("assets").exists());
+        assert!(!fixture.0.join("assets").exists());
+        assert_eq!(
+            fs::read_dir(&prepared)?.count(),
+            1,
+            "asset reads did not touch prepared tables"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_model_that_does_not_resolve_is_the_missing_model_for_its_block_only() -> Result<()> {
+        use crate::resource_source::ResourceSource;
+        use {horizon_core::nbt::Tag, horizon_world::DATA_VERSION};
+        let fixture = Fixture(
+            std::env::temp_dir().join(format!("horizon-unresolved-{}", std::process::id())),
+        );
+        fixture.write(
+            "demo:block/good",
+            r##"{"textures":{"all":"demo:block/good"},"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"up":{"texture":"#all"}}}]}"##,
+        );
+        // Each alias copies the 64 KiB sprite: past what one resolve may copy.
+        let mut textures = vec![format!(r#""all":"demo:block/{}""#, "a".repeat(64 << 10))];
+        textures.extend((0..32).map(|i| format!(r##""a{i}":"#all""##)));
+        fixture.write(
+            "demo:block/huge",
+            &format!(r#"{{"textures":{{{}}}}}"#, textures.join(",")),
+        );
+        let mut names = Vec::new();
+        let mut states = Vec::new();
+        for block in ["good", "huge"] {
+            let path = fixture
+                .0
+                .join(format!("assets/demo/blockstates/{block}.json"));
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(
+                path,
+                format!(r#"{{"variants":{{"":{{"model":"demo:block/{block}"}}}}}}"#),
+            )?;
+            names.push(format!("demo:{block}"));
+            states.push(
+                BlockState {
+                    name: format!("demo:{block}"),
+                    properties: Default::default(),
+                }
+                .to_nbt(),
+            );
+        }
+        let registry = BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(DATA_VERSION)),
+            ("states", Tag::List(states)),
+            (
+                "defaults",
+                Tag::compound([("demo:good", Tag::Int(0)), ("demo:huge", Tag::Int(1))]),
+            ),
+        ]))?;
+        let facts: BTreeMap<String, Value> = serde_json::from_str(
+            r#"{"demo:good":{"schema":{},"states":[{}]},"demo:huge":{"schema":{},"states":[{}]}}"#,
+        )?;
+        let source = ResourceSource::directory(fixture.0.clone());
+        let mut sprites = Sprites::new(source.clone());
+        let blocks: Vec<&str> = names.iter().map(String::as_str).collect();
+        let catalog = StateModels::from_facts(&source, &registry, &blocks, &mut sprites, &facts)?;
+        let faces = |state| -> Result<usize> {
+            let picked = catalog.collect(BlockStateId(state), BlockPos::new(0, 0, 0))?;
+            Ok(picked[0].1.faces.len())
+        };
+        assert_eq!(faces(0)?, 1, "the good block keeps its own model");
+        assert_eq!(faces(1)?, 6, "the other one is the missing cube");
+        Ok(())
+    }
+
+    #[test]
     fn standalone_models_bake_once_and_skip_what_does_not_read() -> Result<()> {
         let fixture = Fixture(
             std::env::temp_dir().join(format!("horizon-standalone-{}", std::process::id())),
@@ -688,7 +1084,9 @@ mod tests {
         );
         fixture.write("lanef:block/orphan", r#"{"parent":"lanef:block/absent"}"#);
         let mut models = StateModels::default();
-        let mut sprites = Sprites::default();
+        let mut sprites = Sprites::new(crate::resource_source::ResourceSource::directory(
+            fixture.0.clone(),
+        ));
         let names: Vec<String> = [
             "lanef:block/shaft_half",
             "lanef:block/cog",
@@ -698,8 +1096,15 @@ mod tests {
         ]
         .map(str::to_owned)
         .into();
-        let parsed = ParsedModels::load(&fixture.0);
-        models.bake_standalone(&fixture.0, &mut sprites, &parsed, &names)?;
+        let parsed = ParsedModels::load(&crate::resource_source::ResourceSource::directory(
+            fixture.0.clone(),
+        ));
+        models.bake_standalone(
+            &horizon_assets::resource_source::ResourceSource::directory(fixture.0.to_path_buf()),
+            &mut sprites,
+            &parsed,
+            &names,
+        )?;
         let shaft = models.standalone("lanef:block/shaft_half").expect("baked");
         assert_eq!(shaft.faces.len(), 2);
         let cog = models.standalone("lanef:block/cog").expect("baked");
@@ -712,7 +1117,12 @@ mod tests {
         assert_eq!(models.baked.len(), 2);
         // Without a parsed library, the files are read directly.
         let mut direct = StateModels::default();
-        direct.bake_standalone(&fixture.0, &mut sprites, &ParsedModels::default(), &names)?;
+        direct.bake_standalone(
+            &horizon_assets::resource_source::ResourceSource::directory(fixture.0.to_path_buf()),
+            &mut sprites,
+            &ParsedModels::default(),
+            &names,
+        )?;
         assert_eq!(
             direct.standalone("lanef:block/cog").map(|m| m.faces.len()),
             Some(2)
@@ -739,7 +1149,7 @@ mod tests {
         let names = vec!["lanef:block/shared".to_owned()];
         let root = std::env::temp_dir().join("horizon-standalone-none");
         models.bake_standalone(
-            &root,
+            &horizon_assets::resource_source::ResourceSource::directory(root.to_path_buf()),
             &mut Sprites::default(),
             &ParsedModels::default(),
             &names,
@@ -748,8 +1158,382 @@ mod tests {
         assert_eq!(models.standalone.get("lanef:block/shared"), Some(&1));
         Ok(())
     }
+
+    #[test]
+    fn cull_flags_tracks_culled_uncullable_and_rotations() {
+        assert_eq!(std::mem::size_of::<CullFlags>(), 1);
+        let bake = |json: &str, turns: [u8; 3]| {
+            let model = horizon_assets::model::CuboidModel::from_json(json).unwrap();
+            let library = horizon_assets::resolve::ModelLibrary::new(BTreeMap::from([(
+                "horizon:test".to_owned(),
+                model,
+            )]))
+            .unwrap();
+            bake_resolved(
+                &mut Sprites::default(),
+                &library.resolve("horizon:test").unwrap(),
+                turns,
+                false,
+            )
+            .unwrap()
+        };
+
+        // All six faces culled, none uncullable.
+        let all_culled = serde_json::json!({
+            "textures": {"all": "horizon:block/test"},
+            "elements": [{
+                "from": [0, 0, 0], "to": [16, 16, 16],
+                "faces": {
+                    "down": {"texture": "#all", "cullface": "down"},
+                    "up": {"texture": "#all", "cullface": "up"},
+                    "north": {"texture": "#all", "cullface": "north"},
+                    "south": {"texture": "#all", "cullface": "south"},
+                    "west": {"texture": "#all", "cullface": "west"},
+                    "east": {"texture": "#all", "cullface": "east"}
+                }
+            }]
+        })
+        .to_string();
+        let baked = bake(&all_culled, [0, 0, 0]);
+        let flags = CullFlags::from_faces(&baked.faces);
+        assert_eq!(flags.cull_mask(), 0b0011_1111);
+        assert!(!flags.has_uncullable());
+
+        // Subset of culled faces under rotations: flags track rotated cull directions.
+        let subset_culled = serde_json::json!({
+            "textures": {"all": "horizon:block/test"},
+            "elements": [{
+                "from": [0, 0, 0], "to": [16, 16, 16],
+                "faces": {
+                    "down": {"texture": "#all", "cullface": "down"},
+                    "north": {"texture": "#all", "cullface": "north"},
+                    "east": {"texture": "#all", "cullface": "east"}
+                }
+            }]
+        })
+        .to_string();
+        let unrotated = bake(&subset_culled, [0, 0, 0]);
+        let unrotated_flags = CullFlags::from_faces(&unrotated.faces);
+        assert_eq!(
+            unrotated_flags.cull_mask(),
+            (1u8 << Direction::Down as u8)
+                | (1u8 << Direction::North as u8)
+                | (1u8 << Direction::East as u8)
+        );
+        assert!(!unrotated_flags.has_uncullable());
+        for turns in [[0, 90, 0], [90, 0, 0], [90, 180, 0]] {
+            let rotated = bake(&subset_culled, turns);
+            let rotated_flags = CullFlags::from_faces(&rotated.faces);
+            assert!(!rotated_flags.has_uncullable(), "turns={turns:?}");
+            let expected_mask = rotated.faces.iter().fold(0u8, |mask, f| {
+                mask | f.quad.cull.map_or(0, |d| 1u8 << (d as u8))
+            });
+            assert_eq!(rotated_flags.cull_mask(), expected_mask, "turns={turns:?}");
+        }
+
+        // Uncullable only.
+        let uncullable_only = serde_json::json!({
+            "textures": {"all": "horizon:block/test"},
+            "elements": [{
+                "from": [2, 2, 2], "to": [14, 14, 14],
+                "faces": {"up": {"texture": "#all"}, "north": {"texture": "#all"}}
+            }]
+        })
+        .to_string();
+        let baked = bake(&uncullable_only, [0, 0, 0]);
+        let uncullable_flags = CullFlags::from_faces(&baked.faces);
+        assert_eq!(uncullable_flags.cull_mask(), 0);
+        assert!(uncullable_flags.has_uncullable());
+
+        // Mixed culled and uncullable faces.
+        let mixed = serde_json::json!({
+            "textures": {"all": "horizon:block/test"},
+            "elements": [{
+                "from": [0, 0, 0], "to": [16, 8, 16],
+                "faces": {
+                    "down": {"texture": "#all", "cullface": "down"},
+                    "up": {"texture": "#all"}
+                }
+            }]
+        })
+        .to_string();
+        let baked = bake(&mixed, [0, 0, 0]);
+        let mixed_flags = CullFlags::from_faces(&baked.faces);
+        assert_eq!(mixed_flags.cull_mask(), 1u8 << Direction::Down as u8);
+        assert!(mixed_flags.has_uncullable());
+
+        // Union combines cull masks and uncullable bit.
+        let union = unrotated_flags.union(uncullable_flags);
+        assert_eq!(union.cull_mask(), unrotated_flags.cull_mask());
+        assert!(union.has_uncullable());
+
+        // Empty model (no faces).
+        let empty = serde_json::json!({
+            "textures": {"all": "horizon:block/test"},
+            "elements": []
+        })
+        .to_string();
+        let baked = bake(&empty, [0, 0, 0]);
+        assert_eq!(CullFlags::from_faces(&baked.faces), CullFlags::EMPTY);
+    }
+
+    #[test]
+    fn combined_standalone_model_refreshes_cull_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, value: Value| {
+            let path = dir.path().join(format!("assets/merge/models/{name}.json"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, value.to_string()).unwrap();
+        };
+        write(
+            "culled",
+            serde_json::json!({
+                "textures": {"all": "merge:block/a"},
+                "elements": [{
+                    "from": [0, 0, 0], "to": [16, 16, 16],
+                    "faces": {
+                        "north": {"texture": "#all", "cullface": "north"},
+                        "west": {"texture": "#all", "cullface": "west"}
+                    }
+                }]
+            }),
+        );
+        write(
+            "uncullable",
+            serde_json::json!({
+                "textures": {"all": "merge:block/a"},
+                "elements": [{
+                    "from": [2, 2, 2], "to": [14, 14, 14],
+                    "faces": {
+                        "up": {"texture": "#all"},
+                        "south": {"texture": "#all", "cullface": "south"}
+                    }
+                }]
+            }),
+        );
+        let source = crate::resource_source::ResourceSource::directory(dir.path().to_path_buf());
+        let parsed = ParsedModels::load(&source);
+        let mut catalog = StateModels::default();
+        // Warm cache before standalone baking to verify bake_standalone_forms invalidates it.
+        assert!(catalog.cull_flags().is_empty());
+        catalog.bake_standalone_forms(
+            &source,
+            &mut Sprites::default(),
+            &parsed,
+            &[crate::models::StandaloneFormRegistration {
+                owner: "test",
+                form: mod_api::StandaloneModelForm::Combined {
+                    id: "merge:combined".into(),
+                    parts: vec!["merge:culled".into(), "merge:uncullable".into()],
+                },
+            }],
+        );
+        let slot = catalog.standalone_slot("merge:combined").expect("baked");
+        let flags = catalog.cull_flags()[slot as usize];
+        assert_eq!(
+            flags.cull_mask(),
+            (1u8 << Direction::North as u8)
+                | (1u8 << Direction::West as u8)
+                | (1u8 << Direction::South as u8)
+        );
+        assert!(flags.has_uncullable());
+    }
+
+    #[test]
+    fn model_slots_at_small_matches_models_at_inline_and_spilled() {
+        let model_for = |name: &str, cull: Option<&str>| {
+            let mut face = serde_json::json!({"texture": "#all"});
+            if let Some(c) = cull {
+                face["cullface"] = Value::String(c.to_owned());
+            }
+            let json = serde_json::json!({
+                "textures": {"all": "horizon:block/test"},
+                "elements": [{"from": [0, 0, 0], "to": [16, 16, 16], "faces": {"up": face}}]
+            })
+            .to_string();
+            let model = horizon_assets::model::CuboidModel::from_json(&json).unwrap();
+            let library = horizon_assets::resolve::ModelLibrary::new(BTreeMap::from([(
+                name.to_owned(),
+                model,
+            )]))
+            .unwrap();
+            let baked = bake_resolved(
+                &mut Sprites::default(),
+                &library.resolve(name).unwrap(),
+                [0; 3],
+                false,
+            )
+            .unwrap();
+            (
+                Variant {
+                    model: name.to_owned(),
+                    rotations: [0; 3],
+                    uv_lock: false,
+                },
+                baked,
+            )
+        };
+        let baked = vec![
+            model_for("horizon:a", Some("up")),
+            model_for("horizon:b", Some("north")),
+            model_for("horizon:c", None),
+        ];
+        let map_index = |v: &Variant| match v.model.as_str() {
+            "horizon:a" => 0u32,
+            "horizon:b" => 1u32,
+            _ => 2u32,
+        };
+        let single_def =
+            BlockStateDefinition::from_json(r#"{"variants":{"":{"model":"horizon:a"}}}"#).unwrap();
+        let weighted_def = BlockStateDefinition::from_json(
+            r#"{"variants":{"":[{"model":"horizon:a","weight":1},{"model":"horizon:b","weight":3}]}}"#,
+        )
+        .unwrap();
+        let multi_def = BlockStateDefinition::from_json(
+            r#"{"multipart":[{"apply":{"model":"horizon:a"}},{"apply":{"model":"horizon:b"}},{"apply":{"model":"horizon:c"}}]}"#,
+        )
+        .unwrap();
+        let catalog = StateModels {
+            choices: vec![
+                CompiledChoices::new(&single_def).unwrap().map(map_index),
+                CompiledChoices::new(&weighted_def).unwrap().map(map_index),
+                CompiledChoices::new(&multi_def).unwrap().map(map_index),
+            ],
+            bounds: OnceLock::new(),
+            cull_flags: OnceLock::new(),
+            states: vec![
+                Some((0, SelectedModels::Variant(0))),
+                Some((1, SelectedModels::Variant(0))),
+                Some((2, SelectedModels::Multipart(vec![0, 1, 2]))),
+            ],
+            single_models: vec![Some(0), None, None],
+            baked,
+            standalone: BTreeMap::new(),
+        };
+
+        let first_flags = catalog.cull_flags();
+        let second_flags = catalog.cull_flags();
+        assert!(std::ptr::eq(first_flags.as_ptr(), second_flags.as_ptr()));
+        assert_eq!(first_flags[0].cull_mask(), 1u8 << Direction::Up as u8);
+        assert!(!first_flags[0].has_uncullable());
+        assert_eq!(first_flags[1].cull_mask(), 1u8 << Direction::North as u8);
+        assert!(!first_flags[1].has_uncullable());
+        assert_eq!(first_flags[2].cull_mask(), 0);
+        assert!(first_flags[2].has_uncullable());
+
+        let mut vec_buf = Vec::new();
+        let mut inline_buf: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
+        let mut spill_buf: smallvec::SmallVec<[u32; 2]> = smallvec::SmallVec::new();
+
+        for i in 0..32 {
+            let pos = BlockPos::new(i * 7 - 5, i % 16, -i * 11);
+            for state_id in [0u32, 1, 2] {
+                let id = BlockStateId(state_id);
+                catalog.models_at(id, pos, &mut vec_buf).unwrap();
+                catalog
+                    .model_slots_at_small(id, pos, &mut inline_buf)
+                    .unwrap();
+                catalog
+                    .model_slots_at_small(id, pos, &mut spill_buf)
+                    .unwrap();
+
+                assert!(
+                    !inline_buf.spilled(),
+                    "8-slot buffer must stay on the stack"
+                );
+                if state_id == 2 {
+                    assert!(
+                        spill_buf.spilled(),
+                        "2-slot buffer must spill for 3-part multipart"
+                    );
+                }
+                let expected: Vec<*const BakedModel> =
+                    vec_buf.iter().map(|&m| m as *const BakedModel).collect();
+                let got_inline: Vec<*const BakedModel> = inline_buf
+                    .iter()
+                    .map(|&slot| catalog.model_by_slot(slot).unwrap() as *const BakedModel)
+                    .collect();
+                let got_spill: Vec<*const BakedModel> = spill_buf
+                    .iter()
+                    .map(|&slot| catalog.model_by_slot(slot).unwrap() as *const BakedModel)
+                    .collect();
+                assert_eq!(got_inline, expected);
+                assert_eq!(got_spill, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn models_mut_invalidates_cull_flags_for_face_cull_edits() {
+        let json = serde_json::json!({
+            "textures": {"all": "horizon:block/test"},
+            "elements": [{
+                "from": [0, 0, 0], "to": [16, 16, 16],
+                "faces": {"north": {"texture": "#all", "cullface": "north"}}
+            }]
+        })
+        .to_string();
+        let model = horizon_assets::model::CuboidModel::from_json(&json).unwrap();
+        let library = horizon_assets::resolve::ModelLibrary::new(BTreeMap::from([(
+            "horizon:panel".to_owned(),
+            model,
+        )]))
+        .unwrap();
+        let baked = bake_resolved(
+            &mut Sprites::default(),
+            &library.resolve("horizon:panel").unwrap(),
+            [0; 3],
+            false,
+        )
+        .unwrap();
+        let mut catalog = StateModels {
+            baked: vec![(
+                Variant {
+                    model: "horizon:panel".to_owned(),
+                    rotations: [0; 3],
+                    uv_lock: false,
+                },
+                baked,
+            )],
+            ..StateModels::default()
+        };
+
+        // Warm cache: single north-culled face.
+        let initial = catalog.cull_flags();
+        assert_eq!(initial[0].cull_mask(), 1u8 << Direction::North as u8);
+        assert!(!initial[0].has_uncullable());
+        assert!(std::ptr::eq(
+            initial.as_ptr(),
+            catalog.cull_flags().as_ptr()
+        ));
+
+        // Mutate the yielded `&mut BakedModel` even after the iterator itself has been dropped.
+        let (_, model) = catalog.models_mut().next().unwrap();
+        model.faces[0].quad.cull = None;
+        let uncullable = catalog.cull_flags()[0];
+        assert_eq!(uncullable.cull_mask(), 0);
+        assert!(uncullable.has_uncullable());
+
+        // Change cull direction from uncullable to south-culled.
+        for (_, model) in catalog.models_mut() {
+            model.faces[0].quad.cull = Some(Direction::South);
+        }
+        let south_culled = catalog.cull_flags()[0];
+        assert_eq!(south_culled.cull_mask(), 1u8 << Direction::South as u8);
+        assert!(!south_culled.has_uncullable());
+
+        // Removing all faces resets flags to empty.
+        for (_, model) in catalog.models_mut() {
+            model.faces.clear();
+        }
+        assert_eq!(catalog.cull_flags()[0], CullFlags::EMPTY);
+    }
 }
 
 #[cfg(test)]
 #[path = "catalog/bounds_tests.rs"]
 mod bounds_tests;
+
+#[cfg(test)]
+#[path = "catalog/standalone_tests.rs"]
+mod standalone_tests;

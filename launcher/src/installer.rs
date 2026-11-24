@@ -24,7 +24,7 @@ use winreg::RegKey;
 pub const APP_NAME: &str = "Horizon Launcher";
 const BINARY: &str = "horizon-launcher.exe";
 const PUBLISHER: &str = "Horizon";
-const ABOUT_URL: &str = "https://playhorizon.dev";
+const ABOUT_URL: &str = horizon_addresses::LAUNCHER_ABOUT;
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\HorizonLauncher";
 const OWN_KEY: &str = r"Software\Horizon\Launcher";
 const ASIDE_PREFIX: &str = "horizon-launcher-uninstall-";
@@ -194,6 +194,8 @@ fn place(src: &Path, dest: &Path) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no folder"))?;
     let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    // The same lock as a self-update: the startup cleanup leaves this one's files alone.
+    let _lock = backend::lock_update(&backend::update_lock_file(dest)).map_err(io::Error::other)?;
     let pid = std::process::id();
     let temp = dir.join(format!("{name}.update-{pid}"));
     // A leftover from an earlier run (the same pid, a crash) must not stop the rename.

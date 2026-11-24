@@ -1,5 +1,43 @@
 # Third-party notices
 
+## cap-std / cap-fs-ext
+
+`horizon-client` directly uses `cap-std` and `cap-fs-ext` 3.4.6 from
+[the cap-std project](https://github.com/bytecodealliance/cap-std) for confined mod file access.
+Copyrights are retained by their contributors. Both crates offer Apache-2.0 WITH LLVM-exception,
+Apache-2.0 or MIT; the MIT option is reproduced here:
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+## horizon-mixins
+
+The raw injection schema in `crates/horizon-mod-package/src/manifest.rs` is adapted from
+[horizon-mixins](https://github.com/horizon-rust/horizon-mixins/tree/ddd9700b21997c95d95ac6ee5ecafe3830cf622a),
+Copyright (c) 2026 levzzz, under the MIT license
+(`crates/horizon-mod-package/HORIZON_MIXINS_LICENSE`).
+
 ## Code removed for its license
 
 Horizon once shipped three pieces of code under MIT that came from projects whose licenses don't allow that. All
@@ -46,10 +84,17 @@ original classes, game shaders, textures or prepared resources are distributed h
 `third_party/wgpu-hal` is [wgpu-hal](https://github.com/gfx-rs/wgpu) 30.0.1 by the gfx-rs
 developers, with upstream fixes applied
 ([gfx-rs/wgpu#10124](https://github.com/gfx-rs/wgpu/pull/10124),
-[gfx-rs/wgpu#10714](https://github.com/gfx-rs/wgpu/pull/10714)). Its GL backend also reports
+[gfx-rs/wgpu#10714](https://github.com/gfx-rs/wgpu/pull/10714)). On NVIDIA with a Wayland surface
+its Vulkan backend also waits for each swapchain image on the CPU (an acquire fence), so no frame
+waits on the GPU for an image the compositor still holds. Its GL backend also reports
 the context's sampled textures and samplers per shader stage (usually 32 on desktop GL,
 where WebGL2's minimum 16 was reported before), so a pipeline layout the driver accepts is
-not refused. It is licensed under MIT or Apache-2.0; both licenses are in that folder
+not refused. Its GL backend copies depth and stencil textures with a framebuffer blit, where
+`glCopyTexSubImage` read only colour and left the copy empty. Its DirectX 12 backend leaves out
+an adapter that offers neither `IDXGIAdapter4` nor `IDXGIAdapter3`, where an `unwrap` ended the
+program, and gives an intermediate texture-copy buffer's allocation back when its command
+encoder is reset, where only the resource was dropped and the allocation leaked. It is licensed under MIT or
+Apache-2.0; both licenses are in that folder
 (`LICENSE.MIT`, `LICENSE.APACHE`).
 
 ## naga
@@ -62,6 +107,8 @@ The GLSL frontend also resets the common type for each comma-separated declarato
 variable's array specifier does not change later variables.
 It also reads a struct member outside a constant expression through a pointer to the member,
 not out of a loaded copy of the whole struct, so a member an atomic function uses can be read.
+It limits recursive parsing and lowering of GLSL after preprocessing and reports a source diagnostic
+when the nesting limit is exceeded.
 The HLSL backend writes an ordinary level-zero texture sample as `SampleLevel(..., 0.0)`, while
 comparison textures keep `SampleCmpLevelZero`; HLSL has no ordinary `SampleLevelZero` method.
 The shared interpolation defaults also compile with `glsl-in` alone, without needing the
@@ -76,9 +123,10 @@ The Windows x64 game folder holds `dxcompiler.dll`, Microsoft's DirectX Shader C
 `bin/x64/dxcompiler.dll` of `dxc_2026_09_29.zip` (zip SHA-256
 `ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1`, DLL SHA-256
 `0689e2fee0a1c9df8662a59680469f24e2a3ad7ce6bbbcc9284f7a83172bfc59`, 22,274,872 bytes). The release build downloads
-it and checks both checksums (`tools/ci/fetch_dxc.py`); it is not in this repository. DirectX 12 loads it only on
-integrated GPUs (`crates/horizon-client-render/src/gfx/dx12_compiler.rs`,
-[#8513](https://github.com/horizon-rust/horizon/issues/8513)); every other GPU compiles with FXC, part of Windows.
+it and checks both checksums (`tools/ci/fetch_dxc.py`); it is not in this repository. DirectX 12 loads it on
+integrated GPUs, and on a discrete GPU only when ray tracing or mesh shaders ask for Shader Model 6.5
+(`crates/horizon-client-render/src/gfx/dx12_compiler.rs`,
+[#8513](https://github.com/horizon-rust/horizon/issues/8513)); otherwise the GPU compiles with FXC, part of Windows.
 
 Copyright (c) Microsoft Corporation. It is not covered by Horizon's MIT license. It is distributed under the
 "Microsoft Software License Terms, Microsoft DirectX Shader Compiler" (`LICENSE-MS.txt` of that release). Its
@@ -216,38 +264,6 @@ licensed under the MIT license:
 > DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-## BlueMap
-
-`crates/horizon-client-render/src/bluemap.rs` reads the lowres tiles of a server's
-[BlueMap](https://github.com/BlueMap-Minecraft/BlueMap) web map. It follows three of BlueMap's files:
-`core/src/main/java/de/bluecolored/bluemap/core/map/lowres/LowresLayer.java` (`saveTile`) for the
-tiles' pixel layout, `common/webapp/src/js/util/Utils.js` (`pathFromCoords`) for their paths, and
-`core/src/main/java/de/bluecolored/bluemap/core/map/MapSettingsSerializer.java` for a map's
-`settings.json`, at commit
-[96ae320d1d39](https://github.com/BlueMap-Minecraft/BlueMap/tree/96ae320d1d39581c10058d8222f2290f2fcb5333).
-BlueMap is licensed under the MIT license:
-
-> Copyright (c) Blue (Lukas Rieger) <https://bluecolored.de>
-> Copyright (c) contributors
->
-> Permission is hereby granted, free of charge, to any person obtaining a copy
-> of this software and associated documentation files (the "Software"), to deal
-> in the Software without restriction, including without limitation the rights
-> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-> copies of the Software, and to permit persons to whom the Software is
-> furnished to do so, subject to the following conditions:
->
-> The above copyright notice and this permission notice shall be included in
-> all copies or substantial portions of the Software.
->
-> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-> THE SOFTWARE.
-
 ## JOML
 
 `crates/horizon-client-render/src/camera.rs` (`joml::Mat4::rotation`, `invert_orthonormal`) and
@@ -331,8 +347,23 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 [fdlibm](https://www.netlib.org/fdlibm/) 5.3, Sun's freely distributable math library, whose
 results the Java SE API specifies for `StrictMath`. `fdlibm.rs` ports `e_log.c`, `e_log10.c`,
 `s_cbrt.c` and `e_hypot.c`, and, with fused multiply-adds, `s_sin.c`, `s_cos.c`, `k_sin.c`,
-`k_cos.c` and `e_rem_pio2.c`; `trig.rs` ports `e_asin.c`, `s_atan.c` and `e_atan2.c`. This
-notice also heads both files:
+`k_cos.c` and `e_rem_pio2.c`; `trig.rs` ports `e_asin.c`, `s_atan.c` and `e_atan2.c`.
+
+The strict additions in `crates/horizon-core/src/jmath/fdlibm/strict_exp_pow.rs`
+adapt netlib's original `e_exp.c` 1.6 (2004-04-22), `e_pow.c` 1.5
+(2004-04-22) and `s_scalbn.c` 1.3 (1995-01-18), preserving their ordered
+double arithmetic and Sun permission notices. Their public-JDK reference
+vectors are generated by `tools/generate_strict_math_vectors.py` through
+`StrictMath` API calls; no JDK/OpenJDK implementation source was used.
+
+`strict_trig.rs` adapts original netlib `s_sin.c`, `s_cos.c`, `s_tan.c`,
+`k_sin.c`, `k_cos.c`, `k_tan.c`, `e_rem_pio2.c` and `k_rem_pio2.c`.
+The full large-argument reduction kernel specializes its original `prec=2`
+double-precision path; the unfused arithmetic order is preserved. The tangent
+kernel carries Sun's 2004 notice; the other trigonometric sources carry Sun's
+1993 notice.
+
+The original Sun notice is preserved in each adapted source:
 
 ```
 Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
@@ -361,6 +392,9 @@ Horizon (Copyright (c) 2026 Ludovic Marie and the Horizon contributors).
 
 `crates/horizon-client-render/src/touch.rs` and `touch/tests/` are adapted from the touch input
 state of Starling's `crates/horizon-client-render/src/touch.rs` at the same commit.
+
+`crates/horizon-client-render/src/touch/custom.rs` is adapted from the custom buttons of Starling's
+`crates/horizon-client-render/src/touch.rs` at the same commit.
 
 `crates/horizon-client-render/src/touch/draw.rs` is adapted from the touch control drawing in
 Starling's `crates/horizon-client-render/src/touch.rs` at the same commit.

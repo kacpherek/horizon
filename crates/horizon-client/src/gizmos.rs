@@ -89,6 +89,18 @@ impl Gizmos {
             });
         }
     }
+    /// The on-top lines turned by `turn` about `camera`: `turn` takes a camera-relative point
+    /// to where it is drawn (the debug crosshair rolled with a mod's camera roll, whose pass
+    /// draws without the frame's pose).
+    pub fn turn_on_top(&mut self, camera: [f64; 3], turn: glam::DMat4) {
+        let turned = |p: [f64; 3]| {
+            let rel = glam::DVec3::from_array(p) - glam::DVec3::from_array(camera);
+            (turn.transform_point3(rel) + glam::DVec3::from_array(camera)).to_array()
+        };
+        for line in &mut self.on_top {
+            (line.start, line.end) = (turned(line.start), turned(line.end));
+        }
+    }
     /// `Gizmos.line`.
     pub fn line(&mut self, start: [f64; 3], end: [f64; 3], color: u32, width: f32) {
         self.lines.push(Line {
@@ -405,8 +417,20 @@ pub fn view_vector(x_rot: f32, y_rot: f32) -> [f64; 3] {
 
 /// `GizmoFeatureRenderer.buildLines`: camera-relative ends, clipped at the
 /// near plane in view space (z = -0.05), as (start, end, colour, width).
+#[horizon_mod_api_macros::replaceable]
 pub fn camera_relative(lines: &[Line], camera: [f64; 3], view: glam::Mat4) -> Vec<[f32; 8]> {
     let mut out = Vec::with_capacity(lines.len());
+    camera_relative_to(lines, camera, view, |line| out.push(line));
+    out
+}
+
+/// Append clipped, camera-relative lines without allocating a temporary batch.
+pub(crate) fn camera_relative_to(
+    lines: &[Line],
+    camera: [f64; 3],
+    view: glam::Mat4,
+    mut append: impl FnMut([f32; 8]),
+) {
     for l in lines {
         let rel = |p: [f64; 3]| {
             glam::Vec3::new(
@@ -433,7 +457,7 @@ pub fn camera_relative(lines: &[Line], camera: [f64; 3], view: glam::Mat4) -> Ve
                 }
             }
         }
-        out.push([
+        append([
             start.x,
             start.y,
             start.z,
@@ -444,7 +468,6 @@ pub fn camera_relative(lines: &[Line], camera: [f64; 3], view: glam::Mat4) -> Ve
             l.width,
         ]);
     }
-    out
 }
 
 #[cfg(test)]
@@ -504,6 +527,30 @@ mod tests {
                 (z, 0xFF7F_7FFF, 2.0),
             ]
         );
+    }
+
+    /// A rolled camera turns the crosshair with the world: drawn through the unrolled view,
+    /// at +90 the green +Y axis points to the screen's left, as the world's up does.
+    #[test]
+    fn a_rolled_crosshair_turns_with_the_world() {
+        let camera = [0.5, 64.0, 0.5];
+        let view = crate::camera::view_matrix(0.0, 0.0);
+        let roll = crate::camera::view_roll(90.0);
+        let mut g = Gizmos::default();
+        g.debug_crosshair(camera, 0.0, 0.0, 2.0);
+        g.turn_on_top(camera, (view.inverse() * roll * view).as_dmat4());
+        let green = g.on_top[4];
+        assert_eq!(green.color, 0xFF00_FF00);
+        let rel =
+            |p: [f64; 3]| (glam::DVec3::from_array(p) - glam::DVec3::from_array(camera)).as_vec3();
+        let (start, end) = (
+            view.transform_point3(rel(green.start)),
+            view.transform_point3(rel(green.end)),
+        );
+        let axis = end - start;
+        assert!(axis.x < 0.0 && axis.y.abs() < 1e-4 * axis.x.abs(), "{axis}");
+        // Its centre, straight ahead, stays where it was.
+        assert!(rel(green.start).distance(glam::Vec3::Z) < 1e-6, "{start}");
     }
 
     #[test]

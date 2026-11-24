@@ -5,6 +5,8 @@
 //! This file only lists the probes, so that adding one reruns no harness: tools/parity.py leaves it out of
 //! their dependencies. How a probe runs is in dispatch.rs.
 extern crate horizon_client_lib as horizon_client;
+#[path = "../../src/test_resources.rs"]
+mod test_resources;
 #[macro_use]
 mod dispatch;
 
@@ -17,6 +19,7 @@ mod audio_attributes_fixture;
 /// Sound-engine fakes the audio probes share.
 mod audio_common;
 mod auto_jump_probe;
+mod bitmap_advance_fixture;
 mod block_entity_anim_fixture;
 mod block_entity_render_fixture;
 mod block_entity_tickers_fixture;
@@ -75,6 +78,7 @@ mod marker_particles_probe;
 mod menu_fixture;
 mod mipmap_probe;
 mod mob_ai_probe;
+mod mob_attribute_nbt_fixture;
 mod mob_attributes_fixture;
 mod music_fixture;
 mod natural_spawn_fixture;
@@ -134,6 +138,7 @@ probes! {
     arrow_probe,
     audio_attributes_fixture,
     auto_jump_probe,
+    bitmap_advance_fixture,
     block_entity_anim_fixture,
     block_entity_render_fixture,
     block_entity_tickers_fixture,
@@ -193,6 +198,7 @@ probes! {
     menu_fixture,
     mipmap_probe,
     mob_ai_probe,
+    mob_attribute_nbt_fixture,
     mob_attributes_fixture,
     music_fixture,
     natural_spawn_fixture,

@@ -20,9 +20,10 @@ import os
 import random
 import subprocess
 try:
-    from . import block_update_harness as h, lab, test_dispenser_parity as d, test_rust_parity as base
+    from . import block_update_harness as h, fast_bins, lab, test_dispenser_parity as d, test_rust_parity as base
 except ImportError:
     import block_update_harness as h
+    import fast_bins
     import lab
     import test_dispenser_parity as d
     import test_rust_parity as base
@@ -153,6 +154,10 @@ def cases(facts, items, recipes, count, seed):
     states = d.States(facts)
     names = [n for n in recipes.recipes if recipes.recipes[n]['type'] in
              ('minecraft:crafting_shaped', 'minecraft:crafting_shapeless', 'minecraft:crafting_transmute')]
+    yield {'seed': 42, 'mode': 'craft', 'pos': [0, 0, 0],
+           'cells': [[0, 0, 0, states.get('crafter', orientation='east_up', triggered='true', crafting='false')]],
+           'items': [[0, 0, 0, 0, item('oak_log', 1)]], 'disabled': [], 'ticks': 0,
+           'entities': [{'type': 'minecraft:hopper_minecart', 'pos': [1.5, 0.0, 0.5]}]}
     for n in range(count):
         orientation = rng.choice(FRONTS)
         front_dir = orientation.split('_')[0]
@@ -242,7 +247,7 @@ def main():
            '-cp', dependencies, '-d', str(classes), str(java_root / 'dev/horizonlab/parity/VanillaDispenserOracle.java')])
     d.run(['java', '-Xmx3G', '-cp', str(classes) + os.pathsep + dependencies, 'dev.horizonlab.parity.VanillaDispenserOracle',
            str(resources), str(work / 'cases.jsonl'), str(work / 'native.txt')])
-    d.run(['cargo', 'build', '-q', '--profile', 'fast', '-p', 'horizon-client', '--bin', 'horizon-client'], cwd=lab.ROOT,
+    d.run([*fast_bins.command('horizon-client'), '-q'], cwd=lab.ROOT,
           env={**os.environ, 'CARGO_BUILD_JOBS': os.environ.get('CARGO_BUILD_JOBS', '3')})
     d.run([str(lab.cargo_target() / 'fast/horizon-client'), '--resources', str(resources)], cwd=work,
           env=lab.game_env(HORIZON_DISPENSE_FIXTURE=f'{work / "cases.jsonl"},{work / "rust.txt"}'))

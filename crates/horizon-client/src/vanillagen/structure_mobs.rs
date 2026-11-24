@@ -8,7 +8,8 @@ use crate::{
     items::Items,
     mobs::{
         Mob, MobType, MobTypes,
-        finalize::{self, Ctx, FinalizeLevel, Group, Reason, SpawnData, SpawnRegistries},
+        finalize::{self, Ctx, FinalizeLevel, Group, SpawnRegistries},
+        spawn_rules::Reason,
         spawning::{LocalDifficulty, MOON_BRIGHTNESS},
     },
 };
@@ -16,16 +17,19 @@ use horizon_core::{
     geometry::{Aabb, Vec3},
     random::{LegacyRandom, RandomSource, XoroshiroRandom},
 };
-use horizon_world::{
-    nbt::{Compound, Tag},
-    worldgen::{generator::StructureMobs, structure::legacy::PieceRandom},
-};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock, PoisonError, Weak,
         atomic::{AtomicI64, AtomicU8, Ordering},
+    },
+};
+use {
+    horizon_core::nbt::{Compound, Tag},
+    horizon_world::{
+        item_defaults::{ItemData, ItemDefaults},
+        worldgen::{generator::StructureMobs, structure::legacy::PieceRandom},
     },
 };
 
@@ -37,7 +41,7 @@ struct Data {
     items: Items,
     camel_husk: (f32, f32),
 }
-fn load(root: &std::path::Path) -> Option<Data> {
+fn load(root: &std::path::Path, defaults: &ItemDefaults) -> Option<Data> {
     let types = MobTypes::load(root).ok()?.types;
     let camel = types.get("minecraft:camel_husk")?;
     let camel_husk = (camel.width as f32, camel.height as f32);
@@ -50,17 +54,10 @@ fn load(root: &std::path::Path) -> Option<Data> {
         )
         .unwrap_or_default(),
         registries: SpawnRegistries::load(root),
-        enchantments: Enchantments::load(root),
-        items: Items::tags_only(root, &horizon_world::loot::PackOverlay::NONE).ok()?,
+        enchantments: Enchantments::load(root, defaults).ok()?,
+        items: Items::tags_only(root, &horizon_world::loot::PackOverlay::NONE, defaults).ok()?,
         camel_husk,
     })
-}
-fn load_or_log(root: &std::path::Path) -> Option<Data> {
-    let data = load(root);
-    if data.is_none() {
-        log::error!("Horizon: no mob data, structure mobs are finalized when loaded");
-    }
-    data
 }
 /// Fills `cell` with `load()` on a thread of its own, unless something fills it
 /// first. A `get_or_init` while it loads waits for it instead of loading again.
@@ -87,24 +84,62 @@ fn fill_behind<T: Send + Sync + 'static>(
     }
 }
 
+/// What a finalizer reads [`Data`] into, shared with the thread `load_behind` starts.
+type DataCell = Arc<OnceLock<Option<Data>>>;
+
+/// The cell for a finalizer of `root` and `item_data`: the one a live finalizer of the same
+/// root and item defaults holds, else a new one. `load` takes no dimension, so the overworld
+/// and the Nether of one world read the same files: one read serves both instead of a copy
+/// each (#19996). The cell goes with the world's last finalizer.
+fn shared_cell(root: &Path, item_data: &Arc<ItemData>) -> DataCell {
+    static CELLS: Mutex<Vec<(PathBuf, Weak<ItemData>, Weak<OnceLock<Option<Data>>>)>> =
+        Mutex::new(Vec::new());
+    let mut cells = CELLS.lock().unwrap_or_else(PoisonError::into_inner);
+    cells.retain(|(_, _, cell)| cell.strong_count() > 0);
+    let live = cells.iter().find_map(|(path, data, cell)| {
+        // A held `Weak` keeps its allocation, so no other `ItemData` can take its address.
+        (path == root && std::ptr::eq(data.as_ptr(), Arc::as_ptr(item_data)))
+            .then(|| cell.upgrade())
+            .flatten()
+    });
+    live.unwrap_or_else(|| {
+        let cell = Arc::new(OnceLock::new());
+        cells.push((
+            root.to_owned(),
+            Arc::downgrade(item_data),
+            Arc::downgrade(&cell),
+        ));
+        cell
+    })
+}
+
 pub struct StructureMobFinalizer {
     root: PathBuf,
+    item_data: Arc<ItemData>,
     dimension: String,
-    /// Shared with the thread `load_behind` starts.
-    data: Arc<OnceLock<Option<Data>>>,
+    /// Shared with the thread `load_behind` starts and the world's other finalizers.
+    data: DataCell,
     /// The level's difficulty (0 peaceful to 3 hard) and overworld clock.
     difficulty: AtomicU8,
     day_time: AtomicI64,
+    mob_maps: std::sync::RwLock<Arc<crate::neoforge_mob_maps::NeoForgeMobMaps>>,
 }
 impl StructureMobFinalizer {
-    pub fn new(root: PathBuf, dimension: &str) -> Self {
+    pub fn new(root: PathBuf, dimension: &str, item_data: Arc<ItemData>) -> Self {
         Self {
+            data: shared_cell(&root, &item_data),
             root,
+            item_data,
             dimension: dimension.to_owned(),
-            data: Arc::new(OnceLock::new()),
             difficulty: AtomicU8::new(2),
             day_time: AtomicI64::new(0),
+            mob_maps: std::sync::RwLock::new(Arc::clone(
+                crate::neoforge_mob_maps::NeoForgeMobMaps::vanilla(),
+            )),
         }
+    }
+    pub fn set_mob_maps(&self, snapshot: &Arc<crate::neoforge_mob_maps::NeoForgeMobMaps>) {
+        *self.mob_maps.write().unwrap() = Arc::clone(snapshot);
     }
     pub fn set_conditions(&self, difficulty: u8, day_time: i64) {
         self.difficulty.store(difficulty, Ordering::Relaxed);
@@ -114,6 +149,7 @@ impl StructureMobFinalizer {
 
 struct Level<'a> {
     data: &'a Data,
+    mob_maps: &'a crate::neoforge_mob_maps::NeoForgeMobMaps,
     biome: &'a str,
     structures: &'a [String],
     difficulty: u8,
@@ -121,6 +157,9 @@ struct Level<'a> {
     next_id: u32,
 }
 impl FinalizeLevel for Level<'_> {
+    fn mob_maps(&self) -> &crate::neoforge_mob_maps::NeoForgeMobMaps {
+        self.mob_maps
+    }
     fn biome(&self, _: [i32; 3]) -> String {
         self.biome.to_owned()
     }
@@ -162,13 +201,20 @@ impl FinalizeLevel for Level<'_> {
         self.next_id += 1;
         Some(Mob::new(self.next_id, t, Vec3::ZERO, 0.0))
     }
+    fn spawn_data(&self) -> finalize::SpawnData<'_> {
+        finalize::SpawnData {
+            registries: &self.data.registries,
+            enchantments: &self.data.enchantments,
+            items: &self.data.items,
+            camel_husk_size: self.data.camel_husk,
+        }
+    }
 }
 
 fn run<R: RandomSource>(
     level: &mut Level<'_>,
     random: &mut R,
     difficulty: LocalDifficulty,
-    data: &SpawnData<'_>,
     m: &mut Mob,
     reason: Reason,
     group: &mut Option<Group>,
@@ -177,7 +223,6 @@ fn run<R: RandomSource>(
         level,
         random,
         difficulty,
-        data,
         created: Vec::new(),
         jockey_rider: None,
     };
@@ -262,16 +307,22 @@ impl StructureMobs for StructureMobFinalizer {
 
 impl StructureMobFinalizer {
     fn data(&self) -> Option<&Data> {
-        self.data.get_or_init(|| load_or_log(&self.root)).as_ref()
+        self.data
+            .get_or_init(|| {
+                let data = load(&self.root, self.item_data.defaults());
+                if data.is_none() {
+                    log::error!("Horizon: no mob data, structure mobs are finalized when loaded");
+                }
+                data
+            })
+            .as_ref()
     }
-    /// Starts reading the mob data on a thread of its own. Otherwise the first
-    /// mob a fresh chunk generates reads it on the server's tick, which stalls
-    /// for seconds where the resources are slow to read (#13857). The thread
-    /// does not run at idle priority: the tick waits for it if it gets there
-    /// first, and idle work could starve while the tick blocks on it.
     pub fn load_behind(&self) {
         let root = self.root.clone();
-        fill_behind(&self.data, "Structure mobs", move || load_or_log(&root));
+        let item_data = self.item_data.clone();
+        let _ = fill_behind(&self.data, "Structure mobs", move || {
+            load(&root, item_data.defaults())
+        });
     }
     /// A mob chunk generation spawns (`spawnOriginalMobs`): a new one of
     /// `kind` finalized as a structure mob is, as the chunk saves it; `group`
@@ -304,8 +355,11 @@ impl StructureMobFinalizer {
     ) -> Option<Compound> {
         let base = self.difficulty.load(Ordering::Relaxed);
         let day_time = self.day_time.load(Ordering::Relaxed);
+        // Release the publication lock before any finalize body runs.
+        let mob_maps = Arc::clone(&self.mob_maps.read().unwrap());
         let mut level = Level {
             data,
+            mob_maps: &mob_maps,
             biome,
             structures,
             difficulty: base,
@@ -315,17 +369,11 @@ impl StructureMobFinalizer {
         let moon = MOON_BRIGHTNESS[level.moon_phase([0; 3])];
         // WorldGenRegion.getCurrentDifficultyAt: no inhabited time.
         let difficulty = LocalDifficulty::new(base, day_time, 0, moon);
-        let spawn = SpawnData {
-            registries: &data.registries,
-            enchantments: &data.enchantments,
-            items: &data.items,
-            camel_husk_size: data.camel_husk,
-        };
         let any = random.as_any();
         let created = if let Some(r) = any.downcast_mut::<LegacyRandom>() {
-            run(&mut level, r, difficulty, &spawn, &mut m, reason, group)
+            run(&mut level, r, difficulty, &mut m, reason, group)
         } else if let Some(r) = any.downcast_mut::<XoroshiroRandom>() {
-            run(&mut level, r, difficulty, &spawn, &mut m, reason, group)
+            run(&mut level, r, difficulty, &mut m, reason, group)
         } else {
             log::error!("Horizon: unknown region random, structure mobs are finalized when loaded");
             return None;
@@ -343,6 +391,133 @@ impl StructureMobFinalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use horizon_world::native_load_context::DataLoadOrigin;
+
+    /// The dimensions of one world read their data once (#19996); another load's item
+    /// defaults read their own, and the read goes when the world's finalizers do.
+    #[test]
+    fn a_worlds_dimensions_share_one_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("items.json"), "{}").unwrap();
+        let root = dir.path().to_owned();
+        let load = || crate::test_resources::item_data(&root, DataLoadOrigin::ServerDataLoad);
+        let item_data = load().unwrap();
+        let overworld =
+            StructureMobFinalizer::new(root.clone(), "minecraft:overworld", item_data.clone());
+        let nether = StructureMobFinalizer::new(root.clone(), "minecraft:the_nether", item_data);
+        assert!(Arc::ptr_eq(&overworld.data, &nether.data));
+        let other =
+            StructureMobFinalizer::new(root.clone(), "minecraft:overworld", load().unwrap());
+        assert!(!Arc::ptr_eq(&overworld.data, &other.data));
+        let read = Arc::downgrade(&overworld.data);
+        drop((overworld, nether));
+        assert!(read.upgrade().is_none());
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn structure_maps_reload_without_cross_world_bleed() {
+        use crate::neoforge_mob_maps::NeoForgeMobMaps;
+        use std::collections::BTreeMap;
+        let root = PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("explicit fixture resources"),
+        );
+        let item_data =
+            crate::test_resources::item_data(&root, DataLoadOrigin::ServerDataLoad).unwrap();
+        let first =
+            StructureMobFinalizer::new(root.clone(), "minecraft:overworld", item_data.clone());
+        let mut second = StructureMobFinalizer::new(root, "minecraft:overworld", item_data);
+        // Resource decoding can be shared; the two worlds' published snapshots cannot.
+        second.data = first.data.clone();
+        let mut desert = NeoForgeMobMaps::default();
+        desert.set_villager_types(BTreeMap::from([("minecraft:plains".into(), 1)]));
+        let desert = Arc::new(desert);
+        let mut snow = NeoForgeMobMaps::default();
+        snow.set_villager_types(BTreeMap::from([("minecraft:plains".into(), 4)]));
+        let snow = Arc::new(snow);
+        let mut removed = NeoForgeMobMaps::default();
+        removed.set_villager_types(BTreeMap::new());
+        let removed = Arc::new(removed);
+        first.set_mob_maps(&desert);
+        second.set_mob_maps(&snow);
+        for (world, snapshot, expected) in [
+            (&first, None, "minecraft:desert"),
+            (&second, None, "minecraft:snow"),
+            (&first, Some(&removed), "minecraft:plains"),
+            (&second, None, "minecraft:snow"),
+            (&first, Some(&desert), "minecraft:desert"),
+        ] {
+            if let Some(snapshot) = snapshot {
+                world.set_mob_maps(snapshot);
+            }
+            let Tag::Compound(mut nbt) = Tag::compound([
+                ("id", Tag::String("minecraft:villager".into())),
+                (
+                    "Pos",
+                    Tag::List(vec![
+                        Tag::Double(0.0f64.to_bits()),
+                        Tag::Double(64.0f64.to_bits()),
+                        Tag::Double(0.0f64.to_bits()),
+                    ]),
+                ),
+            ]) else {
+                unreachable!()
+            };
+            assert!(world.finalize(
+                &mut nbt,
+                "minecraft:plains",
+                &[],
+                &mut LegacyRandom::new(12345)
+            ));
+            let result = Tag::Compound(nbt);
+            assert!(
+                matches!(result.get("VillagerData").and_then(|value| value.get("type")), Some(Tag::String(value)) if value.to_string_lossy() == expected),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn structure_zombie_preserves_unknown_profession() {
+        let Some(root) = std::env::var_os("HORIZON_TEST_RESOURCES").map(PathBuf::from) else {
+            return;
+        };
+        let item_data =
+            crate::test_resources::item_data(&root, DataLoadOrigin::ServerDataLoad).unwrap();
+        let hook = StructureMobFinalizer::new(root, "minecraft:overworld", item_data);
+        let mut nbt = match Tag::compound([
+            ("id", Tag::String("minecraft:zombie_villager".into())),
+            (
+                "Pos",
+                Tag::List(vec![
+                    Tag::Double(0.0_f64.to_bits()),
+                    Tag::Double(64.0_f64.to_bits()),
+                    Tag::Double(0.0_f64.to_bits()),
+                ]),
+            ),
+            (
+                "VillagerData",
+                Tag::compound([
+                    ("type", Tag::String("minecraft:plains".into())),
+                    ("profession", Tag::String("example:engineer".into())),
+                    ("level", Tag::Int(1)),
+                ]),
+            ),
+        ]) {
+            Tag::Compound(c) => c,
+            _ => unreachable!(),
+        };
+        assert!(hook.finalize(
+            &mut nbt,
+            "minecraft:plains",
+            &[],
+            &mut LegacyRandom::new(12345)
+        ));
+        let result = Tag::Compound(nbt);
+        assert!(
+            matches!(result.get("VillagerData").and_then(|v| v.get("profession")), Some(Tag::String(s)) if s.to_string_lossy() == "example:engineer")
+        );
+    }
 
     /// The bastion's crossbow piglin keeps its crossbow (STRUCTURE skips
     /// createSpawnWeapon) and saves what Piglin.addAdditionalSaveData writes.
@@ -358,11 +533,8 @@ mod tests {
             &mut bytes,
         )
         .unwrap();
-        let limits = horizon_world::nbt::Limits::templates();
-        let template = horizon_world::nbt::read_named(&bytes, limits)
-            .unwrap()
-            .0
-            .tag;
+        let limits = horizon_core::nbt::Limits::templates();
+        let template = horizon_core::nbt::read_named(&bytes, limits).unwrap().0.tag;
         let Some(Tag::List(entities)) = template.get("entities") else {
             panic!("no entities");
         };
@@ -370,7 +542,9 @@ mod tests {
             panic!("no nbt");
         };
         nbt.remove(&"UUID".into());
-        let hook = StructureMobFinalizer::new(root, "minecraft:the_nether");
+        let item_data =
+            crate::test_resources::item_data(&root, DataLoadOrigin::ServerDataLoad).unwrap();
+        let hook = StructureMobFinalizer::new(root, "minecraft:the_nether", item_data);
         let mut random = LegacyRandom::new(12345);
         hook.finalize(&mut nbt, "minecraft:nether_wastes", &[], &mut random);
         let keys: Vec<String> = {
@@ -500,15 +674,22 @@ mod tests {
     ) -> Vec<String> {
         use crate::streaming::{ChunkGenerator, Proto};
         let assets = crate::assets::Assets::load(root).unwrap();
-        let biomes = crate::biome::Biomes::load(root).unwrap();
-        let terrain = super::super::VanillaTerrain::for_dimension(
-            &root.join("worldgen"),
-            assets.registry,
-            &biomes,
-            seed,
-            dimension,
+        let biomes = crate::biome::Biomes::load(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
         )
         .unwrap();
+        let item_data =
+            crate::test_resources::item_data(root, DataLoadOrigin::ServerDataLoad).unwrap();
+        let terrain_resources = crate::vanillagen::TerrainResources {
+            data: None,
+            dir: &root.join("worldgen"),
+            registry: assets.registry,
+            biomes: &biomes,
+            item_data: &item_data,
+        };
+        let terrain =
+            super::super::VanillaTerrain::for_dimension(terrain_resources, seed, dimension)
+                .unwrap();
         let mut worker = terrain.worker();
         let mut region: [Proto; 9] = std::array::from_fn(|i| {
             terrain.proto(&mut worker, x + i as i32 % 3 - 1, z + i as i32 / 3 - 1)
@@ -632,7 +813,16 @@ mod tests {
     #[test]
     fn load_behind_without_resources_has_no_data() {
         let dir = std::env::temp_dir().join("horizon-structure-mobs-none");
-        let finalizer = StructureMobFinalizer::new(dir, "minecraft:overworld");
+        // The item data is a separate load from the (absent) structure resources.
+        let items = std::env::temp_dir().join("horizon-structure-mobs-items");
+        std::fs::create_dir_all(&items).unwrap();
+        std::fs::write(items.join("items.json"), "{}").unwrap();
+        let item_data = crate::test_resources::item_data(
+            &items,
+            horizon_world::native_load_context::DataLoadOrigin::ServerDataLoad,
+        )
+        .unwrap();
+        let finalizer = StructureMobFinalizer::new(dir, "minecraft:overworld", item_data);
         finalizer.load_behind();
         // The thread has to fill the cell on its own, before anyone asks.
         for _ in 0..1000 {

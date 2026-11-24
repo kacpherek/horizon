@@ -49,7 +49,9 @@ words_file = ""         # your own list, relative to the server's folder; "": th
 log = "logs/chat-filter.log"
 ```
 
-horizon-server checks the section before every start, and the game reads it from the same file.
+horizon-server checks the section before every start, and the game reads it from the same file. A start
+refuses `window_minutes` 0, and a `mute_minutes` or `tempban_hours` of 0 while its threshold is set: a
+punishment that lasts no time would lift itself as it is given.
 
 ## The list
 
@@ -66,4 +68,4 @@ in an entry must be doubled in the text, so Niger and Nigeria pass, and so do "s
 Keep the list to slurs: insults that aren't slurs are the moderators' to handle.
 
 Code: `crates/horizon-chat-filter` (settings, matcher, escalation, mutes), `lan/hub/chat_filter.rs` (the
-check before the server relays a text), `game/chat_filter.rs` (log, events, bans, the mute commands).
+check before the server relays a text), `game/interface/chat_filter.rs` (log, events, bans, the mute commands).

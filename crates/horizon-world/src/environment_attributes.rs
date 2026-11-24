@@ -295,7 +295,34 @@ fn channels(color: i32) -> [f32; 4] {
     [byte(16), byte(8), byte(0), byte(24)]
 }
 
+/// The attributes clients are not sent (the ones registered without `syncable()`).
+const NOT_SYNCED: [&str; 18] = [
+    "gameplay/can_start_raid",
+    "gameplay/bed_rule",
+    "gameplay/straw_bed_rule",
+    "gameplay/respawn_anchor_works",
+    "gameplay/nether_portal_spawns_piglin",
+    "gameplay/increased_fire_burnout",
+    "gameplay/eyeblossom_open",
+    "gameplay/turtle_egg_hatch_chance",
+    "gameplay/snow_golem_melts",
+    "gameplay/surface_slime_spawn_chance",
+    "gameplay/cat_waking_up_gift_chance",
+    "gameplay/bees_stay_in_hive",
+    "gameplay/monsters_burn",
+    "gameplay/can_pillager_patrol_spawn",
+    "gameplay/natural_mob_spawns",
+    "gameplay/creature_world_gen_spawn_probability",
+    "gameplay/villager_activity",
+    "gameplay/baby_villager_activity",
+];
+
 impl Attribute {
+    /// `EnvironmentAttribute.isSyncable`: whether clients are sent it
+    /// (`EnvironmentAttributeMap.NETWORK_CODEC`).
+    pub fn synced(&self) -> bool {
+        !NOT_SYNCED.contains(&self.id)
+    }
     /// `EnvironmentAttribute.defaultValue`; `None` for the types not ported yet.
     pub fn default_value(&self) -> Option<Value> {
         Some(match self.default {
@@ -353,9 +380,15 @@ fn boolean(json: &Json) -> Result<bool, String> {
 /// decimal text to a float once; this rounds through a double, which differs only for decimals
 /// a hair from a float midpoint.)
 fn float(json: &Json) -> Result<f32, String> {
-    json.as_f64()
+    let value = json
+        .as_f64()
         .map(|f| f as f32)
-        .ok_or_else(|| format!("not a number: {json}"))
+        .ok_or_else(|| format!("not a number: {json}"))?;
+    // A server's or a pack's `1e300` would be an infinite attribute for `Range::Any` ones.
+    if !value.is_finite() {
+        return Err(format!("{json} is not a finite float"));
+    }
+    Ok(value)
 }
 
 /// `Codec.INT` of a JSON number (`Number.intValue`: truncated).
@@ -875,5 +908,18 @@ impl Attribute {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod finite_tests {
+    use super::AttributeMap;
+    use serde_json::json;
+
+    #[test]
+    fn a_float_that_overflows_is_refused() {
+        let refused = AttributeMap::parse(&json!({"minecraft:visual/cloud_height": 1e300}));
+        assert!(refused.unwrap_err().contains("not a finite float"));
+        assert!(AttributeMap::parse(&json!({"minecraft:visual/cloud_height": 192.5})).is_ok());
     }
 }

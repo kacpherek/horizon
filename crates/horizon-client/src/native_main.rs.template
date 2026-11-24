@@ -1,0 +1,17 @@
+//! Fixed prebuilt entry point shared by both native mod routes.
+#![forbid(unsafe_code)]
+#[used]
+static HOLDER_CAPABILITY: [u8; horizon_mod_package::holder::CAPABILITY.len()] =
+    horizon_mod_package::holder::CAPABILITY;
+#[used]
+static GAME_IDENTITY: [u8; horizon_mod_package::game_identity::MARK.len()] =
+    horizon_mod_package::game_identity::MARK;
+fn main() {
+    std::hint::black_box(&HOLDER_CAPABILITY);
+    std::hint::black_box(&GAME_IDENTITY);
+    // A client SDK's executable is the official game (docs/layers.md, "What players get"); the
+    // SDK build sets the cfg (tools/prebuilt_game.py `api_route`).
+    #[cfg(horizon_official)]
+    horizon_official::register();
+    horizon_mod_host::main();
+}

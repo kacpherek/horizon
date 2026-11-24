@@ -1,12 +1,27 @@
-//! Tooltip display visibility oracle companion for tools/test_tooltip_display_parity.py.
-use horizon_client::{item_tooltip::TooltipDisplay, items::ItemStack};
-use horizon_world::nbt::Tag;
+//! Tooltip display oracle companion for tools/test_tooltip_display_parity.py.
+use horizon_client::{
+    item_tooltip::{jukebox_line, tooltip_display},
+    items::{ItemInfo, ItemStack},
+};
+use horizon_core::nbt::Tag;
 use std::{error::Error, fmt::Write};
 
 pub fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = crate::args().collect();
     let mut output = String::new();
+    let disc = ItemInfo {
+        jukebox_song: Some("minecraft:13".into()),
+        ..ItemInfo::default()
+    };
     for line in std::fs::read_to_string(&args[1])?.lines() {
+        if let Some(snbt) = line.strip_prefix("jukebox\t") {
+            let stack =
+                horizon_client::item_data::parse_stack(snbt)?.ok_or("empty jukebox test stack")?;
+            let display = tooltip_display(&stack);
+            let song = jukebox_line(&stack, Some(&disc), &display, &|_| None);
+            writeln!(output, "jukebox\t{}", song.as_deref().unwrap_or_default())?;
+            continue;
+        }
         if let Some(name) = line.strip_prefix("name\t") {
             let components = horizon_client::item_data::command_components(&format!(
                 "[minecraft:custom_name={name}]"
@@ -18,7 +33,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
             };
             let text = horizon_client::item_tooltip::styled_name(&stack, || "unused".into());
             output.push_str("name\t");
-            for span in text.spans {
+            for span in &text.spans {
                 for c in span.text.chars() {
                     let style = &span.style;
                     write!(
@@ -57,7 +72,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
                 .data_mut()
                 .set_other("minecraft:tooltip_display", Some(Tag::compound(component)));
         }
-        let display = TooltipDisplay::for_stack(&stack);
+        let display = tooltip_display(&stack);
         writeln!(
             output,
             "{}\t{}",

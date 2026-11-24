@@ -259,19 +259,32 @@ impl Fixture {
         size: [u32; 2],
         terrain: &mut TerrainDraw<'_>,
     ) -> Vec<[u8; 4]> {
+        self.frame(post, size, size, terrain)
+            .expect("the frame is drawn")
+    }
+
+    /// One frame at `size` in a window of `window` pixels: the window's picture, or `None`
+    /// where the pack gave the frame up.
+    pub(super) fn frame(
+        &self,
+        post: &mut PackPost,
+        size: [u32; 2],
+        window: [u32; 2],
+        terrain: &mut TerrainDraw<'_>,
+    ) -> Option<Vec<[u8; 4]>> {
         let world = self.texture(size, T::Rgba8Unorm);
         let depth = self.texture(size, T::Depth32Float);
-        let screen = self.texture(size, T::Rgba8Unorm);
+        let screen = self.texture(window, T::Rgba8Unorm);
         let stride = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let read = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: u64::from(stride * size[1]),
+            size: u64::from(stride * window[1]),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let hud = HudBatch::new(size);
+        let hud = HudBatch::scratch(size);
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        post.run(
+        let drawn = post.run(
             &self.device,
             &self.queue,
             &mut encoder,
@@ -281,10 +294,13 @@ impl Fixture {
             &fixture_frame(&hud),
             &Default::default(),
             size,
-            size,
+            window,
             &[],
             terrain,
         );
+        if !drawn {
+            return None;
+        }
         encoder.copy_texture_to_buffer(
             screen.texture().as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -301,23 +317,26 @@ impl Fixture {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
-        read.slice(..)
+        let pixels = read
+            .slice(..)
             .get_mapped_range()
             .unwrap()
             .chunks_exact(stride as usize)
             .flat_map(|row| {
-                row[..size[0] as usize * 4]
+                row[..window[0] as usize * 4]
                     .as_chunks::<4>()
                     .0
                     .iter()
                     .copied()
             })
-            .collect()
+            .collect();
+        Some(pixels)
     }
 }
 
 #[test]
 fn partial_writes_retain_the_alternate_with_flip_scale_and_mrt_controls() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = Fixture::new() else { return };
     let mut failures = Vec::new();
     for (coverage, mrt, keep_main, shadow) in [
@@ -375,6 +394,7 @@ fn partial_writes_retain_the_alternate_with_flip_scale_and_mrt_controls() {
 
 #[test]
 fn frame_clear_and_retained_history_apply_before_partial_post_writes() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = Fixture::new() else { return };
     for clear in [true, false] {
         let mut post = gpu.build(pack(Coverage::Full, false, false, Some(clear), false));
@@ -428,6 +448,7 @@ fn fixture_frame(hud: &HudBatch) -> Frame<'_> {
         underwater: false,
         cave_culling: false,
         title: true,
+        gui_only: false,
         sky_blocked: false,
         skybox: false,
         end_sky: false,
@@ -498,6 +519,7 @@ mod clear_budget_tests;
 /// pack of our own with these three programs reads 0 there, not the previous frame's 0.25).
 #[test]
 fn a_cleared_buffer_starts_every_frame_cleared_on_both_textures() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = Fixture::new() else { return };
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let mut add = |name: &str, source: &str| {

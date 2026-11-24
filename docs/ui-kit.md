@@ -21,7 +21,7 @@ The kit grows a piece at a time, each with something on screen that needs it:
 | `hud_kit::icon` | `Icon`: a sprite, an item, a glyph or the player's face, through an `IconPainter` |
 | `hud_kit::tabs` | `collapsed`: a page list in one row, `‹ Name ›` with a pip per page; `tab_strip`: a row of tabs that falls back to it |
 | `pad_glyph`, with `GlyphOf` and `MenuJob` in `gamepad.rs` | `Glyph`: a controller button, asked for by what it does, in the player's `Glyphs` |
-| `hud_kit::fit` | `ellipsize`, `wrap`, `chord` and `fit_in_circle`: text cut or wrapped to the room it has |
+| `hud_kit::fit` | `ellipsize`, `clip_text` (vanilla's `clipText`), `wrap`, `chord` and `fit_in_circle`: text cut or wrapped to the room it has |
 | `hud_kit::hint` | `HintRow`: glyphs and what they do, "(A) Jump", measured, fitted and drawn one way |
 | `settings_shell` | `Shell`: a searchable settings screen (Extras, Graphics, Controller Settings, Shaders) a `Screen` describes; it draws and drives it, binding rows included |
 
@@ -392,6 +392,34 @@ Each overlay's captions now fit their room:
   `game/split/hud.rs` tests fit a prompt's answers to a narrow view.
 
 ## The settings shell
+
+### Its look
+
+The shell paints through `graphics_style`, which follows the menu style the layer above gives
+(`menu_style::install`). Its `surfaces` picks one of two looks, with the same layout:
+
+- `Surfaces::Flat`: see-through glass panels and flat controls in the style's colours. The official game
+  gives this with Horizon's Blocks palette (`horizon_look.rs`).
+- `Surfaces::Vanilla`: what vanilla's Options screens draw, from the player's resource packs. Panels are
+  the list background between its header and footer separators, and the open page is a selection
+  list's entry (a grey edge round black, white with the focus). Controls are the `widget/*` sprites: a
+  value a press steps through is a `CycleButton`-style button, and sliders always show their track.
+  A row the cursor or the focus is on gets the grey edge, and its control lights. `NEUTRAL`, the look
+  with no style given, uses it, so the engine built alone looks vanilla.
+
+Two of vanilla's pieces draw in any look, for overlays that use them: `graphics_style::vanilla_tab`
+(a Create World tab, `MenuTabBar.MenuTabButton`) and `ui::tooltip_panel` (a tooltip's background and
+frame round any content).
+
+The radial menu follows the same switch (`graphics_style::vanilla_surfaces()`). On vanilla's surfaces
+every slot is an advancement task frame with its item: the picked one in the obtained (gold) frame under
+a container's hover glow, one that can't run dimmed, an empty one faded. The hub is a tooltip with one
+short line (the item's name), the pages are Create World's tabs, and there are no
+state chips. A view too tight for the frames takes vanilla's 18 px inventory slots before the HUD's rows
+are covered (`radial_overlay/vanilla.rs`).
+
+`HORIZON_MENU_STYLE=vanilla` starts the official game with no style given, so it draws in `NEUTRAL`.
+Use it to see and test the vanilla look; `pad_menu_e2e.py` passes the variable on to the game.
 
 ### Moving a screen onto the shell
 

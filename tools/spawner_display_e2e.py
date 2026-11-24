@@ -33,9 +33,9 @@ def changed_pixels(first, second):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--game", type=Path, default=ROOT / "target/fast/horizon-client")
-    parser.add_argument("--ctl", type=Path, default=ROOT / "target/fast/horizon-ctl")
-    parser.add_argument("--resources", type=Path, default=ROOT / ".local/horizon-client/26.3")
+    parser.add_argument("--game", type=Path, default=lab.binary(ROOT / "target/fast", "horizon-client"))
+    parser.add_argument("--ctl", type=Path, default=lab.binary(ROOT / "target/fast", "horizon-ctl"))
+    parser.add_argument("--resources", type=Path, default=lab.RESOURCES)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     output = (args.output or Path(tempfile.mkdtemp(prefix="spawner-display-"))).resolve()
@@ -45,7 +45,7 @@ def main():
     for key in ("HORIZON_HOME", "HORIZON_LAUNCHER_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"):
         homes[key] = work / key
         homes[key].mkdir()
-    env = lab.game_env(**homes, HORIZON_TELEMETRY_URL="off")
+    env = lab.game_env(**homes)
     socket = work / "ctl.sock"
 
     def ctl(*words, timeout=60):

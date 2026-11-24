@@ -30,6 +30,9 @@
 //! The float arithmetic follows vanilla and JOML's default (non-FMA,
 //! non-fast-math) code paths operation by operation.
 use horizon_core::geometry::trig;
+pub use mod_api::client::camera::{
+    CameraEntity, CameraType, FovPlayer, LivingCamera, UseItem, lerp, wrap_degrees,
+};
 
 /// `(float) Math.PI`.
 const PI: f32 = std::f32::consts::PI;
@@ -60,24 +63,9 @@ pub fn java_max(a: f32, b: f32) -> f32 {
         b
     }
 }
-/// `Mth.lerp(float, float, float)`.
-pub fn lerp(alpha: f32, p0: f32, p1: f32) -> f32 {
-    p0 + alpha * (p1 - p0)
-}
 /// `Mth.lerp(double, double, double)`.
 pub fn lerp_d(alpha: f64, p0: f64, p1: f64) -> f64 {
     p0 + alpha * (p1 - p0)
-}
-/// `Mth.wrapDegrees(float)`.
-pub fn wrap_degrees(angle: f32) -> f32 {
-    let mut normalized = angle % 360.0;
-    if normalized >= 180.0 {
-        normalized -= 360.0;
-    }
-    if normalized < -180.0 {
-        normalized += 360.0;
-    }
-    normalized
 }
 /// `Mth.clamp(float, float, float)`.
 pub fn clamp(value: f32, min: f32, max: f32) -> f32 {
@@ -488,54 +476,67 @@ pub fn view_rotation_matrix(yaw: f32, pitch: f32) -> (glam::Mat4, glam::Mat4) {
 }
 
 /// Camera-relative world view used by terrain, sky and the first-person hand.
+#[horizon_mod_api_macros::replaceable]
 pub fn view_matrix(yaw: f32, pitch: f32) -> glam::Mat4 {
     // Vanilla uses the conjugate of Camera.rotation, not a world-up look-at.
     let q = Quat::rotation_yxz(PI - yaw * DEG_TO_RAD, -pitch * DEG_TO_RAD, 0.0);
     glam::Mat4::from_quat(glam::Quat::from_xyzw(-q.x, -q.y, -q.z, q.w))
 }
 
-/// `CameraType`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CameraType {
-    #[default]
-    FirstPerson,
-    ThirdPersonBack,
-    ThirdPersonFront,
-}
-impl CameraType {
-    pub fn is_first_person(self) -> bool {
-        self == Self::FirstPerson
+/// `GameRenderer.projectPointToScreen`: world point `at` seen from a camera at `position` facing
+/// `yaw`/`pitch`, rolled `roll` degrees (`view_roll`), through column-major `projection` (the
+/// frame's reversed-Z perspective), as normalised device x and y (-1 to 1 across the screen) and
+/// depth z. The view is the camera's rotation only, without bob or spin, as vanilla's. None for a point at or behind the camera and
+/// for a non-finite `at`, where vanilla returns a mirrored or NaN point.
+pub fn project_point(
+    projection: &[f32; 16],
+    position: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    roll: f32,
+    at: [f64; 3],
+) -> Option<[f32; 3]> {
+    if !at.iter().all(|v| v.is_finite()) {
+        return None;
     }
-    pub fn is_mirrored(self) -> bool {
-        self == Self::ThirdPersonFront
+    // Vanilla subtracts in doubles, then transforms the offset as floats.
+    let offset = glam::Vec3::new(
+        (at[0] - position[0]) as f32,
+        (at[1] - position[1]) as f32,
+        (at[2] - position[2]) as f32,
+    );
+    let view = if roll == 0.0 {
+        view_matrix(yaw, pitch)
+    } else {
+        view_roll(roll) * view_matrix(yaw, pitch)
+    };
+    let clip = glam::Mat4::from_cols_array(projection) * view * offset.extend(1.0);
+    if clip.w.is_nan() || clip.w <= 0.0 {
+        return None;
     }
-    /// `CameraType.cycle` (F5).
-    pub fn cycle(self) -> Self {
-        match self {
-            Self::FirstPerson => Self::ThirdPersonBack,
-            Self::ThirdPersonBack => Self::ThirdPersonFront,
-            Self::ThirdPersonFront => Self::FirstPerson,
-        }
-    }
+    let ndc = [clip.x / clip.w, clip.y / clip.w, clip.z / clip.w];
+    ndc.iter().all(|v| v.is_finite()).then_some(ndc)
 }
 
-/// What `AbstractClientPlayer.getFieldOfViewModifier` reads.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FovPlayer {
-    /// `Abilities.flying`.
-    pub flying: bool,
-    /// `Abilities.getWalkingSpeed()`.
-    pub walking_speed: f32,
-    /// `getAttributeValue(MOVEMENT_SPEED)`.
-    pub movement_speed: f64,
-    /// The item in use and its use ticks, when using one.
-    pub using: Option<(UseItem, i32)>,
+/// `view_matrix` with a roll about the view direction, in degrees.
+pub fn view_matrix_rolled(yaw: f32, pitch: f32, roll: f32) -> glam::Mat4 {
+    let q = Quat::rotation_yxz(
+        PI - yaw * DEG_TO_RAD,
+        -pitch * DEG_TO_RAD,
+        -roll * DEG_TO_RAD,
+    );
+    glam::Mat4::from_quat(glam::Quat::from_xyzw(-q.x, -q.y, -q.z, q.w))
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UseItem {
-    Bow,
-    Spyglass,
-    Other,
+
+/// The roll `view_matrix_rolled` adds, as a turn in front of the unrolled view:
+/// `view_roll(roll) * view_matrix(yaw, pitch)` is `view_matrix_rolled(yaw, pitch, roll)`, so it
+/// can sit in a frame's pose (beside the bob and the nausea spin) and reach everything that
+/// reads that pose. Identity at 0.
+pub fn view_roll(roll: f32) -> glam::Mat4 {
+    if roll == 0.0 {
+        return glam::Mat4::IDENTITY;
+    }
+    glam::Mat4::from_rotation_z(roll * DEG_TO_RAD)
 }
 /// `AbstractClientPlayer.getFieldOfViewModifier(firstPerson, effectScale)`.
 pub fn field_of_view_modifier(p: &FovPlayer, first_person: bool, effect_scale: f32) -> f32 {
@@ -560,52 +561,6 @@ pub fn field_of_view_modifier(p: &FovPlayer, first_person: bool, effect_scale: f
         }
     }
     lerp(effect_scale, 1.0, modifier)
-}
-
-/// The camera entity as `Camera.alignWithEntity` and the field-of-view
-/// death and hurt effects see it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CameraEntity {
-    pub position: [f64; 3],
-    /// `xo`, `yo`, `zo`.
-    pub previous: [f64; 3],
-    pub x_rot: f32,
-    pub y_rot: f32,
-    pub x_rot_o: f32,
-    pub y_rot_o: f32,
-    /// `Entity.getEyeHeight()`.
-    pub eye_height: f32,
-    /// A living entity's `getScale()` and camera distance attribute.
-    pub living: Option<LivingCamera>,
-    /// The vehicle's scale and camera distance when it is living.
-    pub mount: Option<(f32, f64)>,
-}
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LivingCamera {
-    pub scale: f32,
-    pub camera_distance: f64,
-    /// `isSleeping()` with `getBedOrientation()` as its `toYRot()`.
-    pub sleeping: Option<Option<f32>>,
-    /// `isDeadOrDying()` and `deathTime`.
-    pub dead: Option<i32>,
-}
-impl CameraEntity {
-    /// `Entity.getXRot(partialTicks)`.
-    pub fn view_x_rot(&self, partial: f32) -> f32 {
-        if partial == 1.0 {
-            self.x_rot
-        } else {
-            lerp(partial, self.x_rot_o, self.x_rot)
-        }
-    }
-    /// `LocalPlayer.getViewYRot` (`getYRot(partialTicks)`, a `Mth.rotLerp`).
-    pub fn view_y_rot(&self, partial: f32) -> f32 {
-        if partial == 1.0 {
-            self.y_rot
-        } else {
-            self.y_rot_o + partial * wrap_degrees(self.y_rot - self.y_rot_o)
-        }
-    }
 }
 
 /// The fluid `Camera.getFluidInCamera` reports, as the field of view sees it.
@@ -1124,6 +1079,69 @@ pub fn spinning_effect_matrix(intensity: f32, angle_degrees: f32) -> glam::Mat4 
 
 #[cfg(test)]
 mod tests {
+    /// A roll in front of the view is `view_matrix_rolled`'s (NeoForge's `Camera.setRotation`
+    /// roll), and at 0 leaves the view as it was.
+    #[test]
+    fn a_view_roll_in_front_of_the_view_is_the_rolled_view() {
+        assert_eq!(super::view_roll(0.0), glam::Mat4::IDENTITY);
+        assert_eq!(
+            super::view_roll(0.0) * super::view_matrix(37.0, -21.0),
+            super::view_matrix(37.0, -21.0)
+        );
+        for (yaw, pitch, roll) in [
+            (0.0, 0.0, 90.0),
+            (37.0, -21.0, 22.5),
+            (-137.25, 61.5, -45.0),
+            (359.9, -90.0, 180.0),
+        ] {
+            let posed = super::view_roll(roll) * super::view_matrix(yaw, pitch);
+            let rolled = super::view_matrix_rolled(yaw, pitch, roll);
+            assert!(
+                (posed.to_cols_array().iter())
+                    .zip(rolled.to_cols_array())
+                    .all(|(a, b)| (a - b).abs() < 1e-5),
+                "yaw {yaw} pitch {pitch} roll {roll}: {posed} vs {rolled}"
+            );
+        }
+        // 90 puts the world's up at the screen's left, on the projected screen too.
+        let up = super::view_roll(90.0) * super::view_matrix(0.0, 0.0) * glam::Vec4::Y;
+        assert!(up.x < -0.99 && up.y.abs() < 1e-6, "{up}");
+        let projection =
+            glam::Mat4::perspective_rh(70f32.to_radians(), 16.0 / 9.0, 512.0, 0.05).to_cols_array();
+        let above = super::project_point(&projection, [0.0; 3], 0.0, 0.0, 90.0, [0.0, 1.0, 10.0]);
+        let [x, y, _] = above.unwrap();
+        assert!(x < -0.05 && y.abs() < 1e-5, "{above:?}");
+    }
+
+    /// A synthetic camera at (0, 64, 0) facing south (yaw 0, +Z), 70° FOV, 16:9, near 0.05, far
+    /// 512, reversed Z as the game builds it.
+    fn project(at: [f64; 3]) -> Option<[f32; 3]> {
+        let projection =
+            glam::Mat4::perspective_rh(70f32.to_radians(), 16.0 / 9.0, 512.0, 0.05).to_cols_array();
+        super::project_point(&projection, [0.0, 64.0, 0.0], 0.0, 0.0, 0.0, at)
+    }
+
+    #[test]
+    fn projected_points_ahead_land_on_screen_and_behind_or_nan_are_none() {
+        let ahead = project([0.0, 64.0, 10.0]).unwrap();
+        assert!(ahead[0].abs() < 1e-6 && ahead[1].abs() < 1e-6, "{ahead:?}");
+        // Reversed Z: depth near / distance, 0.05 / 10.
+        assert!((ahead[2] - 0.005).abs() < 1e-4, "{ahead:?}");
+        // Up and to the camera's right (west, -X, when facing south) at the edge of the view.
+        let corner = (35f64.to_radians()).tan() * 10.0;
+        let edge = project([-corner * 16.0 / 9.0, 64.0 + corner, 10.0]).unwrap();
+        assert!(
+            (edge[0] - 1.0).abs() < 1e-4 && (edge[1] - 1.0).abs() < 1e-4,
+            "{edge:?}"
+        );
+        let near = project([0.0, 64.0, 0.05]).unwrap();
+        assert!((near[2] - 1.0).abs() < 1e-5, "{near:?}");
+        assert_eq!(project([f64::MAX, 64.0, 10.0]), None);
+        assert_eq!(project([0.0, 64.0, -10.0]), None);
+        assert_eq!(project([0.0, 64.0, 0.0]), None);
+        assert_eq!(project([f64::NAN, 64.0, 10.0]), None);
+        assert_eq!(project([0.0, f64::INFINITY, 10.0]), None);
+    }
     #[test]
     fn near_plane_bounds_sit_half_a_near_distance_ahead_of_the_eye() {
         // Facing +Z (yaw 0): the zero-to-one culling projection puts NDC

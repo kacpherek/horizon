@@ -40,7 +40,8 @@ def clients(build):
     return ['java','-Xmx2g','-Duser.timezone=UTC','-cp',cp,'net.minecraft.server.Main','nogui'],['java','-Xmx1g','-cp',str(classes)+os.pathsep+cp,'dev.horizonlab.parity.LocatorBarClient']
 
 def generate(java,build):
-    directory=build/'generate';net.server_dir(directory);server=net.Server(java,directory,'generate')
+    # No clients connect during generation: let the server bind an OS-assigned port without a probe/bind race.
+    directory=build/'generate';net.server_dir(directory,port=0);server=net.Server(java,directory,'generate')
     try:
         server.wait_for(r'Done \(');c=Commands(server,build/'generate-commands.json')
         for text in ['tick freeze','gamerule spawn_mobs false','gamerule advance_time false','gamerule respawn_radius 0','forceload add 0 0 15 15','fill 0 199 0 15 199 15 stone','fill 0 200 0 15 203 15 air','setworldspawn 4 200 4','save-all flush']:c.reply(text)
@@ -144,7 +145,7 @@ def side(name,binary,build):
     java,client=clients(build)
     if name=='java':
         generate(java,build);f=run('java',java,client,build);admit(f);(build/'reference.json').write_text(json.dumps(f,indent=2)+'\n');print('JAVA ADMITTED',len(f));return 0
-    f=run('native',[str(Path(binary).resolve()),'--resources',str(net.lab.LOCAL/'horizon-client/26.3'),'--dedicated','--nogui'],client,build)
+    f=run('native',[str(Path(binary).resolve()),'--resources',str(net.lab.RESOURCES),'--dedicated','--nogui'],client,build)
     ref=json.loads((build/'reference.json').read_text());diff={k:{'java':v,'native':f.get(k)} for k,v in ref.items() if f.get(k)!=v};report={'facts':len(ref),'matched':len(ref)-len(diff),'differences':diff,'reference_sha256':hashlib.sha256((build/'reference.json').read_bytes()).hexdigest()};(build/'strict-report.json').write_text(json.dumps(report,indent=2)+'\n');print('NATIVE',report['matched'],'/',report['facts'],list(diff));return int(bool(diff))
 
 def main():

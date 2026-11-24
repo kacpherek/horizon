@@ -44,16 +44,24 @@ pub struct Pack {
     pub title: String,
     /// `pack.mcmeta`'s description as plain text; a shader pack's format.
     pub description: String,
-    /// `pack.png`, a resource pack's picture.
+    /// `pack.png`, a resource pack's picture, as PNG made small ([`crate::pictures::list_picture`]).
     pub icon: Option<Vec<u8>>,
     pub enabled: bool,
+    /// Why the game can't run it: a Horizon shader pack made for another shader API.
+    pub unsupported: Option<String>,
 }
 
 fn shader_key(path: &Path) -> Option<String> {
     if !horizon_shader_api::package::is_pack(path) {
         return None;
     }
-    let manifest = horizon_shader_api::Pack::read_manifest(path).ok()?;
+    let manifest = if path.is_dir() {
+        horizon_shader_api::Pack::read_manifest(path)
+    } else {
+        let mut zip = horizon_port_pack::zip_intake::open(fs::File::open(path).ok()?).ok()?;
+        horizon_shader_api::Pack::read_zip_manifest(&mut zip)
+    }
+    .ok()?;
     Some(format!("horizon:{}", manifest.id))
 }
 
@@ -112,12 +120,13 @@ fn migrate_shader_values(home: &Path, pack: &Path, key: &str) -> std::io::Result
 /// The packs of `kind` in the game folder `home`, by name: turning one on or off leaves it where
 /// it is.
 pub fn list(home: &Path, kind: Kind) -> Vec<Pack> {
+    let _game = crate::game_shader_api::for_home(home);
     let on = enabled(home, kind);
     let mut packs: Vec<Pack> = fs::read_dir(home.join(kind.folder()))
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|e| read(&e.path(), kind, &on))
+        .filter_map(|e| read(&e.path(), kind, &on, true))
         .collect();
     packs.sort_by(|a, b| a.file.cmp(&b.file));
     let mut keys = std::collections::HashSet::new();
@@ -172,13 +181,16 @@ fn enabled(home: &Path, kind: Kind) -> Vec<String> {
     }
 }
 
-fn read(path: &Path, kind: Kind, on: &[String]) -> Option<Pack> {
+/// The pack at `path`; its picture made only when `picture` is set (a list draws it, an add
+/// doesn't, and decoding one is slow).
+fn read(path: &Path, kind: Kind, on: &[String], picture: bool) -> Option<Pack> {
     let file = path.file_name()?.to_str()?.to_string();
     if file.starts_with('.') {
         return None;
     }
     let ext =
         |x: &str| path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case(x));
+    let mut unsupported = None;
     let (title, description, icon) = match kind {
         Kind::Resource => {
             let meta = entry(path, "pack.mcmeta")?;
@@ -186,13 +198,27 @@ fn read(path: &Path, kind: Kind, on: &[String]) -> Option<Pack> {
             (
                 file.clone(),
                 plain(&meta["pack"]["description"]),
-                entry(path, "pack.png"),
+                picture
+                    .then(|| entry(path, "pack.png"))
+                    .flatten()
+                    .and_then(crate::pictures::list_picture),
             )
         }
         Kind::Shader if path.join(SHADER_MANIFEST).is_file() || ext(SHADER_PACKAGE) => {
-            let name = entry(path, SHADER_MANIFEST)
-                .and_then(|t| toml::from_slice::<toml::Table>(&t).ok())
+            let manifest =
+                entry(path, SHADER_MANIFEST).and_then(|t| toml::from_slice::<toml::Table>(&t).ok());
+            let name = manifest
+                .as_ref()
                 .and_then(|t| t.get("name")?.as_str().map(str::to_string));
+            unsupported = manifest
+                .as_ref()
+                .and_then(|t| t.get("api")?.as_str())
+                .filter(|api| {
+                    !crate::game_shader_api::served()
+                        .iter()
+                        .any(|line| line == api)
+                })
+                .map(crate::browser::horizon::made_for_other_shader_api);
             (
                 name.unwrap_or_else(|| file.clone()),
                 "Horizon shader pack".into(),
@@ -213,6 +239,7 @@ fn read(path: &Path, kind: Kind, on: &[String]) -> Option<Pack> {
         title,
         description,
         icon,
+        unsupported,
     })
 }
 
@@ -226,7 +253,7 @@ pub(crate) fn entry(path: &Path, name: &str) -> Option<Vec<u8>> {
             .read_to_end(&mut out)
             .ok()?;
     } else {
-        let mut zip = zip::ZipArchive::new(fs::File::open(path).ok()?).ok()?;
+        let mut zip = horizon_port_pack::zip_intake::open(fs::File::open(path).ok()?).ok()?;
         let entry = zip.by_name(name).ok()?;
         entry.take(4 << 20).read_to_end(&mut out).ok()?;
     }
@@ -380,19 +407,19 @@ pub fn kind_of(file: &Path) -> Result<Kind, String> {
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase());
     match ext.as_deref() {
-        Some(SHADER_PACKAGE) => return Ok(Kind::Shader),
-        Some("zip") => {}
+        Some(SHADER_PACKAGE | "zip") => {}
         _ => {
             return Err(format!(
                 "{name} is not a pack: packs are .zip or .hshader files."
             ))
         }
     }
-    let zip = fs::File::open(file)
-        .ok()
-        .and_then(|f| zip::ZipArchive::new(f).ok())
-        .ok_or_else(|| format!("{name} is not a zip file that can be read."))?;
-    if zip.index_for_name("pack.mcmeta").is_some() {
+    let archive = fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let zip = horizon_port_pack::zip_intake::open(archive)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    if ext.as_deref() == Some(SHADER_PACKAGE) {
+        Ok(Kind::Shader)
+    } else if zip.index_for_name("pack.mcmeta").is_some() {
         Ok(Kind::Resource)
     } else if zip
         .file_names()
@@ -410,7 +437,7 @@ pub fn kind_of(file: &Path) -> Result<Kind, String> {
 }
 
 /// Copies a pack file into the right folder of `home`, under a name not taken yet. Returns it,
-/// turned off.
+/// turned off, without its picture: the list read after it makes that.
 pub fn add(home: &Path, file: &Path) -> Result<Pack, String> {
     let kind = kind_of(file)?;
     let dir = home.join(kind.folder());
@@ -432,7 +459,7 @@ pub fn add(home: &Path, file: &Path) -> Result<Pack, String> {
         .find(|p| !p.exists())
         .unwrap();
     fs::copy(file, &target).map_err(|e| format!("Could not copy {}: {e}", file.display()))?;
-    read(&target, kind, &[])
+    read(&target, kind, &[], false)
         .ok_or_else(|| format!("{} is not a pack the game reads", target.display()))
 }
 

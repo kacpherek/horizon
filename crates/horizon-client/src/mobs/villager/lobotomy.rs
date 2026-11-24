@@ -9,9 +9,8 @@
 //! farming, breeding, panic, POI searches), but keeps gravity, damage, despawn, trading and its XP,
 //! and `Villager.restock` on `WorkAtPoi`'s schedule (see [`skips_brain`]).
 use super::super::villager_brain;
-use super::super::{Mob, MobWorld};
+use super::super::{Mob, MobEvent, MobWorld};
 use horizon_core::geometry::Vec3;
-use horizon_core::random::LevelRandom;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -119,10 +118,10 @@ fn room_exceeds(m: &Mob, w: &MobWorld, cap: usize) -> bool {
 pub fn brain_tick(
     m: &mut Mob,
     w: &MobWorld,
-    lr: &mut LevelRandom,
+    lr: &mut crate::health::DamageLevel<'_>,
     events: &mut Vec<super::super::MobEvent>,
 ) {
-    if !skips_brain(m, w) {
+    if !skips_brain(m, w, events) {
         super::tick_brain(m, w, lr, events);
     }
 }
@@ -130,7 +129,7 @@ pub fn brain_tick(
 /// `WorkAtPoi.start`'s restock for a villager whose brain is off: the job site it remembers (the
 /// brain's memory, else what it was saved or loaded with), if it is still a workstation of its own
 /// profession (`PoiFilter::Held`) and within `WorkAtPoi`'s 1.73 blocks of the villager.
-fn restock_at_job_site(m: &mut Mob, w: &MobWorld) {
+fn restock_at_job_site(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     let site = match villager_brain::mem_ref(m) {
         Some(mem) => mem.job_site.value(),
         None => match super::ext(m).and_then(|e| e.saved_memories.as_deref()) {
@@ -139,18 +138,25 @@ fn restock_at_job_site(m: &mut Mob, w: &MobWorld) {
         },
     };
     let own_job_site = |p: [i32; 3]| {
-        matches!(villager_brain::poi_at(w, p[0], p[1], p[2]),
-            Some(villager_brain::Poi::Job(j)) if j == m.extra.variant2)
+        w.professions
+            .state_index(&m.extra.profession)
+            .is_some_and(|profession| {
+                profession != usize::from(super::NONE)
+                    && profession != usize::from(super::NITWIT)
+                    && villager_brain::poi_at(w, p[0], p[1], p[2]).is_some_and(|poi| {
+                        poi.is_job() && w.professions.accepts(profession, poi, true)
+                    })
+            })
             && villager_brain::closer_to_center(p, m.position, 1.73)
     };
     if site.is_some_and(own_job_site) {
-        villager_brain::restock_if_due(m, w);
+        villager_brain::restock_if_due(m, w, events);
     }
 }
 
 /// Whether this tick's brain is skipped. Rechecks the villager when its turn comes (its id staggers
 /// the turns), and restocks a stuck villager that has a job site on `WorkAtPoi`'s schedule.
-pub fn skips_brain(m: &mut Mob, w: &MobWorld) -> bool {
+pub fn skips_brain(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) -> bool {
     if !enabled() {
         // Off, or turned off: forget the state, so a later start rechecks at once.
         if let Some(e) = m.extra.villager.as_deref_mut() {
@@ -158,11 +164,11 @@ pub fn skips_brain(m: &mut Mob, w: &MobWorld) -> bool {
         }
         return false;
     }
-    step(m, w, i64::from(INTERVAL.load(Ordering::Relaxed)))
+    step(m, w, i64::from(INTERVAL.load(Ordering::Relaxed)), events)
 }
 
 /// `skips_brain` with the setting on, rechecking every `interval` ticks.
-fn step(m: &mut Mob, w: &MobWorld, interval: i64) -> bool {
+fn step(m: &mut Mob, w: &MobWorld, interval: i64, events: &mut Vec<MobEvent>) -> bool {
     let phase = (w.game_time + i64::from(m.id)) % interval == 0;
     let stuck = match super::ext(m).and_then(|e| e.lobotomized) {
         Some(stuck) if !phase => stuck,
@@ -177,7 +183,7 @@ fn step(m: &mut Mob, w: &MobWorld, interval: i64) -> bool {
         // (an adult's work hours) and with a job site that is still there, without the walk to it.
         let works = super::activity_at(m.is_baby(), w.day_time) == super::Activity::Work;
         if works {
-            restock_at_job_site(m, w);
+            restock_at_job_site(m, w, events);
         }
     }
     stuck

@@ -13,8 +13,9 @@ fn texel(x: u32, y: u32) -> [u8; 4] {
 }
 
 #[test]
-#[ignore = "requires a host GPU; missing adapter is a failure"]
+#[ignore = "daily"]
 fn a_pack_reads_paged_maps_at_the_colours_coordinates() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let instance = crate::gfx::test_gpu::instance();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -138,7 +139,7 @@ void main() {
     pass.paged = true;
     post.set_paged_maps([Some(map), None]);
     post.copied |= 1;
-    post.resize(&device, [8, 1]);
+    post.resize(&device, &queue, [8, 1]);
     let read = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 256,

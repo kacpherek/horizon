@@ -8,10 +8,10 @@
 use crate::{
     font::Font,
     hud_layout::{Blend, GuiDraw, WHITE},
-    java_text::float_to_string,
     scoreboard::{Comp, NumberFormat, Objective, RenderType, Scoreboard, comp_text},
     text::Text,
 };
+use horizon_core::java_number::float_to_string;
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -349,6 +349,34 @@ pub struct TabInputs<'a> {
     pub mark: &'a dyn Fn(u128) -> Option<NameMark>,
 }
 
+/// The vanilla width allotted to the ping icon, including padding.
+pub const LATENCY_WIDTH: i32 = 13;
+/// Largest latency column a mod may request, in GUI pixels.
+pub const MAX_LATENCY_WIDTH: i32 = 128;
+
+/// A typed paint insertion just before a listed player's stock ping sprite.
+pub struct LatencySlot<'a> {
+    pub sprite_at: usize,
+    pub player: &'a TabPlayer,
+    /// Left, top, exclusive right and exclusive bottom in GUI pixels.
+    pub bounds: [i32; 4],
+}
+
+#[derive(Clone, Copy)]
+enum Insertion {
+    Hearts {
+        y: i32,
+        left: i32,
+        right: i32,
+        id: u128,
+        score: i32,
+    },
+    Latency {
+        player: usize,
+        bounds: [i32; 4],
+    },
+}
+
 /// A mark drawn after a player's head in the tab list: filled rectangles `(x, y, width, height,
 /// ARGB)` in an 8x8 box. Once any listed player has one, every row gets the column, so the names
 /// stay aligned.
@@ -373,9 +401,10 @@ struct LayoutCache {
     footer: Option<Text>,
     language: Option<std::sync::Arc<crate::lang::Language>>,
     dimensions: (i32, bool, u32, u64),
-    flags: Vec<(bool, Option<NameMark>)>,
+    latency: (i32, bool),
+    flags: Vec<bool>,
     draws: Vec<GuiDraw>,
-    hearts: Vec<(usize, i32, i32, i32, u128, i32)>,
+    insertions: Vec<(usize, Insertion)>,
 }
 impl std::fmt::Debug for LayoutCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -427,13 +456,25 @@ impl TabList {
     }
     /// `extractRenderState`: retain text, measurements and geometry, not animated hearts.
     pub fn layout(&mut self, i: &TabInputs, font: &Font) -> Vec<GuiDraw> {
+        self.layout_with_latency(i, font, LATENCY_WIDTH, None)
+    }
+
+    /// Lay out a custom-width latency column. Collect paint insertions only when
+    /// requested, so the stock path still emits only its ordinary drawing commands.
+    pub fn layout_with_latency<'a>(
+        &mut self,
+        i: &TabInputs<'a>,
+        font: &Font,
+        latency_width: i32,
+        mut slots: Option<&mut Vec<LatencySlot<'a>>>,
+    ) -> Vec<GuiDraw> {
+        let latency = (
+            latency_width.clamp(LATENCY_WIDTH, MAX_LATENCY_WIDTH),
+            slots.is_some(),
+        );
         let language = crate::lang::current();
         let dimensions = (i.screen_width, i.online_mode, i.background, font.epoch());
-        let flags: Vec<_> = i
-            .players
-            .iter()
-            .map(|p| ((i.upside_down)(p.uuid), (i.mark)(p.uuid)))
-            .collect();
+        let flags: Vec<_> = i.players.iter().map(|p| (i.upside_down)(p.uuid)).collect();
         let valid = self.cache.as_ref().is_some_and(|c| {
             c.players == i.players
                 && c.board == *i.board
@@ -441,6 +482,7 @@ impl TabList {
                 && c.header == self.header
                 && c.footer == self.footer
                 && c.dimensions == dimensions
+                && c.latency == latency
                 && c.flags == flags
                 && match (&c.language, &language) {
                     (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
@@ -449,8 +491,12 @@ impl TabList {
                 }
         });
         if !valid {
-            let mut hearts = Vec::new();
-            let draws = self.build_layout(i, font, &mut hearts);
+            let mut insertions = Vec::new();
+            let draws = if latency.1 {
+                self.build_layout::<true>(i, font, latency.0, &mut insertions)
+            } else {
+                self.build_layout::<false>(i, font, latency.0, &mut insertions)
+            };
             self.cache = Some(LayoutCache {
                 players: i.players.to_vec(),
                 board: i.board.clone(),
@@ -459,33 +505,57 @@ impl TabList {
                 footer: self.footer.clone(),
                 language,
                 dimensions,
+                latency,
                 flags,
                 draws,
-                hearts,
+                insertions,
             });
         }
         let cache = self.cache.take().unwrap();
         let mut out = Vec::with_capacity(cache.draws.len());
         let mut start = 0;
-        for &(at, y, left, right, id, score) in &cache.hearts {
+        for &(at, insertion) in &cache.insertions {
             out.extend_from_slice(&cache.draws[start..at]);
-            self.hearts(y, left, right, id, score, i.gui_ticks, font, &mut out);
+            match insertion {
+                Insertion::Hearts {
+                    y,
+                    left,
+                    right,
+                    id,
+                    score,
+                } => {
+                    self.hearts(y, left, right, id, score, i.gui_ticks, font, &mut out);
+                }
+                Insertion::Latency { player, bounds } => {
+                    slots.as_mut().unwrap().push(LatencySlot {
+                        sprite_at: out.len(),
+                        player: &i.players[player],
+                        bounds,
+                    });
+                }
+            }
             start = at;
         }
         out.extend_from_slice(&cache.draws[start..]);
         self.cache = Some(cache);
         out
     }
-    fn build_layout(
+    fn build_layout<const COLLECT_SLOTS: bool>(
         &mut self,
         i: &TabInputs,
         font: &Font,
-        hearts: &mut Vec<(usize, i32, i32, i32, u128, i32)>,
+        latency_width: i32,
+        insertions: &mut Vec<(usize, Insertion)>,
     ) -> Vec<GuiDraw> {
         let width = |t: &Text| font.width_text(t) as i32;
         let ids = self.displayed_ids(i.players, i.board);
-        let by_id: HashMap<_, _> = i.players.iter().map(|p| (p.uuid, p)).collect();
-        let players: Vec<_> = ids.iter().map(|id| by_id[id]).collect();
+        let by_id: HashMap<_, _> = i
+            .players
+            .iter()
+            .enumerate()
+            .map(|(index, p)| (p.uuid, index))
+            .collect();
+        let players: Vec<_> = ids.iter().map(|id| &i.players[by_id[id]]).collect();
         let spacer = font.width(" ") as i32;
         let mut max_name = 0;
         let mut max_score = 0;
@@ -546,15 +616,16 @@ impl TabList {
         };
         let sw = i.screen_width;
         let head = if show_head { 9 } else { 0 };
-        // A column for the marks once anyone listed has one, so the names stay aligned.
-        let marked: Vec<Option<NameMark>> = players.iter().map(|p| (i.mark)(p.uuid)).collect();
-        let mark = if marked.iter().any(Option::is_some) {
-            9
-        } else {
-            0
-        };
-        let head = head + mark;
-        let slot_width = (cols * (head + max_name + width_for_score + 13)).min(sw - 50) / cols;
+        let max_slot_width = sw.saturating_sub(50) / cols;
+        let content_width = head + max_name + width_for_score;
+        let latency_width = latency_width.min(
+            max_slot_width
+                .saturating_sub(content_width)
+                .max(LATENCY_WIDTH),
+        );
+        let slot_width = content_width
+            .saturating_add(latency_width)
+            .min(max_slot_width);
         let xxo = sw / 2 - (slot_width * cols + (cols - 1) * 5) / 2;
         let mut yyo = 10;
         let mut max_line = slot_width * cols + (cols - 1) * 5;
@@ -620,20 +691,6 @@ impl TabList {
                 );
                 xo += 9;
             }
-            if let Some(rects) = marked[n as usize] {
-                for &(mx, my, w, h, color) in rects {
-                    let (x, y) = (xo + i32::from(mx), yo + i32::from(my));
-                    let (x1, y1) = (x + i32::from(w), y + i32::from(h));
-                    out.push(GuiDraw::Fill {
-                        x0: x,
-                        y0: y,
-                        x1,
-                        y1,
-                        color,
-                    });
-                }
-            }
-            xo += mark;
             let spectator = p.game_mode == SPECTATOR;
             out.push(GuiDraw::Text {
                 text: entry.name.clone(),
@@ -647,7 +704,16 @@ impl TabList {
                 let right = left + width_for_score;
                 if right - left > 5 {
                     if objective.render_type == RenderType::Hearts {
-                        hearts.push((out.len(), yo, left, right, p.uuid, entry.score));
+                        insertions.push((
+                            out.len(),
+                            Insertion::Hearts {
+                                y: yo,
+                                left,
+                                right,
+                                id: p.uuid,
+                                score: entry.score,
+                            },
+                        ));
                     } else if let Some(text) = &entry.formatted {
                         out.push(GuiDraw::Text {
                             text: text.clone(),
@@ -658,6 +724,28 @@ impl TabList {
                         });
                     }
                 }
+            }
+            if COLLECT_SLOTS {
+                let right = xo - head + slot_width;
+                // On a narrow GUI the vanilla content can run past the row.
+                // Never let a custom paint cover the name or score lane.
+                let content_right = xo
+                    + max_name
+                    + if width_for_score > 5 {
+                        // The objective starts one pixel after the longest name;
+                        // keep its shadow out of the mod's paint rectangle too.
+                        width_for_score + 2
+                    } else {
+                        1
+                    };
+                let left = (right - latency_width).max(content_right).min(right);
+                insertions.push((
+                    out.len(),
+                    Insertion::Latency {
+                        player: by_id[&p.uuid],
+                        bounds: [left, yo, right, yo + 8],
+                    },
+                ));
             }
             out.push(sprite(
                 ping_sprite(p.latency),
@@ -799,7 +887,9 @@ mod tests {
 
     #[test]
     fn cached_tab_layout_matches_rebuilt_layout_and_animated_health() {
-        let font = Font::metrics(std::path::Path::new("missing-tab-test-resources"));
+        let font = Font::metrics(&horizon_assets::resource_source::ResourceSource::directory(
+            std::path::PathBuf::from("missing-tab-test-resources"),
+        ));
         let mut board = Scoreboard::default();
         board.add_objective(
             "hp",

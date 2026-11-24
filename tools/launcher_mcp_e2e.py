@@ -75,7 +75,7 @@ def scenario(m, out):
     assert init['serverInfo']['name'] == 'horizon-launcher', init
     tools = {t['name'] for t in m.rpc('tools/list', {})['tools']}
     for name in ['play', 'server', 'versions', 'settings', 'mods_search', 'modpack_list', 'servers_list',
-                 'data_status', 'account_list', 'game_args', 'game_state', 'game_ui', 'game_click',
+                 'account_list', 'game_args', 'game_state', 'game_ui', 'game_click',
                  'game_screenshot']:
         assert name in tools, f'{name} missing from {sorted(tools)}'
     for name in ['game_launch', 'mcp', 'no_ai', 'agent_config']:
@@ -87,6 +87,8 @@ def scenario(m, out):
     result, texts, _ = m.call('settings', key='opening-animation', value='off')
     assert json.loads(texts[-1])['opening_animation'] is False, texts
     result, texts, _ = m.call('game_args')
+    assert result['isError'] and 'confirm' in texts[-1], texts
+    result, texts, _ = m.call('game_args', confirm=True)
     assert 'game_args' in json.loads(texts[-1]), texts
     result, texts, _ = m.call('remove', tag=TAG)
     assert result['isError'] and 'confirm' in texts[-1], texts
@@ -135,8 +137,9 @@ def window_game_scenario(m, client, resources, work):
 
     def start(home, *extra):
         home.mkdir(exist_ok=True)
-        # A first launch shows the accessibility onboarding before the title.
-        (home / 'options.txt').write_text('onboardAccessibility:false\n')
+        # A first launch shows the accessibility onboarding before the title. game_click uses
+        # back-to-game, an English widget id: pin the language.
+        (home / 'options.txt').write_text('onboardAccessibility:false\nlang:en_us\n')
         args = [str(client), '--resources', str(resources), *extra]
         if sys.platform == 'darwin':
             args.append('--offscreen')
@@ -224,8 +227,8 @@ def main():
     lab.link_dir(resources, version / '.local/horizon-client' / lab.VERSION)
     (version / '.installed').write_text('')
     (work / 'home').mkdir()
-    # The game's default endpoint, this run's: a player's game with Agent Control on stays out of it.
-    env = lab.game_env(HORIZON_LAUNCHER_HOME=work / 'launcher', HORIZON_HOME=work / 'home', HORIZON_TELEMETRY_URL='off',
+    # Isolate the game control endpoint from any player session.
+    env = lab.game_env(HORIZON_LAUNCHER_HOME=work / 'launcher', HORIZON_HOME=work / 'home',
                        HORIZON_CONTROL=work / 'default.sock')
     m = Mcp(Path(args.launcher).resolve(), env)
     try:

@@ -5,11 +5,21 @@ use super::{
     Renderer, check_layers, cull, describe_adapter, is_software, oit, pack_timing, startup_step,
     surface_format, timing,
 };
-// Ray tracing on request, which the device needs from its creation (gfx.rs may not grow).
-#[path = "ray_query.rs"]
-pub(super) mod ray_query;
+// Mesh shader capability negotiation on request (spec #17243 step 1).
+#[path = "mesh_shader.rs"]
+pub(super) mod mesh_shader;
 use std::sync::Arc;
 use winit::window::Window;
+
+/// Video memory the allocator shares out in blocks of 4-16 MiB (Vulkan and DirectX 12); a
+/// buffer or texture larger than a block gets a block of exactly its size, which is freed
+/// with it. With blocks of 8-64 MiB (`MemoryHints::MemoryUsage`) the size grew with each
+/// block opened, and the few small buffers that live all session (section tests, clouds,
+/// the staging belt) each kept a 32 or 64 MiB block from being freed: some 140 of 540 MB
+/// reserved were empty in a loaded world at render distance 12 (#15723).
+pub(super) const MEMORY_HINTS: wgpu::MemoryHints = wgpu::MemoryHints::Manual {
+    suballocated_device_memory_block_size: 4 << 20..16 << 20,
+};
 
 /// Sets the window surface up on `device`: the swapchain format (`surface_format`), the
 /// copies screenshots and frame generation make, and Mailbox when the surface offers it
@@ -56,13 +66,41 @@ pub(super) fn set_up_surface(
             }
         });
     if log_step {
-        startup_step(format_args!(
-            "device ready; configuring the surface ({}x{} {:?}, {:?})",
-            config.width, config.height, config.format, config.present_mode
-        ));
+        log_configured(&config, Some("device ready; "));
     }
     Renderer::configure(device, surface, &config, None, device_lost)?;
     Ok((config, caps))
+}
+/// The swapchain's size, format and present mode as last logged.
+static LOGGED: std::sync::Mutex<Option<(u32, u32, wgpu::TextureFormat, wgpu::PresentMode)>> =
+    std::sync::Mutex::new(None);
+/// Logs the window surface's size, format and present mode: at the start (`start` leads the
+/// line, flushed as a startup step), and once after each configuration that changed one of
+/// them (fullscreen and back, a resize, VSync, HDR output): the start line alone left a
+/// reconfigured swapchain's present mode unknown.
+pub(super) fn log_configured(config: &wgpu::SurfaceConfiguration, start: Option<&str>) {
+    let key = (
+        config.width,
+        config.height,
+        config.format,
+        config.present_mode,
+    );
+    let changed = LOGGED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(key)
+        != Some(key);
+    if start.is_none() && !changed {
+        return;
+    }
+    let line = format!(
+        "configuring the surface ({}x{} {:?}, {:?})",
+        config.width, config.height, config.format, config.present_mode
+    );
+    match start {
+        Some(lead) => startup_step(format_args!("{lead}{line}")),
+        None => log::info!("Horizon renderer: {line}"),
+    }
 }
 /// What `pick_adapter` knows of one of a backend's adapters.
 #[derive(Clone, Copy, Debug)]
@@ -113,6 +151,15 @@ pub(super) struct DeviceNeeds {
     pub(super) layers: u32,
     pub(super) rays: bool,
 }
+impl DeviceNeeds {
+    /// Whether the device will be asked for a Shader Model 6.5 feature: ray queries
+    /// (`HORIZON_RAY_TRACING` and the picked pack, as `rt::query::features` decides) or mesh
+    /// shaders (`HORIZON_MESH_SHADER`). On DirectX 12, FXC can't compile those; DXC can.
+    pub(super) fn shader_model_6_5(self) -> bool {
+        super::rt::query::wanted(super::rt::query::switch(), self.rays)
+            || mesh_shader::switch() == mesh_shader::Switch::On
+    }
+}
 impl super::output::FrameRequest {
     /// What a device opened for this request and `layers` sprite layers needs.
     pub(super) fn needs(self, layers: u32) -> DeviceNeeds {
@@ -154,7 +201,8 @@ pub(super) async fn open_adapter(
         | pack_timing::PassTiming::features(adapter)
         | cull::Cull::features(adapter)
         | oit::features(adapter)
-        | ray_query::features(adapter, needs.rays)
+        | super::rt::query::features(adapter, needs.rays)
+        | mesh_shader::features(adapter)
         | (adapter.features()
             & (wgpu::Features::INDIRECT_FIRST_INSTANCE
                 | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
@@ -183,11 +231,8 @@ pub(super) async fn open_adapter(
         label: Some("Horizon device"),
         required_features: features,
         required_limits: limits,
-        // Video memory in blocks of 8-64 MiB instead of 128-256 MiB (Vulkan and DirectX 12):
-        // with the larger blocks a few small buffers kept whole blocks the arena's pages had
-        // left, and over half the video memory reserved was unused (1,344 MiB for 500).
-        memory_hints: wgpu::MemoryHints::MemoryUsage,
-        experimental_features: ray_query::experimental(features),
+        memory_hints: MEMORY_HINTS,
+        experimental_features: mesh_shader::experimental(features),
         ..Default::default()
     };
     #[cfg(not(target_os = "macos"))]

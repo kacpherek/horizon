@@ -10,7 +10,7 @@ use horizon_client::{
     block_entity_anim::EnchantingBook,
     block_entity_render::{
         BlockAnim, BlockEntityRenderer, END_GATEWAY_LAYER, END_PORTAL_LAYER, Scene, TextCall,
-        text_vertices,
+        push_text,
     },
     chunk::{Chunk, Light},
     hud::{HudAtlas, Rect},
@@ -125,10 +125,23 @@ pub fn main() -> Result<()> {
     };
     let assets = Assets::load(root)?;
     let registry = assets.registry;
-    let renderer = BlockEntityRenderer::load(root, registry)?;
-    let atlas = HudAtlas::build(root)?;
-    let banners = Banners::load(root);
-    let items = ItemRenderer::load(root)?;
+    let item_data = crate::test_resources::item_data(
+        root,
+        horizon_world::native_load_context::DataLoadOrigin::ClientPreload,
+    )?;
+    let renderer = BlockEntityRenderer::load(
+        &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        registry,
+        item_data.defaults(),
+    )?;
+    let atlas = HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+        root.to_path_buf(),
+    ))?;
+    let banners = Banners::load(root, item_data.defaults());
+    let items = ItemRenderer::load(
+        &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        &item_data,
+    )?;
     let (sprites, names, grid) = fake_sprites(textures)?;
     let air = registry.default_state("minecraft:air").ok_or("no air")?;
     let mut out = BufWriter::new(fs::File::create(output)?);
@@ -366,7 +379,7 @@ pub fn main() -> Result<()> {
                 -pitch * (std::f32::consts::PI / 180.0),
                 0.0,
             ),
-            anim: &|_| anim.clone(),
+            anim: &|_, _| anim.clone(),
             texts: Some(&texts),
             partial: float(&case["partial"]),
             game_time: case["gameTime"].as_i64().unwrap_or(0),
@@ -379,7 +392,12 @@ pub fn main() -> Result<()> {
             nether: false,
             lid: &|_| open,
             sign: &|_| sign.as_ref(),
-            banner: &|_| layers.clone(),
+            sign_revision: None,
+            banner: &|_, visit| {
+                for (texture, tint) in &layers {
+                    visit(texture, *tint);
+                }
+            },
             skull: &|_| None,
             glyph: &|c| atlas.glyph_cell(c),
             glyphs: atlas.font.epoch(),
@@ -401,7 +419,7 @@ pub fn main() -> Result<()> {
                     return json!({"texture": "environment/end_sky", "v": v, "color": q[0].color,
                                   "light": q[0].light, "custom": true});
                 }
-                if q[0].layer == 6 {
+                if q[0].layer & 0xffff == 6 {
                     let texture = "entity/end_portal/end_gateway_beam";
                     let u0 = sprites.get(texture).map_or(0.0, |r| r.u0);
                     let v: Vec<Value> = q
@@ -450,7 +468,7 @@ pub fn main() -> Result<()> {
                 let mut vertices = Vec::new();
                 let mut local = t.clone();
                 local.matrix = Mat4::IDENTITY;
-                text_vertices(&|c| atlas.font.glyph_styled(c, &t.style), Some(atlas.font.white()), &local, &mut vertices);
+                push_text(&|c| atlas.font.glyph_styled(c, &t.style), Some(atlas.font.white()), &local.run(), &mut vertices);
                 let vertices: Vec<_> = vertices.iter().map(|v| {
                     let c = v.color;
                     json!([v.pos[0], v.pos[1], v.pos[2], (c & 0xff00ff00) | (c & 255) << 16 | (c >> 16 & 255)])

@@ -19,16 +19,10 @@ pub enum Pose {
 }
 impl Pose {
     /// `Pose` by its network id (`Pose.id`); the poses a player never takes
-    /// are standing.
+    /// are standing. One id table: `mod_api::Pose`'s, narrowed to the avatar's
+    /// six stances.
     pub fn from_id(id: i32) -> Self {
-        match id {
-            1 => Self::FallFlying,
-            2 => Self::Sleeping,
-            3 => Self::Swimming,
-            4 => Self::SpinAttack,
-            5 => Self::Crouching,
-            _ => Self::Standing,
-        }
+        mod_api::Pose::from_id(id).into()
     }
     /// Network ID for this pose (`Pose.id`).
     pub fn id(self) -> i32 {
@@ -69,13 +63,88 @@ impl Pose {
         }
     }
 }
+impl From<Pose> for mod_api::Pose {
+    /// The living entity's pose (`Entity.getPose`) the avatar's stance names.
+    fn from(pose: Pose) -> Self {
+        match pose {
+            Pose::Standing => Self::Standing,
+            Pose::FallFlying => Self::FallFlying,
+            Pose::Sleeping => Self::Sleeping,
+            Pose::Swimming => Self::Swimming,
+            Pose::SpinAttack => Self::SpinAttack,
+            Pose::Crouching => Self::Crouching,
+        }
+    }
+}
+impl From<mod_api::Pose> for Pose {
+    /// Narrow a living entity's pose to a movement stance. Dimension queries
+    /// use `Dimensions::avatar` to preserve Avatar.POSES's fixed dying box.
+    fn from(pose: mod_api::Pose) -> Self {
+        match pose {
+            mod_api::Pose::FallFlying => Self::FallFlying,
+            mod_api::Pose::Sleeping => Self::Sleeping,
+            mod_api::Pose::Swimming => Self::Swimming,
+            mod_api::Pose::SpinAttack => Self::SpinAttack,
+            mod_api::Pose::Crouching => Self::Crouching,
+            _ => Self::Standing,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub struct Dimensions {
     pub width: f32,
     pub height: f32,
     pub eye_height: f32,
 }
+/// What `entity_size` (`EntityEvent.Size`) answered for an entity whose size vanilla
+/// recalculated (`Entity.refreshDimensions`) to `vanilla` (width, height, eye height) in
+/// `pose`: `size` replaces it while both still hold. Any change to either goes back to
+/// vanilla's until the hook is asked again; `size` is `None` when the listeners left it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SizeAnswer {
+    pub pose: mod_api::Pose,
+    pub vanilla: [f32; 3],
+    pub size: Option<[f32; 3]>,
+}
+impl SizeAnswer {
+    /// Whether this answer is for `pose` and vanilla's `vanilla`.
+    pub fn asked(&self, pose: mod_api::Pose, vanilla: [f32; 3]) -> bool {
+        self.pose == pose && self.vanilla == vanilla
+    }
+    /// The size to use instead of `vanilla` in `pose`, if this answer still holds.
+    pub fn holds(&self, pose: mod_api::Pose, vanilla: [f32; 3]) -> Option<[f32; 3]> {
+        self.size.filter(|_| self.asked(pose, vanilla))
+    }
+    /// The size the entity had with this answer: the listeners', else vanilla's.
+    pub fn effective(&self) -> [f32; 3] {
+        self.size.unwrap_or(self.vanilla)
+    }
+}
 impl Dimensions {
+    pub fn to_array(self) -> [f32; 3] {
+        [self.width, self.height, self.eye_height]
+    }
+    pub fn from_array([width, height, eye_height]: [f32; 3]) -> Self {
+        Self {
+            width,
+            height,
+            eye_height,
+        }
+    }
+    /// `Avatar.getDefaultDimensions` with the living scale applied, including
+    /// the fixed DYING entry that is not a movement stance.
+    pub fn avatar(pose: mod_api::Pose, scale: f32) -> Self {
+        if pose == mod_api::Pose::Dying {
+            Self {
+                width: 0.2,
+                height: 0.2,
+                eye_height: 1.62,
+            }
+        } else {
+            Pose::from(pose).dimensions(scale)
+        }
+    }
+
     pub fn bounds(self, position: Vec3) -> Aabb {
         let half = f64::from(self.width / 2.0);
         Aabb::new(
@@ -102,11 +171,12 @@ impl PlayerMotion {
         }
     }
     pub fn dimensions_for_pose(&mut self, pose: Pose) -> Result<Dimensions> {
-        Ok(pose.dimensions(self.attribute("minecraft:scale")? as f32))
+        let scale = self.attribute("minecraft:scale")? as f32;
+        Ok(effective_dimensions(pose, scale, self.size_answer))
     }
     pub fn refresh_dimensions(&mut self) -> Result<()> {
         self.scale = self.attribute("minecraft:scale")? as f32;
-        self.dimensions = self.pose.dimensions(self.scale);
+        self.dimensions = effective_dimensions(self.pose, self.scale, self.size_answer);
         Ok(())
     }
     pub fn set_pose(&mut self, pose: Pose) -> Result<()> {
@@ -151,18 +221,31 @@ impl MotionWorld<'_, '_, '_> {
     /// LocalPlayer.aiStep computes crouching BEFORE KeyboardInput.tick, using
     /// the old shift input. This is distinct from Entity's current pose.
     pub fn update_local_crouching(&mut self) -> Result<()> {
-        self.player.local_crouching = !self.player.flying
-            && !self.player.swimming
-            && self.can_fit_pose(Pose::Crouching)?
-            && (self.player.shift_key_down || !self.can_fit_pose(Pose::Standing)?);
+        if self.player.flying || self.player.swimming {
+            self.player.local_crouching = false;
+            return Ok(());
+        }
+        if self.player.shift_key_down {
+            self.player.local_crouching = self.can_fit_pose(Pose::Crouching)?;
+            return Ok(());
+        }
+        let stand = self.player.dimensions_for_pose(Pose::Standing)?;
+        let crouch = self.player.dimensions_for_pose(Pose::Crouching)?;
+        self.player.local_crouching =
+            if stand.width >= crouch.width && stand.height >= crouch.height {
+                if self.can_fit_pose(Pose::Standing)? {
+                    false
+                } else {
+                    self.can_fit_pose(Pose::Crouching)?
+                }
+            } else {
+                self.can_fit_pose(Pose::Crouching)? && !self.can_fit_pose(Pose::Standing)?
+            };
         Ok(())
     }
     /// Dry Player.updatePlayerPose after movement: crawl when neither standing
     /// nor crouching fits; leave the current pose if even crawling cannot fit.
     pub fn update_player_pose(&mut self) -> Result<()> {
-        if !self.can_fit_pose(Pose::Swimming)? {
-            return Ok(());
-        }
         // Player.getDesiredPose: sleeping, swimming, gliding, Riptide's spin.
         let desired = if self.player.sleeping {
             Pose::Sleeping
@@ -177,6 +260,19 @@ impl MotionWorld<'_, '_, '_> {
         } else {
             Pose::Standing
         };
+        if !self.player.spectator {
+            let d_dim = self.player.dimensions_for_pose(desired)?;
+            let swim_dim = self.player.dimensions_for_pose(Pose::Swimming)?;
+            if d_dim.width >= swim_dim.width
+                && d_dim.height >= swim_dim.height
+                && self.can_fit_pose(desired)?
+            {
+                return self.player.set_pose(desired);
+            }
+        }
+        if !self.can_fit_pose(Pose::Swimming)? {
+            return Ok(());
+        }
         let pose = if self.player.spectator || self.can_fit_pose(desired)? {
             desired
         } else if self.can_fit_pose(Pose::Crouching)? {
@@ -227,5 +323,51 @@ impl MotionWorld<'_, '_, '_> {
             self.player.set_pose(Pose::Standing)?;
         }
         Ok(())
+    }
+}
+
+/// Effective dimensions for `pose` at `scale`, applying an `entity_size` answer when it holds.
+fn effective_dimensions(pose: Pose, scale: f32, size_answer: Option<SizeAnswer>) -> Dimensions {
+    let mut dimensions = pose.dimensions(scale);
+    // `EntityEvent.Size`: an `entity_size` answer for this pose and size still holds.
+    if let Some(size) =
+        size_answer.and_then(|answer| answer.holds(pose.into(), dimensions.to_array()))
+    {
+        dimensions = Dimensions::from_array(size);
+    }
+    dimensions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pose_dimensions_apply_matching_size_answer() {
+        let vanilla_crouch = Pose::Crouching.dimensions(1.0);
+        assert_eq!(
+            effective_dimensions(Pose::Crouching, 1.0, None).to_array(),
+            vanilla_crouch.to_array()
+        );
+
+        let resized = [0.4, 0.9, 0.75];
+        let answer = Some(SizeAnswer {
+            pose: Pose::Crouching.into(),
+            vanilla: vanilla_crouch.to_array(),
+            size: Some(resized),
+        });
+        assert_eq!(
+            effective_dimensions(Pose::Crouching, 1.0, answer).to_array(),
+            resized
+        );
+        // A different pose or scale is not covered by the crouching 1.0 size answer.
+        assert_eq!(
+            effective_dimensions(Pose::Standing, 1.0, answer).to_array(),
+            Pose::Standing.dimensions(1.0).to_array()
+        );
+        assert_eq!(
+            effective_dimensions(Pose::Crouching, 2.0, answer).to_array(),
+            Pose::Crouching.dimensions(2.0).to_array()
+        );
     }
 }

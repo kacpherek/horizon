@@ -284,8 +284,47 @@ fn bake_into(
             hidden,
         }) => bake_obj(model, obj, *flip_v, *shade, hidden, transform, output)?,
         Some(ResolvedLoader::Obj { model: None, .. }) | None => {}
+        Some(ResolvedLoader::Registered(quads)) => {
+            for quad in quads.iter() {
+                if let Some(quad) = loader_quad(model, quad, transform, render_type)? {
+                    output.push(quad);
+                }
+            }
+        }
     }
     Ok(())
+}
+/// A registered loader's quad, moved whole by the blockstate transform as an obj face is. A
+/// texture key the model doesn't define skips the quad with a reason.
+fn loader_quad(
+    model: &ResolvedCuboidModel,
+    quad: &crate::model_loaders::LoaderQuad,
+    transform: BlockModelTransform,
+    render_type: Option<RenderType>,
+) -> Result<Option<ModelQuad>> {
+    let Some(material) = model.material(&quad.texture)?.cloned() else {
+        log::warn!(
+            "model loader quad skipped: the model has no texture {:?}",
+            quad.texture
+        );
+        return Ok(None);
+    };
+    let positions = quad.positions.map(|p| transform.position(p));
+    Ok(Some(ModelQuad {
+        positions,
+        uv: quad.uvs,
+        facing: facing(&positions).unwrap_or(Direction::Up),
+        cull: quad.cull.map(|d| transform.direction(d)),
+        material,
+        tint_index: quad.tint_index,
+        shade_direction_override: None,
+        light_emission: 0,
+        light: [0; 2],
+        color: None,
+        ambient_occlusion: None,
+        render_type,
+        shade: quad.shade,
+    }))
 }
 /// Obj faces are unculled quads in block units; the blockstate transform moves them whole.
 fn bake_obj(
@@ -588,6 +627,87 @@ mod loader_tests {
         let looping = r#"{"loader":"neoforge:composite","children":{"a":{"parent":"t:loop"}}}"#;
         let library = library(&[("t:loop", looping)], &[]);
         assert!(library.resolve("t:loop").is_err());
+    }
+
+    /// Resolved composite children, all levels.
+    fn children(model: &crate::resolve::ResolvedCuboidModel) -> usize {
+        match model.loader() {
+            Some(ResolvedLoader::Composite(c)) => c.iter().map(|m| 1 + children(m)).sum(),
+            _ => 0,
+        }
+    }
+    #[test]
+    fn composite_children_share_one_budget_per_resolve() {
+        // `levels` files of 6 children, each naming the next file: 6 + 36 + ... children,
+        // each costing itself plus its one inherited slot.
+        let fan_out = |levels: usize| {
+            let mut models: Vec<(String, String)> = (0..levels)
+                .map(|i| {
+                    let child = format!(r#"{{"parent":"t:m{}"}}"#, i + 1);
+                    let children: Vec<String> =
+                        (0..6).map(|c| format!(r#""c{c}":{child}"#)).collect();
+                    let json = format!(
+                        r#"{{"loader":"neoforge:composite","textures":{{"a":"block/a"}},"children":{{{}}}}}"#,
+                        children.join(",")
+                    );
+                    (format!("t:m{i}"), json)
+                })
+                .collect();
+            models.push((format!("t:m{levels}"), "{}".to_owned()));
+            let models: Vec<(&str, &str)> = models
+                .iter()
+                .map(|(n, j)| (n.as_str(), j.as_str()))
+                .collect();
+            library(&models, &[]).resolve("t:m0")
+        };
+        // 4 levels: 1 554 children of about 230 bytes each; 6 levels would be 55 986 children.
+        assert_eq!(children(&fan_out(4).unwrap()), 6 + 36 + 216 + 1296);
+        assert!(fan_out(6).is_err());
+        // One file is enough when every child copies many slots...
+        let wide = |slots: usize| {
+            let textures: Vec<String> =
+                (0..slots).map(|i| format!(r#""s{i}":"block/a""#)).collect();
+            let children: Vec<String> = (0..64).map(|c| format!(r#""c{c}":{{}}"#)).collect();
+            let json = format!(
+                r#"{{"loader":"neoforge:composite","textures":{{{}}},"children":{{{}}}}}"#,
+                textures.join(","),
+                children.join(",")
+            );
+            library(&[("t:wide", &json)], &[]).resolve("t:wide")
+        };
+        assert_eq!(children(&wide(10).unwrap()), 64);
+        assert!(wide(1000).is_err());
+        // ...or a parent whose `visibility` every child copies into the objects it hides.
+        let hiding = |entries: usize| {
+            let hidden: Vec<String> = (0..entries).map(|i| format!(r#""o{i}":false"#)).collect();
+            let obj = format!(
+                r#"{{"loader":"neoforge:obj","model":"t:x.obj","visibility":{{{}}}}}"#,
+                hidden.join(",")
+            );
+            let children: Vec<String> = (0..64)
+                .map(|c| format!(r#""c{c}":{{"parent":"t:o"}}"#))
+                .collect();
+            let json = format!(
+                r#"{{"loader":"neoforge:composite","children":{{{}}}}}"#,
+                children.join(",")
+            );
+            library(&[("t:o", &obj), ("t:c", &json)], &[]).resolve("t:c")
+        };
+        assert_eq!(children(&hiding(100).unwrap()), 64);
+        assert!(hiding(2000).is_err());
+        // ...or a few slots of long names: bytes count, not entries. Each child copies the
+        // inherited 100 KiB sprite twice (its slot, then its material).
+        let long = |count: usize| {
+            let sprite = format!("block/{}", "a".repeat(100 << 10));
+            let children: Vec<String> = (0..count).map(|c| format!(r#""c{c}":{{}}"#)).collect();
+            let json = format!(
+                r#"{{"loader":"neoforge:composite","textures":{{"all":"{sprite}"}},"children":{{{}}}}}"#,
+                children.join(",")
+            );
+            library(&[("t:long", &json)], &[]).resolve("t:long")
+        };
+        assert_eq!(children(&long(2).unwrap()), 2);
+        assert!(long(8).is_err());
     }
 
     const OBJ: &str = "mtllib m.mtl\nv 0 0 0\nv 1 0 0\nv 1 0 1\nv 0 0 1\nv 0 1 0\n\

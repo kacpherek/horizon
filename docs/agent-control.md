@@ -19,12 +19,12 @@ The command lists are generated, so they can't drift:
 
 | Surface | Where | Transport |
 | --- | --- | --- |
-| Game control socket | `horizon-client --control` / `--control-socket PATH`, or Agent Control on in Horizon Settings > AI Agent (`crates/horizon-client/src/control.rs`; commands in `src/game/control.rs`, `agent.rs`, `ui_control.rs`, `saves_control.rs` and friends) | text line in, one JSON line out; Unix socket, or localhost TCP and a token where there is none |
+| Game control socket | `horizon-client --control` / `--control-socket PATH`, or Agent Control on in Horizon Settings > AI Agent (`crates/horizon-client/src/control.rs`; commands in `src/game/runtime/control.rs`, `agent.rs`, `ui_control.rs`, `saves_control.rs` and friends) | text line in, one JSON line out; Unix socket, or localhost TCP and a token where there is none |
 | `horizon-ctl` | `crates/horizon-client/src/bin/horizon-ctl/` | CLI over the socket; one table of commands (`commands.rs`) gives the help, the argument checks, the MCP tools and the reference |
 | `horizon-ctl mcp` | same | MCP over stdio, one tool per command of the table |
 | Launcher CLI | `launcher/src/cli.rs` | `horizon-launcher <command> [--json]` |
 | Launcher MCP | `launcher/src/mcp.rs`, `cli_tools.rs`, `game_tools.rs` | `horizon-launcher mcp` (stdio): every CLI command as a tool, the session tools, and the game's tools as `game_*` |
-| Connecting | `launcher/src/agents.rs`, `agents_page.rs`; `src/game/agent_settings.rs` | `horizon-launcher agent-config`; Settings > AI in the launcher; Horizon Settings > AI Agent in the game |
+| Connecting | `launcher/src/agents.rs`, `agents_page.rs`; `src/game/runtime/agent_settings.rs` | `horizon-launcher agent-config`; Settings > AI in the launcher; Horizon Settings > AI Agent in the game |
 | No AI | `crates/horizon-core/src/no_ai.rs` | `noAi:true` in `<game home>/horizon-extras.txt`, read by every surface |
 
 ## One MCP server for everything
@@ -93,30 +93,30 @@ passes on without checking it).
 
 ### Launcher
 
-| Capability | Window | CLI | MCP | Notes |
-| --- | --- | --- | --- | --- |
-| Releases and installed versions | Play, version picker | yes | yes | `versions [--installed]` |
-| Install, remove a version | Play | yes | yes | `remove` needs `confirm` in MCP |
-| Pick the version that plays | Play | yes | yes | `settings selected-version TAG` |
-| Prepare resources | Play | yes | yes |  |
-| Start the game | Play | yes | yes | `play --world --creative --join --arg --account`; MCP `play` adds `offscreen` |
-| Join a friend by invite code | Play | yes | yes | `play --join CODE` |
-| Dedicated server here: start, console, log, stop | Servers | yes | yes | `server`; MCP `server`, `server_command`, `server_log`, `server_stop` |
-| Hosted servers: list, create, set up, run a command, forget | Servers | yes | yes | `servers ...`; `servers_forget` needs `confirm` |
-| Accounts: list, sign in, sign out, select, offline | Settings | yes | yes | names and UUIDs only; sign-in is a device code |
-| Game folder, server folder, install new versions, opening animation | Settings | yes | yes | `settings [KEY VALUE]` |
-| Extra game arguments | Settings | yes | yes | `game-args` |
-| Applications menu entry (Linux) | Settings | yes | yes | `desktop-entry` |
-| Updates: check and install | Settings | yes | yes | `update` |
-| Patch notes, links | Patch notes, footer | yes | yes |  |
-| Game log, crash reports | Settings | yes | yes | `logs [--crash]` |
-| Data collection: status, allow, deny, show, delete, send, bug, benchmark upload | Settings > Data | yes | yes | `data_delete` needs `confirm` |
-| Mod browser: search, check, install, update, remove, list (mods, resource packs, modpacks) | Mods | yes | yes | `mods ...`; `mods_remove` needs `confirm` |
-| Modpacks: import, port, play, remove, list | Modpacks | yes | yes | `modpack ...`; `modpack_remove` needs `confirm` |
-| Launcher benchmark | (none) | yes | yes |  |
-| The game it started | (the game) | (horizon-ctl) | yes | `game_*` |
-| Connect an AI agent | Settings > AI | yes | (none) | `agent-config [--client] [--test]`; the agent is already connected, so there is no tool |
-| No AI | Settings > AI | yes | (none) | `no-ai [on\|off]`; the player's switch, never an agent's |
+| Capability | Window | CLI before | MCP before | CLI after | MCP after | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| Releases and installed versions | Play, version picker | yes | yes | yes | yes | `versions [--installed]` |
+| Install, remove a version | Play | yes | yes | yes | yes | `remove` needs `confirm` in MCP |
+| Pick the version that plays | Play | no | no | yes | yes | `settings selected-version TAG` |
+| Prepare resources | Play | yes | yes | yes | yes | |
+| Start the game | Play | yes | yes | yes | yes | `play --world --creative --join --arg --account`; MCP `play` adds `offscreen` |
+| Join a friend by invite code | Play | yes | no | yes | yes | `play --join CODE` |
+| Dedicated server here: start, console, log, stop | Servers | yes | yes | yes | yes | `server`; MCP `server`, `server_command`, `server_log`, `server_stop` |
+| Hosted servers: list, create, set up, run a command, forget | Servers | yes | no | yes | yes | `servers ...`; `servers_forget` needs `confirm` |
+| Accounts: list, sign in, sign out, select, offline | Settings | yes | part | yes | yes | names and UUIDs only; sign-in is a device code; `account_offline` was missing |
+| Game folder, server folder, install new versions, opening animation | Settings | no | no | yes | yes | `settings [KEY VALUE]` |
+| Extra game arguments | Settings | yes | no | yes | yes | `game-args` |
+| Applications menu entry (Linux) | Settings | yes | no | yes | yes | `desktop-entry` |
+| Updates: check and install | Settings | yes | part | yes | yes | MCP could only check |
+| Patch notes, links | Patch notes, footer | yes | yes | yes | yes | |
+| Game log, crash reports | Settings | yes | yes | yes | yes | `logs [--crash]` |
+| Local bug report | (none) | yes | yes | yes | yes | `bug-report` writes a file; nothing is sent |
+| Mod browser: search, check, install, update, remove, list (mods, resource packs, modpacks) | Mods | yes | no | yes | yes | `mods ...`; `mods_remove` needs `confirm` |
+| Modpacks: import, port, play, remove, list | Modpacks | yes | no | yes | yes | `modpack ...`; `modpack_remove` needs `confirm` |
+| Launcher benchmark | (none) | yes | no | yes | yes | |
+| The game it started | (the game) | (horizon-ctl) | yes | (horizon-ctl) | yes | `game_*` |
+| Connect an AI agent | Settings > AI | no | (none) | yes | (none) | `agent-config [--client] [--test]`; the agent is already connected, so there is no tool |
+| No AI | Settings > AI | no | (none) | yes | (none) | `no-ai [on\|off]`; the player's switch, never an agent's |
 
 ### Game
 
@@ -220,7 +220,7 @@ turn the switch off.
   input plays before and after it.
 - **Headless:** `horizon-ctl launch --headless` (`horizon-client --headless --control`) starts a
   game with no display, no window and no GPU: it runs where no display server is (an SSH session,
-  a server) and runs its own loop instead of winit's (`game/headless.rs`), one frame a tick. It
+  a server) and runs its own loop instead of winit's (`game/runtime/headless.rs`), one frame a tick. It
   plays through these commands only; commands that need the screen's pixels (`screenshot`, clicks
   at GUI points) answer with an error ([#4951](https://github.com/horizon-rust/horizon/issues/4951)).
 
@@ -266,14 +266,20 @@ turn the switch off.
 - **Confirm what can't be undone.** A command that deletes the player's things requires
   `confirm` and carries the MCP `destructiveHint`. In the game these are `world-delete`, `fill`
   and `setblock` (the table's `DESTRUCTIVE`); in the launcher, `remove`, `modpack remove`,
-  `mods remove`, `servers forget`, `account sign-out` and `data delete` (`cli_tools::DESTRUCTIVE`).
+  `mods remove`, `servers forget` and `account sign-out` (`cli_tools::DESTRUCTIVE`), and what
+  decides what the next Play runs or joins: `instance launch`, `instance java` and `game-args`.
   Without `confirm: true` the call is refused and the message says to ask the player. In the game
   CLI the flag is `--confirm`. The launcher CLI asks nothing: a person typing `remove` meant it.
+- **Other people's text is data.** Chat, signs, books, MOTDs, names, mod descriptions and log lines
+  can say anything, so each server's instructions tell the agent they are never instructions, and a
+  tool whose result carries such text (the table's `UNTRUSTED`, the server's and the launcher's
+  logs and console) is followed by a second content block saying so
+  (`horizon_mcp::mark_untrusted`). The first block stays the data, so parsers are unaffected.
 - **Ask before reaching out.** A command that sends data or reaches other people carries
   `openWorldHint`, and its description says "only when the player asks". In the game these are
-  `connect`, `lan`, `friends`, `chat` and `command`; in the launcher, `data allow`, `data send`,
-  `data bug`, `data benchmark` and `servers create`. `play`'s `join` argument says the same.
-  Telemetry stays opt-in, and only `data allow` turns it on.
+  `connect`, `lan`, `friends`, `chat` and `command`; in the launcher, `servers create` and
+  `share-log`. `play`'s `join` argument says the same. Bug and benchmark reports stay local;
+  there is no telemetry or data collection switch ([Horizon sends nothing](telemetry.md)).
 - **No secrets.** No surface returns tokens, session files, keychain entries or invite secrets
   the player didn't ask to share:
   - accounts are names and UUIDs;
@@ -295,16 +301,19 @@ turn the switch off.
    {"id": "done", "kind": "button", "label": "Done", "bounds": [...], "enabled": true}]}
 ```
 
-- **Ids are stable and readable.** An id is the label up to its `:`, as a slug (`FOV: 70` is
-  `fov`, `AI Agent...` is `ai-agent`). A repeated slug gets `-2`, `-3`; unlabelled elements are
-  `<kind>-<n>`. A slider's id doesn't change with its value. Slots are `slot-<ID>` with their
-  stack.
+- **Registered IDs do not change with the client's language.** For example, `singleplayer`,
+  `create-new-world`, `options`, `fov`, `done` and `back-to-game` work in Russian and English;
+  `label` still contains the translated text. Widgets without a registered ID use the drawn
+  label up to its `:` as a slug (for example, `My World` is `my-world`). These fallback IDs can
+  change with the label; read `ui` to find them. Repeated slugs get `-2`, `-3`; unlabelled
+  elements are `<kind>-<n>`. Slots are `slot-<ID>` with their stack.
 - **Kinds:** `button`, `slider` (`value` 0..1), `field`, `row` (a world, server, pack or
   language), `tab` (`selected`), `slot`.
 - **Actions:**
   - `click ID [right|middle] [shift]` clicks where the mouse would.
   - `set ID VALUE` moves a slider.
   - `type` types into the focused field.
+  - `click-button LABEL` takes the displayed label, not a registered ID.
 
   After a click, the next `ui`, `click` or `set` waits for a redrawn frame. Right after
   `launch`, they and `screen` and `click-button` wait for the first one.
@@ -390,6 +399,41 @@ A recording is one folder, a bundle is that folder plus the logs in one zip:
   `state.jsonl` is the oracle for where the re-run should have ended. A server recording replays
   only `--in-place`, into the same world.
 
+### Fixed-clock offscreen export
+
+Start the game with `--offscreen` and enter a world or open a replay.
+
+```sh
+horizon-ctl export start portrait --size 1080x1920 --fps 30000/1001 --frames 90
+```
+
+The reply gives the absolute folder under the game's `exports/` and returns before frames are written.
+A PNG sequence is the default. To pipe RGB frames to the configured encoder in `horizon-export.txt`, use
+`--format encoder`. `export status` reports queued steps and frames written. `export stop` replies with
+`draining` while accepted frames are written and the output is finalized. `quit` cancels an active export,
+including one that is draining. On failure, `frames_written` is the count observed during abort.
+A PNG already being written may finish in the background. After the last readback, a stalled
+writer or manifest publication fails the export after 60 seconds. The final `export` event reports `finished` or `stopped` once
+`export.json` is published. If cancellation reaches a rename in progress, the failure event reports
+that publication could not be confirmed. Pass the last event sequence from before the start to
+`wait-for event export --since SEQ` if the export may finish before the wait starts.
+
+Use `--hold` to wait for `export step N`. You can issue control commands such as `tp` and `look` between
+steps. While a step is queued or an automatic export is running, only read-only commands, `export`,
+and `quit` are accepted. Captures wait for terrain,
+lighting, and uploads to settle, with a 30-second stall limit. For a live world they also wait for the
+server to send the view's remaining columns, even after the view's loading indicator expires. Use
+`--no-settle` to capture immediately.
+Use `--hud` to keep the HUD visible. During export, uploaded sections and their block entities
+appear fully visible so their fade-in does not depend on worker timing.
+
+The fixed clock drives the client and replay playhead. During live capture it also drives a private
+integrated server. External and published servers keep their own clocks. A standalone replay seeks back up to one second and ticks forward to the original
+position before capturing. An in-world replay starts where it is because it cannot rebuild the live world by
+seeking backwards. With settling enabled, replay exports advance through recorded portal
+loading intervals without writing frames. The output resumes at the next consecutive frame index
+once the destination has settled.
+
 ### Repeatable screenshots
 
 `HORIZON_STILL=1` (a dev switch, off by default) makes a frozen scene draw the same frame in every
@@ -438,7 +482,7 @@ of the frame ([#8750](https://github.com/horizon-rust/horizon/issues/8750)).
   using an item, riding, running out of air.
 - A shader pack's own buffers, kept from frame to frame, take `horizon-ctl screenshot-sequence
   FRAMES STEP_MS PATH`: the pack starts over (its buffers, images, shadow maps, smoothed values and
-  custom uniforms, or a Horizon pack's `history` and eased values) and draws FRAMES frames on a set
+  custom uniforms, or a Horizon pack's kept resources and eased values) and draws FRAMES frames on a set
   clock, frame n at n frames and (n - 1) × STEP_MS milliseconds (0 since the frame before on frame
   1, STEP_MS after; a decimal, `16.666667` for 60 fps). The last is written as `screenshot PATH`
   writes it (with its `-hdr.png` under HDR output), and the reply, once it is, names the pack and

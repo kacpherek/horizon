@@ -1,12 +1,14 @@
+import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
-from tools import check_layers
+from tools import check_layers, merge_base
 
 CONFIG = {
     "may_depend": {"engine": ["engine"], "platform": ["engine", "platform"], "horizon": ["platform", "horizon"]},
@@ -36,6 +38,40 @@ def run(*packages, allowed=(), base=None, crates=None):
     return check_layers.check(config, check_layers.edges(packages), base)
 
 
+def cargo_packages(source="game", target="cosmetics", *, path=False, rename=None, optional=False, lib_name=None):
+    """Actual offline Cargo metadata, including the real rename field and resolved package IDs."""
+    if not shutil.which("cargo"):
+        raise unittest.SkipTest("requires Cargo")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "Cargo.toml").write_text(
+            f'[workspace]\nresolver = "3"\nmembers = ["{source}", "{target}"]\n'
+            f'[patch.crates-io]\n{target} = {{ path = "{target}" }}\n')
+        for name in (source, target):
+            (root / name / "src").mkdir(parents=True)
+            (root / name / "src/lib.rs").write_text("")
+            manifest = f'[package]\nname = "{name}"\nversion = "1.0.0"\nedition = "2024"\n'
+            if name == target and lib_name:
+                manifest += f'[lib]\nname = "{lib_name}"\n'
+            (root / name / "Cargo.toml").write_text(manifest)
+        location = f'path = "../{target}"' if path else 'version = "=1.0.0"'
+        alias = rename or target
+        # An unrenamed dependency is declared plainly, so Cargo reports rename=null (the `package =` form would
+        # make Cargo report the alias as rename even when it equals the package name).
+        package_key = f'package = "{target}", ' if rename else ''
+        declaration = f'{alias} = {{ {package_key}{location}, optional = {str(optional).lower()} }}\n'
+        with (root / source / "Cargo.toml").open("a") as f:
+            f.write(f'[dependencies]\n{declaration}')
+        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True,
+                       capture_output=True, text=True)
+        lock = (root / "Cargo.lock").read_bytes()
+        with mock.patch.object(check_layers, "ROOT", root):
+            packages = check_layers.metadata(root / "Cargo.toml")
+        if (root / "Cargo.lock").read_bytes() != lock:
+            raise AssertionError("the layer check changed Cargo.lock")
+        return packages
+
+
 class CheckLayersTests(unittest.TestCase):
     def test_downward_and_same_layer_dependencies_pass(self):
         problems, notes = run(package("mod-api", "core"), package("launcher", "mod-api", "cosmetics"))
@@ -63,6 +99,7 @@ class CheckLayersTests(unittest.TestCase):
     def test_build_dependencies_count_and_dev_dependencies_do_not(self):
         self.assertEqual(len(run(package("core", ("mod-api", "build")))[0]), 1)
         self.assertEqual(run(package("core", ("mod-api", "dev"))), ([], []))
+        self.assertEqual(len(run(package("core", "mod-api"))[0]), 1)
 
     def test_an_exception_with_no_dependency_left_is_only_a_note(self):
         problems, notes = run(package("game", "core"), allowed=["game -> cosmetics"])
@@ -116,6 +153,17 @@ class CheckLayersTests(unittest.TestCase):
         self.assertIn("core -> game: a portable crate depends only on the other portable crates", problems[0])
         self.assertIn("core -> wgpu: a portable crate takes no window, GPU", problems[1])
 
+    def test_portable_baseline_only_exempts_the_recorded_optional_edge(self):
+        config = dict(CONFIG, portable={"crates": ["core"], "forbidden": []},
+                      optional=[{"edge": "core -> mod-api", "reason": "Nonportable optional feature"}])
+        dep = {"name": "mod-api", "kind": None, "path": "/x/mod-api", "optional": True}
+        pkg = {"name": "core", "dependencies": [dep]}
+        self.assertEqual(check_layers.portable(config, [pkg]), [])
+        dep["optional"] = False
+        self.assertEqual(len(check_layers.portable(config, [pkg])), 1)
+        dep.update(name="game", optional=True)
+        self.assertEqual(len(check_layers.portable(config, [pkg])), 1)
+
     def test_a_portable_crate_is_an_engine_crate(self):
         config = dict(CONFIG, portable={"crates": ["mod-api", "gone"], "forbidden": []})
         self.assertEqual(check_layers.portable(config, []), [
@@ -123,9 +171,317 @@ class CheckLayersTests(unittest.TestCase):
             f"mod-api: listed as portable in {check_layers.CONFIG_PATH}, but not an engine crate there",
         ])
 
+    def test_an_optional_exception_holds_only_while_the_dependency_is_optional(self):
+        config = dict(CONFIG, optional=[{"edge": "core -> mod-api", "reason": "behind a feature"}])
+        optional_dep = {"name": "mod-api", "kind": None, "path": "/x/mod-api", "optional": True}
+        packages = [{"name": "core", "dependencies": [optional_dep]}]
+        graph = check_layers.edges(packages)
+        self.assertEqual(check_layers.check(config, graph, None, check_layers.optional_edges(packages)), ([], []))
+        # The same dependency made mandatory (here by a build-dependency next to the optional one) fails.
+        packages[0]["dependencies"].append({"name": "mod-api", "kind": "build", "path": "/x/mod-api"})
+        problems, _ = check_layers.check(config, graph, None, check_layers.optional_edges(packages))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("core -> mod-api: listed in 'optional'", problems[0])
+        self.assertIn("no longer optional", problems[0])
+
+    def test_an_optional_exception_excuses_no_other_edge(self):
+        config = dict(CONFIG, optional=[{"edge": "core -> mod-api", "reason": "behind a feature"}])
+        packages = [{"name": "game", "dependencies": [
+            {"name": "mod-api", "kind": None, "path": "/x/mod-api", "optional": True}]}]
+        problems, _ = check_layers.check(config, check_layers.edges(packages), None,
+                                         check_layers.optional_edges(packages))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("game -> mod-api: engine may not depend on platform", problems[0])
+
+    def test_optional_edges_ignore_dev_and_registry_dependencies(self):
+        packages = [{"name": "core", "dependencies": [
+            {"name": "mod-api", "kind": None, "path": "/x/mod-api", "optional": True},
+            {"name": "mod-api", "kind": "dev", "path": "/x/mod-api"},
+            {"name": "serde", "kind": None, "path": None, "optional": True},
+        ]}]
+        self.assertEqual(check_layers.optional_edges(packages), {"core -> mod-api"})
+
+    def test_an_optional_exception_with_no_dependency_left_is_only_a_note(self):
+        config = dict(CONFIG, optional=[{"edge": "core -> mod-api", "reason": "behind a feature"}])
+        problems, notes = check_layers.check(config, check_layers.edges([package("core")]))
+        self.assertEqual(problems, [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("core -> mod-api: no longer a dependency; you can remove it from 'optional'", notes[0])
+
+    def test_a_branch_may_move_an_exception_to_optional_but_not_add_one(self):
+        packages = [{"name": "core", "dependencies": [
+            {"name": "mod-api", "kind": None, "path": "/x/mod-api", "optional": True}]}]
+        graph, optional = check_layers.edges(packages), check_layers.optional_edges(packages)
+        config = dict(CONFIG, optional=[{"edge": "core -> mod-api", "reason": "behind a feature"}])
+        moved = dict(CONFIG, allowed=["core -> mod-api"])
+        self.assertEqual(check_layers.check(config, graph, moved, optional), ([], []))
+        self.assertEqual(check_layers.check(config, graph, config, optional), ([], []))
+        problems, _ = check_layers.check(config, graph, CONFIG, optional)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("core -> mod-api: added to 'optional'", problems[0])
+
+    def test_the_repository_config_keeps_its_rows_apart(self):
+        config = check_layers.load_config()
+        allowed, optional = config["allowed"], check_layers.optional_rows(config)
+        self.assertEqual(len(allowed), len(set(allowed)), "an 'allowed' row is listed twice")
+        self.assertEqual(optional & set(allowed), set(), "an edge is in both 'allowed' and 'optional'")
+        for row in config.get("optional", []):
+            self.assertTrue(row.get("reason"), f"{row['edge']}: an 'optional' row needs a reason")
+        for workspace in config["workspaces"]:
+            self.assertTrue((check_layers.ROOT / workspace).is_file(), workspace)
+
+    def test_a_pending_crate_may_use_only_the_crates_its_entry_lists(self):
+        config = dict(CONFIG, portable={"crates": ["core"], "pending": {"game": ["mod-api"]}, "forbidden": ["wgpu"]})
+        listed = package("game", "core", "mod-api")
+        self.assertEqual(check_layers.portable(config, [listed]), [])
+        unlisted = package("game", "core", "mod-api", "cosmetics")
+        wgpu = {"name": "wgpu", "kind": None, "path": None}
+        problems = check_layers.portable(config, [dict(unlisted, dependencies=unlisted["dependencies"] + [wgpu])])
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("game -> cosmetics: a portable crate depends only on the other portable crates", problems[0])
+        self.assertIn("game -> wgpu: a portable crate takes no window, GPU", problems[1])
+
+    def test_a_crate_is_pending_or_portable_never_both(self):
+        config = dict(CONFIG, portable={"crates": ["core", "game"], "pending": {"game": []}, "forbidden": []})
+        self.assertEqual(check_layers.portable(config, []), [
+            f"game: in both portable.crates and portable.pending of {check_layers.CONFIG_PATH}",
+        ])
+
+    def test_pending_entries_only_shrink(self):
+        def config(*deps):
+            return dict(CONFIG, portable={"crates": ["core"], "pending": {"game": list(deps)}, "forbidden": []})
+        base = config("mod-api")
+        self.assertEqual(check_layers.portable(config("mod-api"), [], base), [])
+        self.assertEqual(check_layers.portable(config(), [], base), [])
+        problems = check_layers.portable(config("mod-api", "cosmetics"), [], base)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("game -> cosmetics: added to portable.pending", problems[0])
+
+    def test_a_portable_crate_does_not_become_pending(self):
+        base = dict(CONFIG, portable={"crates": ["core", "game"], "forbidden": []})
+        config = dict(CONFIG, portable={"crates": ["core"], "pending": {"game": ["mod-api"]}, "forbidden": []})
+        problems = check_layers.portable(config, [], base)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("game: portable on the base", problems[0])
+
+    def test_a_crate_new_to_pending_may_take_its_first_entry(self):
+        base = dict(CONFIG, portable={"crates": ["core"], "forbidden": []})
+        config = dict(CONFIG, portable={"crates": ["core"], "pending": {"game": ["mod-api"]}, "forbidden": []})
+        self.assertEqual(check_layers.portable(config, [], base), [])
+
     def test_registry_dependencies_are_not_edges(self):
         pkg = {"name": "game", "dependencies": [{"name": "cosmetics", "kind": None, "path": None}]}
         self.assertEqual(check_layers.edges([pkg]), {"game": set()})
+
+    def test_a_patched_registry_dep_is_an_edge_like_a_path_dep(self):
+        """A `[patch.crates-io]` declaration is a registry version in --no-deps metadata (no `path`), but Cargo
+        resolves it to a workspace crate: the layer gate must see the crossing exactly as for a path dep."""
+        for path in (False, True):
+            with self.subTest(path=path):
+                graph = check_layers.edges(cargo_packages(path=path))
+                self.assertEqual(graph, {"game": {"cosmetics"}, "cosmetics": set()})
+                problems, _ = check_layers.check(CONFIG, graph)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("game -> cosmetics: engine may not depend on horizon", problems[0])
+
+    def test_a_renamed_registry_dep_resolves_to_its_package(self):
+        packages = cargo_packages(rename="renamed-dep")
+        dep = next(p for p in packages if p["name"] == "game")["dependencies"][0]
+        self.assertEqual((dep["name"], dep["rename"]), ("cosmetics", "renamed-dep"))
+        self.assertEqual(check_layers.edges(packages), {"game": {"cosmetics"}, "cosmetics": set()})
+
+    def test_an_unrenamed_dep_with_a_custom_lib_name_resolves_to_its_package(self):
+        """Cargo's resolve edge name is the extern crate (lib target) name, which differs from the package name when
+        the crate sets [lib] name. Matching that edge name against the declared package name would fail to resolve."""
+        packages = cargo_packages(lib_name="cosmetics_lib")
+        dep = next(p for p in packages if p["name"] == "game")["dependencies"][0]
+        self.assertIsNone(dep.get("rename"))
+        self.assertEqual(dep["name"], "cosmetics")
+        self.assertEqual(check_layers.edges(packages), {"game": {"cosmetics"}, "cosmetics": set()})
+
+    def test_optional_edges_resolve_a_patched_registry_dep_to_the_local_crate(self):
+        packages = cargo_packages(optional=True)
+        self.assertEqual(check_layers.optional_edges(packages), {"game -> cosmetics"})
+        next(p for p in packages if p["name"] == "game")["dependencies"][0]["optional"] = False
+        self.assertEqual(check_layers.optional_edges(packages), set())
+
+    def test_portable_treats_a_patched_registry_dep_as_a_local_crate(self):
+        config = dict(CONFIG, portable={"crates": ["core"], "forbidden": []})
+        packages = cargo_packages("core", "game")
+        problems = check_layers.portable(config, packages)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("core -> game: a portable crate depends only on the other portable crates", problems[0])
+
+    def test_a_same_name_external_package_is_not_a_local_edge(self):
+        local = "path+file:///x/cosmetics#1.0.0"
+        external = "registry+https://github.com/rust-lang/crates.io-index#cosmetics@2.0.0"
+        game = "path+file:///x/game#1.0.0"
+        dep = {"name": "cosmetics", "rename": "look", "kind": None, "target": None, "path": None,
+               "optional": True, "req": "^2.0"}
+        packages = [{"name": "game", "id": game, "dependencies": [dep]},
+                    {"name": "cosmetics", "id": local, "dependencies": []}]
+        resolved = {"packages": [
+            {"id": local, "name": "cosmetics", "source": None, "manifest_path": "/x/cosmetics/Cargo.toml"},
+            {"id": external, "name": "cosmetics", "source": "registry+https://github.com/rust-lang/crates.io-index"}],
+            "resolve": {"nodes": [{"id": game, "deps": [{"name": "look", "pkg": external,
+                                                       "dep_kinds": [{"kind": None, "target": None}]}]}]}}
+        check_layers.resolve_registry([(packages[0], dep)], resolved)
+        self.assertEqual(check_layers.edges(packages), {"game": set(), "cosmetics": set()})
+        self.assertEqual(check_layers.optional_edges(packages), set())
+        config = dict(CONFIG, portable={"crates": ["game"], "forbidden": ["cosmetics"]})
+        self.assertEqual(len(check_layers.portable(config, packages)), 1)
+
+    def test_a_patch_to_a_crate_in_another_workspace_is_a_local_edge(self):
+        """A registry declaration patched to a crate that isn't a member of this manifest's workspace is still a
+        local edge: layers.json's whole `crates` inventory, not just this workspace's members, drives the candidate
+        filter. Otherwise a launcher -> root-workspace patch bypasses the layer gate."""
+        game = "path+file:///x/game#1.0.0"
+        cosmetics = "path+file:///x/cosmetics#1.0.0"
+        game_pkg = {"name": "game", "id": game, "dependencies": [
+            {"name": "cosmetics", "rename": None, "kind": None, "target": None, "path": None}]}
+        resolved = {"packages": [
+            {"id": game, "name": "game", "source": None},
+            {"id": cosmetics, "name": "cosmetics", "source": None,
+             "manifest_path": "/x/cosmetics/Cargo.toml"}],
+            "resolve": {"nodes": [
+                {"id": game, "deps": [{"name": "cosmetics", "pkg": cosmetics,
+                                       "dep_kinds": [{"kind": None, "target": None}]}]},
+                {"id": cosmetics, "deps": []}]}}
+
+        def run(cmd, **kwargs):
+            payload = {"packages": [game_pkg]} if "--no-deps" in cmd else resolved
+            return mock.Mock(stdout=json.dumps(payload))
+
+        config = dict(CONFIG, workspaces=["launcher/Cargo.toml"])
+        with mock.patch.object(check_layers.subprocess, "run", side_effect=run):
+            packages = check_layers.workspace_packages(config)
+        self.assertEqual(check_layers.edges(packages), {"game": {"cosmetics"}})
+        problems, _ = check_layers.check(CONFIG, check_layers.edges(packages))
+        self.assertTrue(any("game -> cosmetics: engine may not depend on horizon" in p for p in problems), problems)
+
+
+class UpstreamLayerRestorationTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "Fixture")
+        self.git("config", "user.email", "fixture@example.invalid")
+        self.config = dict(CONFIG, crates=dict(CONFIG["crates"], cosmetic="horizon"))
+        self.base_config = dict(self.config, crates={k: v for k, v in self.config["crates"].items() if k != "cosmetics"})
+        (self.root / "tools").mkdir()
+        (self.root / "tools/layers.json").write_text(json.dumps(self.base_config))
+        self.git("add", "tools")
+        self.git("commit", "-q", "-m", "base")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", "-b", "upstream")
+        upstream = dict(self.config, allowed=["game -> cosmetics"])
+        (self.root / "tools/layers.json").write_text(json.dumps(upstream))
+        self.git("commit", "-q", "-am", "upstream layers")
+        remote = self.root / "remote.git"
+        self.git("init", "-q", "--bare", str(remote))
+        self.git("push", "-q", str(remote), "HEAD:refs/heads/main")
+        self.git("checkout", "-q", "-b", "work", self.base)
+        (self.root / "fork").write_text("fork")
+        self.git("add", "fork")
+        self.git("commit", "-q", "-m", "fork")
+        self.git("merge", "-q", "--no-edit", "upstream")
+        for patch in (mock.patch.object(merge_base, "ROOT", self.root),
+                      mock.patch.dict(os.environ, {"HORIZON_UPSTREAM_URL": str(remote)})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.root, check=True,
+                              capture_output=True, text=True).stdout
+
+    def problems(self, edge, layer="horizon"):
+        upstream, errors = merge_base.verified_sync_config(self.base, "tools/layers.json")
+        self.assertEqual(errors, [])
+        config = dict(self.config, allowed=[edge], crates=dict(self.config["crates"], cosmetics=layer))
+        crate, dependency = edge.split(" -> ")
+        return check_layers.check(config, {crate: {dependency}, dependency: set()},
+                                  self.base_config, upstream=upstream)[0]
+
+    def test_verbatim_upstream_edge_and_assignment_pass(self):
+        self.assertEqual(self.problems("game -> cosmetics"), [])
+
+    def run_main(self, allowed):
+        packages = [{"name": "game", "dependencies": [{"name": "cosmetics", "kind": None, "path": "/x/cosmetics"}]},
+                    {"name": "cosmetics", "dependencies": []}]
+        config = dict(self.config, allowed=allowed)
+        with mock.patch.object(check_layers, "load_config", return_value=config), \
+                mock.patch.object(check_layers, "base_config", return_value=self.base_config), \
+                mock.patch.object(check_layers, "workspace_packages", return_value=packages), \
+                mock.patch.object(merge_base, "verified_sync_config", wraps=merge_base.verified_sync_config) as spy, \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            return check_layers.main(["--base", self.base]), spy
+
+    def test_a_violation_the_upstream_inventory_excuses_looks_it_up_once(self):
+        code, spy = self.run_main(["game -> cosmetics"])
+        self.assertEqual(code, 0)
+        spy.assert_called_once()
+
+    def test_a_merge_without_a_violation_never_reaches_the_network(self):
+        packages = [{"name": "game", "dependencies": []}]
+        with mock.patch.object(check_layers, "load_config", return_value=self.base_config), \
+                mock.patch.object(check_layers, "base_config", return_value=self.base_config), \
+                mock.patch.object(check_layers, "workspace_packages", return_value=packages), \
+                mock.patch.object(merge_base, "fetch_upstream_main", side_effect=AssertionError("network")), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(check_layers.main(["--base", self.base]), 0)
+
+    def test_fork_only_edge_fails(self):
+        self.assertTrue(self.problems("game -> mod-api"))
+
+    def test_one_character_different_edge_fails(self):
+        self.assertTrue(self.problems("game -> cosmetic"))
+
+    def test_upstream_edge_without_a_merge_of_upstream_fails(self):
+        self.git("reset", "-q", "--hard", "HEAD^")
+        self.assertTrue(self.problems("game -> cosmetics"))
+
+    def test_altered_new_crate_assignment_fails(self):
+        self.assertTrue(self.problems("game -> cosmetics", "platform"))
+
+
+class PullRequestMergeTests(unittest.TestCase):
+    def test_a_pull_request_merge_compares_with_main_as_merged(self):
+        """main added an exception after the branch left it: on the pull request's merge into that main, the base
+        holds it, so the pull request isn't charged with it; the event's old base does not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t.invalid",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t.invalid")
+
+            def run(*args):
+                return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, env=env,
+                                      text=True).stdout.strip()
+
+            (root / "tools").mkdir()
+            (root / "tools/layers.json").write_text(json.dumps({"allowed": []}))
+            (root / "work.txt").write_text("a\n")
+            run("init", "-q", "-b", "main")
+            run("add", ".")
+            run("commit", "-q", "-m", "base")
+            base = run("rev-parse", "HEAD")
+            run("checkout", "-q", "-b", "work")
+            (root / "work.txt").write_text("b\n")
+            run("commit", "-q", "-am", "unrelated change")
+            run("checkout", "-q", "main")
+            (root / "tools/layers.json").write_text(json.dumps({"allowed": ["core -> horizon"]}))
+            run("commit", "-q", "-am", "main allows an exception")
+            run("checkout", "-q", "--detach", "main")
+            run("merge", "-q", "--no-ff", "-m", "merge work", "work")
+            with mock.patch.object(check_layers, "ROOT", root), mock.patch.object(merge_base, "ROOT", root):
+                merged, error = merge_base.pull_request_base(base, True)
+                self.assertIsNone(error)
+                self.assertEqual(check_layers.base_config(merged), {"allowed": ["core -> horizon"]})
+                self.assertEqual(check_layers.base_config(base), {"allowed": []})
+                run("checkout", "-q", "work")
+                self.assertEqual(merge_base.pull_request_base(base, True)[1],
+                                 "--pull-request-merge needs HEAD to merge the pull request into a descendant of --base.")
 
 
 class BaseConfigTests(unittest.TestCase):

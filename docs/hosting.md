@@ -63,7 +63,7 @@ for Windows includes it), else against the SHA-256 GitHub publishes, and never a
 - a `game-files` folder for the files you prepare, kept across updates.
 
 Options: `--version vX.Y.Z`, `--dir FOLDER`, `--bin FOLDER` (Windows: `-Version`, `-Dir`). Other systems,
-such as Linux on ARM, build from source: `cargo build --release -p horizon-client --bin horizon-client -p
+such as Linux on ARM, build from source: `cargo build --release -p horizon-game --bin horizon-client -p
 horizon-server` and keep both programs in one folder.
 
 On Nix and NixOS, the repository's flake builds `horizon-server` from source and has a
@@ -118,7 +118,10 @@ horizon-server init --eula --world survival --seed 12345 --port 25565 --whitelis
 
 `--no-whitelist` turns the whitelist off, and `--offline` turns online mode off (see "Before you start").
 The players you add are looked up as Minecraft accounts in online mode, and get offline UUIDs on an offline
-server, as vanilla does.
+server, as vanilla does. A lookup Mojang's services don't answer (they rate-limit busy addresses, often a host's,
+with HTTP 429) is tried three times, 750 ms apart, as vanilla's bulk lookup does; if it still fails, `init` says
+so ("Couldn't look up Alex: Mojang's services are rate-limiting this address...") rather than that the player
+doesn't exist. The same goes for `op`, `whitelist add` and `ban` while the server is stopped.
 
 Start the server in the foreground, with the console on your terminal (Ctrl-C stops it cleanly):
 
@@ -160,6 +163,10 @@ enforce_whitelist = false
 view_distance = 10
 simulation_distance = 10
 max_view_distance = 0        # past view_distance, saved chunks only, up to this (0: off)
+max_viewed_loaded_chunks = 2048             # see "Other levels a mod shows a player" below
+max_viewed_ticking_chunks = 441
+max_viewed_loaded_chunks_per_level = 16384
+max_viewed_ticking_chunks_per_level = 3528
 admin_feedback_to_ops = true # operators see each other's commands ([name: ...]); false: only the log
 accept_older_clients = false # true: 26.2 clients join too (see below; work in progress)
 
@@ -241,6 +248,40 @@ average tick goes over 50 ms, the ring pulls in by two chunks a second, never in
 30 s of ticks under 45 ms, it grows back by one chunk every 5 s. What it sent is kept in memory for 5
 minutes (96 MB at most), so a player walking back isn't sent the save again.
 
+### Other levels a mod shows a player: `max_viewed_*`
+
+A server mod (a portal mod, for example) can ask for areas of chunks in other levels for one player
+(`PlayerRef::set_chunk_areas`). The server keeps them loaded and sends them to a Horizon client that can
+keep other levels; a vanilla client is sent nothing. An area either only keeps its chunks loaded (nothing
+ticks there because of it) or ticks them as a player standing there would. An area counts as no player:
+no mobs spawn around it, it doesn't count for sleeping, raids or spawners. Terrain generated for it is
+saved like any other.
+
+The four caps limit what mods can ask for, counted per level:
+
+| Setting | Default | Range | What it counts |
+|---|---|---|---|
+| `max_viewed_loaded_chunks` | 2048 | 0 to 65536 | Chunks kept loaded for one player in one level, the loading ring around each area included. A client keeps at most 4489 columns of a viewed level: a higher value is lowered to 4489 at startup, with a warning in the log. A client of an older Horizon (before revision 4 of viewed levels) gets at most 2048 |
+| `max_viewed_ticking_chunks` | 441 | 0 to 65536 | Of them, the ticking ones: 441 is one player's simulation area at distance 10 |
+| `max_viewed_loaded_chunks_per_level` | 16384 | 0 to 1048576 | Loaded chunks of every player together in one level |
+| `max_viewed_ticking_chunks_per_level` | 3528 | 0 to 1048576 | Ticking chunks of every player together in one level |
+
+0 refuses every area of that kind. A request over a cap is refused whole, and the mod is told which cap and
+its value. Areas end when the player leaves.
+
+### Levels a mod opens: `horizon-max-runtime-levels`
+
+A mod can open levels of its own while the server runs ([runtime levels](modding/src/how-to/world/runtime-levels.md)).
+The server keeps at most 64 of them open at once, for all mods together; the 65th request is refused
+with `CapReached`. Set another number under `[properties]` in `server.toml`:
+
+```toml
+[properties]
+horizon-max-runtime-levels = 128
+```
+
+A level frees its place when its mod unloads or deletes it (a delete also removes its folder from `dimensions/`). After 300 ticks with nobody in it, it leaves memory, as any level does, but keeps its place: it opens again when someone enters it.
+
 Already have a vanilla server? Run `horizon-server init` in its folder, or `horizon-server import
 server.properties` to write `server.toml` from it. The world, `ops.json`, `whitelist.json` and the ban lists
 keep vanilla's names and formats, so going back to vanilla works too.
@@ -249,7 +290,7 @@ keep vanilla's names and formats, so going back to vanilla works too.
 
 A native-mods build exports a standalone engine
 (`horizon-launcher native-build FOLDER --server-output DIR --version TAG --trust-native-code`;
-see [Native mods](native-mods.md#standalone-server-export)). Point the server at it:
+see [Native mods](modding/src/how-to/native-mods/12-standalone-server-export.md)). Point the server at it:
 
     horizon-server --dir SERVER config set engine.path=/absolute/export/horizon-engine
     horizon-server --dir SERVER restart
@@ -357,7 +398,9 @@ far past the view distance, which helps players find the seed. A player's own LO
 shorter. Each player may have 8 tiles waiting and ask for 64 a second on average, and one background thread
 samples them for everyone in turn, behind the ticks, so far terrain never slows the server down; a tile past the
 distance or over a player's limits is refused, and a client that keeps breaking the limits is disconnected.
-Tiles are sampled again for each player who asks (there is no cache yet). Vanilla clients never hear of it.
+A tile is the same for every player in its level, so the server keeps the tiles it sampled in memory (up to
+32 MiB, about 4,000 tiles; the least recently asked for go first) and answers the next player who asks for one
+with it: players looking at the same land cost one sample. Vanilla clients never hear of it.
 
 `horizon-server report` records the running server for 60 seconds (`report 300` for five minutes, up to 600) into
 `reports/profile-<time>Z.hzperf`, a capture the performance tools read ([perf-platform.md](perf-platform.md)), and
@@ -407,6 +450,55 @@ A running server takes the difficulty, the default game mode, the whitelist, the
 player limit and the backup settings at once; the rest applies at its next start, and `config set` says which. `--json` prints that as `saved`, `applied`
 and `restart`.
 
+**`/restart`** saves and stops the game as `/stop` does, and the server starts it again: from in game, the console,
+RCON and `horizon-server cmd restart`, for owners (the permission `/stop` needs). The command exists only on a
+server `horizon-server` runs, so vanilla's command tree is unchanged elsewhere; a game started by hand answers on its
+console that nothing would start it again, and does nothing. The game program is looked up again at every start, so a
+new engine put in place beforehand (`engine.path`, or the release `current` points at) runs after the restart. Put it
+there with `mv` or `install`, which swap the file: copying over the running program fails or corrupts it.
+With `[proxy]` on (below), the players stay connected through it.
+
+### Behind the server's own proxy: `[proxy]`
+
+    [proxy]
+    enabled = true
+
+Off by default. With it on, `horizon-server` listens on `server.port` itself and runs the game on 127.0.0.1, on
+`game_port` (0: a free port), with Velocity forwarding and a secret it makes (`forwarding.secret`, kept in
+`.horizon/`; a `forwarding.secret` you wrote for a Velocity of your own stops the start). It logs each player in
+itself, with `online_mode` as set (the account check and the encryption), then logs into the game as that player
+and passes the packets along as they are. The game sees the player's real UUID, name, skin and address, and its own
+whitelist, bans and player limit apply as always. The server list is the game's own, or says "restarting" while the
+game is down. It is read when `horizon-server` starts, not when the game does.
+
+    [proxy]
+    enabled = true
+    hold_seconds = 60       # how long a held player waits for the game, 1 to 3600
+
+**What players see during a restart.** Whatever stops the game for a restart (`/restart`, `horizon-server restart`,
+the API, the panel, an update, a backup restore) or ends it (a crash), the proxy sends each player a request to
+set the world up again, and the player's game shows its loading screen. The player stays on the same connection:
+no disconnect, no login, no auto-reconnect. The proxy keeps them alive while the game is down. When the game is
+back, the proxy logs into it again as the same player, passes its configuration (registries, tags, packs) to the
+client and replays what the client said at its first login (its settings, brand, plugin channels and chat
+session); then play goes on from the game's own join, so the player is placed where the saved player data says,
+with their inventory. A player who connects while the game is down is logged in the same way and waits in the
+loading screen. The server list says "restarting" meanwhile.
+
+If the game is not back after `hold_seconds`, the held players are disconnected with a message that says so. A
+stop for good (`horizon-server stop`, Ctrl-C, the service stopping) is not held: players get the game's own
+"server closed", and a `stop` typed in game disconnects them with "the server was stopped" once the game has ended.
+A player who is in the middle of joining when the game stops is held in the configuration they were in: the
+game's registries reach them a second time, which is not tried against every client version.
+
+The proxy relays a stopping game's own kick as a hold. To keep a plugin or a restart script from being mistaken
+for a kick, only the reason `multiplayer.disconnect.server_shutdown` is held; bans, kicks and timeouts reach the
+player as they are.
+
+It is not a general proxy: one game, the one this server runs, and no routing (for several servers, see
+[#7484](https://github.com/horizon-rust/horizon/issues/7484)). Clients of an older release (`accept_older_clients`)
+can't join through it. The game's own port is private: a login that doesn't come from the proxy is refused.
+
 The server restarts the game by itself if it crashes: after 5 s, then waiting longer each time, up to 5
 minutes. It keeps the crash report and gives up after 5 crashes in 10 minutes, and `status` says why.
 
@@ -439,7 +531,8 @@ so, with an Update button that runs `horizon-server update` (section 5), and sho
 horizon-server panel
 ```
 
-prints a login link that works once, for 10 minutes. The panel listens on `127.0.0.1:8130`, this computer
+prints a login link that works once, for 10 minutes. A sign-in lasts for its browser tab, until it goes 12
+hours unused or for 7 days at most; then make a new link. The panel listens on `127.0.0.1:8130`, this computer
 only. To reach it from your other devices:
 
 - put your tailnet address in `[panel] bind` (for example `bind = "100.101.102.103:8130"`), or
@@ -461,7 +554,7 @@ or keeps its settings, fix both in `server.toml`:
 ```toml
 [api]
 bind = "127.0.0.1:8131"      # or your tailnet address, 100.x.y.z:8131
-token = "a long random string only the bot knows"
+token = "b0t-0nly-2f9c41a7d8e35b60"   # 16 characters or more, no spaces
 ```
 
 The same rules as the panel's hold: a tailnet or loopback address, unless `allow_public = true` (the token is then
@@ -585,7 +678,7 @@ horizon-server restore before-the-update
 
 A backup zips the world, vanilla's files and `server.toml` into `backups/`. A running server saves first and
 stays up: players don't notice. Automatic backups run on the `[backups] every` schedule while the server runs,
-and the oldest automatic ones beyond `keep` are deleted. Backups you make by hand are never deleted.
+and the oldest automatic ones beyond `keep` (1 to 1000) are deleted. Backups you make by hand are never deleted.
 
 `restore` takes a backup's file name, a unique start of it, or the name you gave it. It moves the current
 world aside to `backups/replaced-<time>/` (never deleted), puts the backup in place, and restarts the server if
@@ -636,6 +729,43 @@ legacy = true
 ```
 
 Players join with any vanilla 26.3 client: only the server decides the damage.
+
+### Mods' biome regions: `[biome_regions]`
+
+A world made with a mod that adds a [biome region](modding/src/how-to/content-mods/biome-regions.md) saves that region with the
+world. If the mod is later removed, the server refuses to start and names the mod and region. To start anyway with
+vanilla's biomes where that region was (chunks that already exist stay as they are), add to `server.toml`, then
+restart:
+
+```toml
+[biome_regions]
+missing = "vanilla"      # "refuse", the default: don't start
+adopt_installed = false  # true explicitly adopts installed regions for new generation
+```
+
+The choice for a missing mod is saved in the world, so it holds even if the setting is removed later.
+Substitution keeps the missing region's slot and weight; a returning mod does not undo it.
+Adoption keeps saved weights for returning regions, takes declared weights for new regions and
+drops absent regions. Completed chunks keep their saved biomes and blocks. New generation may
+differ in surface material, carving, features and structures. The
+[design note](design/mod-api/mod-biome-regions.md) lists record limits and fixture coverage.
+
+### Worlds saved with mods that are gone: `[missing_mods]`
+
+A world records the mods it was saved with: code mods and content mods, and the namespaces of the mods' blocks.
+If one of them is no longer loaded, opening the world turns that mod's blocks into air and removes what they hold,
+and the next save makes it permanent. So the server refuses to start that world: it logs one line per missing mod
+and a last line naming the switch, and changes nothing in the world. To open it anyway, back the world up, then add
+to `server.toml` and restart:
+
+```toml
+[missing_mods]
+allow = true   # false, the default: don't start
+```
+
+Started as `horizon-client --dedicated` directly, `--allowMissingMods` does the same for one start. With either one,
+the server logs the same list as a warning and opens the world. A mod whose `mod_mismatch` listener marks a missing
+mod resolved (a migration) takes it off the list.
 
 ## 8. Start it with the computer
 

@@ -7,13 +7,14 @@ use crate::{
 };
 use horizon_core::random::{LegacyRandom, LevelRandom};
 use horizon_world::registry::BlockStateId;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+mod path_type_cache;
 mod pending_entity;
 pub use pending_entity::{EntityLoadReason, PendingEntity};
 
 mod modified;
-pub use modified::ModifiedChunks;
+pub use modified::{ChunkMark, ModifiedChunks};
 
 /// Sections (x, section index, z) waiting to be remeshed, kept by column
 /// (a bit per section index), so the mesh scheduler looks at each column once
@@ -37,6 +38,25 @@ impl DirtySections {
                 .columns
                 .get(&(x, z))
                 .is_some_and(|m| m.contains(sy as usize))
+    }
+    /// Remove a single section index, pruning its column entry if empty.
+    pub fn remove(&mut self, (x, sy, z): (i32, i32, i32)) -> bool {
+        if !(0..SectionMask::CAPACITY as i32).contains(&sy) {
+            return false;
+        }
+        let Some(mask) = self.columns.get_mut(&(x, z)) else {
+            return false;
+        };
+        let had = mask.contains(sy as usize);
+        mask.remove(sy as usize);
+        if mask.is_empty() {
+            self.columns.remove(&(x, z));
+        }
+        had
+    }
+    /// The dirty section indexes of column (x, z).
+    pub fn column(&self, x: i32, z: i32) -> SectionMask {
+        self.columns.get(&(x, z)).copied().unwrap_or_default()
     }
     /// The dirty section indexes of column (x, z), removed.
     pub fn take_column(&mut self, x: i32, z: i32) -> SectionMask {
@@ -62,11 +82,23 @@ impl DirtySections {
     }
 }
 pub struct World {
+    // Initialized only for a logical server level, then borrowed by every AI worker.
+    path_type_cache: OnceLock<path_type_cache::PathTypeCache>,
+    /// The dimension type's fire-source tag, resolved at entry and data reload.
+    pub infiniburn: Option<Arc<horizon_world::level::data::BlockSet>>,
     /// Server-owned mod data attached to this dimension.
-    pub attachments: horizon_world::attachments::Attachments,
+    pub attachments: horizon_mod_runtime::attachments::Attachments,
+    /// Mod-owned watered areas; never serialized with the world.
+    pub water_tickets: horizon_mod_runtime::water_tickets::WaterTickets,
     /// The holders lent to mods since the last flush, whose synced changes
     /// `flush_attachment_sync` sends.
-    pub attachment_syncs: FxHashSet<horizon_world::attachments::Holder>,
+    pub attachment_syncs: FxHashSet<horizon_mod_runtime::attachments::Holder>,
+    /// Block entities a moving piston landed since the last flush, whose
+    /// synced attachments `flush_attachment_sync` sends whole (arismoko/horizon#3184).
+    pub attachment_landings: FxHashSet<horizon_mod_runtime::attachments::Holder>,
+    /// The capability generations mods' providers advanced here
+    /// (`level_invalidate_capabilities`), which kept capabilities compare.
+    pub capability_generations: horizon_mod_runtime::capability_generations::CapabilityGenerations,
     /// The level's build range and skylight (its dimension type); its
     /// chunks hold `shape.column()`.
     pub shape: LevelShape,
@@ -78,11 +110,22 @@ pub struct World {
     pub air: BlockStateId,
     /// Sections whose geometry changed and need remeshing.
     pub dirty_sections: DirtySections,
+    /// Sections dirtied by individual block edits (`World::set_block`),
+    /// rebuilt synchronously before the frame draws (`SectionRenderDispatcher.rebuildSectionSync`)
+    /// so a placed or broken block appears on the same frame as its selection outline.
+    pub immediate_sections: DirtySections,
+    /// Nesting depth of active local player block-edit scopes; only writes made while `> 0`
+    /// are recorded in `immediate_sections`.
+    player_edit_depth: u32,
     /// Chunks whose light must be recomputed.
     pub dirty_light: crate::fast_hash::FxHashSet<(i32, i32)>,
     /// Edits on lit chunks (position, old state, new state), relit
     /// incrementally by streaming.
     pub light_edits: Vec<((i32, i32, i32), u32, u32)>,
+    /// Where each light check queued since the last ask sits in `light_edits`, so a repeated
+    /// check at the same position queues nothing, as `LevelLightEngine.checkBlock` queues into a
+    /// set. An index that no longer holds its position (drained, rolled back) is ignored.
+    pub light_checks: crate::fast_hash::FxHashMap<(i32, i32, i32), usize>,
     /// Saved entities of chunks that just loaded, spawned by the game.
     pub loaded_entities: Vec<((i32, i32), Vec<PendingEntity>)>,
     /// Chunks loaded since the level's last pass, their entity sections not
@@ -96,11 +139,21 @@ pub struct World {
     pub modified: ModifiedChunks,
     /// Block entities, and the order they tick in.
     pub block_entities: crate::block_entities::BlockEntities,
+    /// Carrier transfer fences: the world cells and carriers locked
+    /// while a carrier operation runs between prepared and committed
+    /// (the game's carrier transfers). Empty, one load, when no
+    /// operation is in flight.
+    pub carrier_fences: crate::carrier_fences::Fences,
+    /// Whether the world's `data/` folder already existed when the
+    /// world opened — the carrier store's first-use gate. Captured at
+    /// open, not at transfer time, so a folder created this session
+    /// (by the first save, say) cannot pass for an old one.
+    pub carrier_data_existed_at_open: bool,
     /// Each chest's `ContainerOpenersCounter`: opener count and largest
     /// interaction range.
     pub chest_openers: FxHashMap<(i32, i32, i32), (i32, f64)>,
     /// `BaseContainerBlockEntity.name`: custom names of container block entities.
-    pub block_names: FxHashMap<(i32, i32, i32), horizon_world::nbt::Tag>,
+    pub block_names: FxHashMap<(i32, i32, i32), horizon_core::nbt::Tag>,
     /// States (by id) whose writes are recorded in `watched_writes` (sculk
     /// blocks, which need a block entity).
     pub watched: Vec<bool>,
@@ -121,9 +174,13 @@ pub struct World {
     /// Writes of this tick's block events and block entities, held out of
     /// the log while it is sent: they go out with the next tick's.
     pub block_log_held: Vec<(i32, i32, i32)>,
+    /// The state each position had before its first write since the hub last took it, for the
+    /// projections of the players whose view of the terrain differs (`lan::terrain_view`); kept
+    /// only while that hub asks for it.
+    pub block_previous: Option<FxHashMap<(i32, i32, i32), u32>>,
     /// Every write since the mobs last ticked (position, old and new state),
     /// for `ServerLevel.sendBlockUpdated`'s path recomputing; kept only while
-    /// the mobs of this world tick (`game/creatures.rs`).
+    /// the mobs of this world tick (`game/mobs/creatures/mod.rs`).
     pub path_writes: Option<Vec<((i32, i32, i32), u32, u32)>>,
     /// The chunks changed in bulk (`edit_runs`) since the log was last
     /// drained, kept while `block_log` is: sent to the players whole.
@@ -133,7 +190,7 @@ pub struct World {
     /// (`ChunkHolder.sectionLightChanged`).
     pub light_log: Option<crate::fast_hash::FxHashMap<(i32, i32), SectionMask>>,
     /// The villager POIs of each section (`PoiManager`'s sections).
-    pub pois: crate::poi_sections::PoiSections<crate::poi_sections::Poi>,
+    pub pois: crate::poi_sections::PoiSections<horizon_world::poi::PoiIdentity>,
     /// Moving-piston states removed during the last tick; retained until the
     /// final block mesh is visible.
     pub moving_piston_fallback: Vec<([i32; 3], horizon_world::piston_shape::MovingPistonState)>,
@@ -144,6 +201,21 @@ pub struct World {
     /// from the block entities after each tick: the collision queries read it
     /// (`ShulkerBoxBlockEntity.getBoundingBox`), as `moving_pistons` for pistons.
     pub shulkers: FxHashMap<[i32; 3], crate::block_entity_anim::Shulker>,
+}
+/// See [`World::region_stamp`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionStamp {
+    n: u8,
+    items: [(i32, i32, i32, u64, u32); RegionStamp::MOST],
+}
+impl RegionStamp {
+    /// The most sections (or missing columns) a stamp holds: a box of 16 blocks a side reaches 8.
+    pub const MOST: usize = 8;
+    fn push(&mut self, item: (i32, i32, i32, u64, u32)) -> Option<()> {
+        *self.items.get_mut(usize::from(self.n))? = item;
+        self.n += 1;
+        Some(())
+    }
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Weather {
@@ -216,16 +288,71 @@ impl Weather {
             self.thunder_level.0 + (self.thunder_level.1 - self.thunder_level.0) * partial;
         (rain, thunder * rain)
     }
+    /// `ClientPacketListener.handleGameEvent`'s weather events, the player's level's or a viewed
+    /// level's: START_RAINING (1), STOP_RAINING (2), RAIN_LEVEL_CHANGE (7) and
+    /// THUNDER_LEVEL_CHANGE (8), with the event's `param`. Any other event is not the weather's.
+    pub fn game_event(&mut self, event: u8, param: f32) {
+        match event {
+            1 => {
+                self.raining = true;
+                self.rain_level = (0.0, 0.0);
+            }
+            2 => {
+                self.raining = false;
+                self.rain_level = (1.0, 1.0);
+            }
+            7 => {
+                self.rain_level = (param, param);
+                self.raining = param > 0.0;
+            }
+            8 => {
+                self.thunder_level = (param, param);
+                self.thundering = param > 0.0;
+            }
+            _ => {}
+        }
+    }
 }
 impl World {
+    /// Install loaded instances, retiring an existing column's block entities even
+    /// when the new payload omits their positions. Initial loads need no world scan.
+    pub fn load_chunk_block_entities(
+        &mut self,
+        chunk: (i32, i32),
+        entities: Vec<(
+            crate::block_entities::Pos,
+            crate::chunk::block_entity::BlockEntity,
+        )>,
+    ) {
+        if self.chunks.contains_key(&chunk) {
+            let incoming: FxHashSet<_> = entities.iter().map(|(pos, _)| *pos).collect();
+            self.block_entities
+                .unload(|p| (p.0 >> 4, p.2 >> 4) == chunk && !incoming.contains(p));
+        }
+        self.block_entities.load_chunk(entities);
+    }
+    /// A loaded column's block entities, as fresh instances, with the attachment maps its save
+    /// kept for them.
+    pub fn install_chunk_block_entities(&mut self, chunk: &mut crate::chunk::Chunk) {
+        let key = (chunk.x, chunk.z);
+        self.load_chunk_block_entities(key, std::mem::take(&mut chunk.block_entities));
+        if let Some(extras) = &chunk.saved {
+            for (pos, attachments) in &extras.block_entity_attachments {
+                self.block_entities
+                    .restore_attachments(*pos, attachments.clone());
+            }
+        }
+    }
     /// Queue ordinary NBT; transient transfer state is never decoded from it.
-    pub fn queue_entity_nbt(&mut self, key: (i32, i32), tags: Vec<horizon_world::nbt::Tag>) {
+    pub fn queue_entity_nbt(&mut self, key: (i32, i32), tags: Vec<horizon_core::nbt::Tag>) {
         self.loaded_entities
             .push((key, tags.into_iter().map(PendingEntity::from).collect()));
     }
 
     pub fn new(air: BlockStateId, seed: i64) -> Self {
         Self {
+            path_type_cache: OnceLock::new(),
+            infiniburn: None,
             shape: LevelShape::OVERWORLD,
             chunks: Default::default(),
             random: LevelRandom::for_level(LegacyRandom::new(seed)),
@@ -234,15 +361,23 @@ impl World {
             air,
             fast_lava: false,
             dirty_sections: Default::default(),
+            immediate_sections: Default::default(),
+            player_edit_depth: 0,
             dirty_light: Default::default(),
             light_edits: Vec::new(),
+            light_checks: Default::default(),
             loaded_entities: Vec::new(),
             entities_pending: FxHashSet::default(),
             loaded_chunks: Vec::new(),
             modified: ModifiedChunks::default(),
             attachments: Default::default(),
+            water_tickets: Default::default(),
             attachment_syncs: FxHashSet::default(),
+            attachment_landings: FxHashSet::default(),
+            capability_generations: Default::default(),
             block_entities: Default::default(),
+            carrier_fences: Default::default(),
+            carrier_data_existed_at_open: false,
             chest_openers: FxHashMap::default(),
             block_names: FxHashMap::default(),
             watched: Vec::new(),
@@ -254,6 +389,7 @@ impl World {
             weather: Weather::default(),
             block_log: None,
             block_log_held: Vec::new(),
+            block_previous: None,
             path_writes: None,
             bulk_log: Default::default(),
             light_log: None,
@@ -338,26 +474,111 @@ impl World {
     /// cell above or below the level reads its top or bottom cells, not the cells the chunks'
     /// widened column holds there (vanilla's Nether and End save none, and read back they
     /// hold the table's first biome). `None` where the chunk isn't loaded.
+    #[inline]
     pub fn noise_biome(&self, x: i32, y: i32, z: i32) -> Option<u16> {
         let y = y.clamp(self.shape.min_y, self.shape.max_y() - 1);
-        Some(self.chunks.get(&(x >> 4, z >> 4))?.biome(x, y, z))
+        Some(self.chunks.get_chunk(x >> 4, z >> 4)?.biome(x, y, z))
     }
     /// One above the highest block Y the level's chunks hold.
     pub fn top_y(&self) -> i32 {
         self.layout().max_y()
     }
+    /// Writes the stored state at a resident position and nothing else: no remesh, relight,
+    /// block log, path or watched write, and no block entity change. A transaction's tentative
+    /// write, which `set` makes real at the root commit or which this takes back on an abort,
+    /// so nothing outside sees it. False outside the resident chunks or the world's height.
+    pub fn set_stored(&mut self, x: i32, y: i32, z: i32, state: BlockStateId) -> bool {
+        self.chunks
+            .mutate_chunk((x >> 4, z >> 4), |chunk| {
+                if chunk.section_index(y).is_none() {
+                    return false;
+                }
+                Arc::make_mut(chunk).set(x & 15, y, z & 15, state.0);
+                true
+            })
+            .unwrap_or(false)
+    }
+    /// Enter a local player block-edit scope so writes mark `immediate_sections`.
+    pub fn begin_player_edit(&mut self) {
+        self.player_edit_depth = self.player_edit_depth.saturating_add(1);
+    }
+    /// Leave a local player block-edit scope.
+    pub fn end_player_edit(&mut self) {
+        self.player_edit_depth = self.player_edit_depth.saturating_sub(1);
+    }
+    /// Dirty sections whose center is within `max_dist_sq` of `camera_block` (vanilla
+    /// `PrioritizeChunkUpdates.NEARBY`, 768.0 squared blocks), nearest first, at most `limit`.
+    /// Returned apart from `immediate_sections` so the player's own edits are never budgeted.
+    pub fn nearby_dirty_sections(
+        &self,
+        camera_block: [i32; 3],
+        max_dist_sq: f64,
+        limit: usize,
+    ) -> Vec<(i32, i32, i32)> {
+        let bottom_y = self.bottom_y();
+        let (cx0, cy0, cz0) = (
+            f64::from(camera_block[0]),
+            f64::from(camera_block[1]),
+            f64::from(camera_block[2]),
+        );
+        // Only the columns whose centre can be within reach, not every dirty column loaded.
+        let reach = max_dist_sq.sqrt();
+        let columns = |c0: f64| {
+            ((c0 - 8.0 - reach) / 16.0).ceil() as i32..=((c0 - 8.0 + reach) / 16.0).floor() as i32
+        };
+        let mut nearby = Vec::new();
+        for (cx, cz) in columns(cx0).flat_map(|cx| columns(cz0).map(move |cz| (cx, cz))) {
+            let sections = self.dirty_sections.column(cx, cz);
+            if sections.is_empty() {
+                continue;
+            }
+            let sx = f64::from(cx * 16 + 8) - cx0;
+            let sz = f64::from(cz * 16 + 8) - cz0;
+            let horiz = sx * sx + sz * sz;
+            if horiz > max_dist_sq {
+                continue;
+            }
+            for sy in sections.iter().map(|s| s as i32) {
+                let sy_d = f64::from(bottom_y + sy * 16 + 8) - cy0;
+                let dist_sq = horiz + sy_d * sy_d;
+                if dist_sq <= max_dist_sq {
+                    nearby.push((dist_sq, (cx, sy, cz)));
+                }
+            }
+        }
+        // Hash order differs run to run; the key breaks distance ties deterministically.
+        nearby.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        nearby.truncate(limit);
+        nearby.into_iter().map(|(_, key)| key).collect()
+    }
     /// Resident storage write; marks the touched sections (and neighbours on
     /// section borders) for remeshing and the surrounding chunks for relighting.
     /// Neighbour updates, drops and block entities belong to the gameplay layer.
     pub fn set(&mut self, x: i32, y: i32, z: i32, state: BlockStateId) -> crate::Result<()> {
-        let Some(chunk) = self.chunks.get_mut(&(x >> 4, z >> 4)) else {
+        self.set_with_notification(x, y, z, state, true)
+    }
+    /// Store a state while controlling whether the change enters the client block log.
+    pub fn set_with_notification(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        state: BlockStateId,
+        notify: bool,
+    ) -> crate::Result<()> {
+        let Some(write) = self.chunks.mutate_chunk((x >> 4, z >> 4), |chunk| {
+            let min_y = chunk.min_y();
+            let sections = chunk.sections.len() as i32;
+            if chunk.section_index(y).is_none() {
+                return Err("write outside world height");
+            }
+            let lit = chunk.lit;
+            let previous = Arc::make_mut(chunk).set(x & 15, y, z & 15, state.0);
+            Ok((min_y, sections, lit, previous))
+        }) else {
             return Err("write outside resident chunks".into());
         };
-        let (min_y, sections) = (chunk.min_y(), chunk.sections.len() as i32);
-        if chunk.section_index(y).is_none() {
-            return Err("write outside world height".into());
-        }
-        let previous = Arc::make_mut(chunk).set(x & 15, y, z & 15, state.0);
+        let (min_y, sections, lit, previous) = write?;
         if previous != state.0 {
             self.block_entities
                 .state_changed((x, y, z), previous, state.0);
@@ -366,7 +587,10 @@ impl World {
                 self.watched_writes.push(((x, y, z), previous, state.0));
             }
             self.revision = self.revision.wrapping_add(1);
-            if let Some(log) = &mut self.block_log {
+            if let Some(states) = &mut self.block_previous {
+                states.entry((x, y, z)).or_insert(previous);
+            }
+            if notify && let Some(log) = &mut self.block_log {
                 log.push((x, y, z));
             }
             if let Some(writes) = &mut self.path_writes {
@@ -379,35 +603,64 @@ impl World {
             // border (the diagonal only where both borders meet).
             let sy = (y - min_y) >> 4;
             let local_y = y & 15;
-            let mark = |dirty: &mut DirtySections, bx: i32, bz: i32| {
-                dirty.insert((bx >> 4, sy, bz >> 4));
-                if local_y == 0 && sy > 0 {
-                    dirty.insert((bx >> 4, sy - 1, bz >> 4));
-                }
-                if local_y == 15 && sy + 1 < sections {
-                    dirty.insert((bx >> 4, sy + 1, bz >> 4));
-                }
-            };
+            let record_immediate = self.player_edit_depth > 0;
+            let mark =
+                |dirty: &mut DirtySections, immediate: &mut DirtySections, bx: i32, bz: i32| {
+                    let mut insert = |section: (i32, i32, i32)| {
+                        dirty.insert(section);
+                        if record_immediate {
+                            immediate.insert(section);
+                        }
+                    };
+                    insert((bx >> 4, sy, bz >> 4));
+                    if local_y == 0 && sy > 0 {
+                        insert((bx >> 4, sy - 1, bz >> 4));
+                    }
+                    if local_y == 15 && sy + 1 < sections {
+                        insert((bx >> 4, sy + 1, bz >> 4));
+                    }
+                };
             let (bx, bz) = (x & 15, z & 15);
-            mark(&mut self.dirty_sections, x, z);
+            mark(&mut self.dirty_sections, &mut self.immediate_sections, x, z);
             if bx == 0 {
-                mark(&mut self.dirty_sections, x - 1, z);
+                mark(
+                    &mut self.dirty_sections,
+                    &mut self.immediate_sections,
+                    x - 1,
+                    z,
+                );
             } else if bx == 15 {
-                mark(&mut self.dirty_sections, x + 1, z);
+                mark(
+                    &mut self.dirty_sections,
+                    &mut self.immediate_sections,
+                    x + 1,
+                    z,
+                );
             }
             if bz == 0 {
-                mark(&mut self.dirty_sections, x, z - 1);
+                mark(
+                    &mut self.dirty_sections,
+                    &mut self.immediate_sections,
+                    x,
+                    z - 1,
+                );
             } else if bz == 15 {
-                mark(&mut self.dirty_sections, x, z + 1);
+                mark(
+                    &mut self.dirty_sections,
+                    &mut self.immediate_sections,
+                    x,
+                    z + 1,
+                );
             }
             if (bx == 0 || bx == 15) && (bz == 0 || bz == 15) {
                 mark(
                     &mut self.dirty_sections,
+                    &mut self.immediate_sections,
                     if bx == 0 { x - 1 } else { x + 1 },
                     if bz == 0 { z - 1 } else { z + 1 },
                 );
             }
-            if self.chunks.get(&(x >> 4, z >> 4)).is_some_and(|c| c.lit) {
+            if lit {
                 self.light_edits.push(((x, y, z), previous, state.0));
             } else {
                 for dz in -1..=1 {
@@ -422,26 +675,59 @@ impl World {
     /// `getHeight(Heightmap.Types.WORLD_SURFACE, x, z)`: one above the highest
     /// block that isn't `air`, or the column's minimum Y (also where the chunk
     /// isn't loaded).
+    #[inline]
     pub fn world_surface(&self, x: i32, z: i32, air: impl Fn(BlockStateId) -> bool) -> i32 {
         let bottom = self.layout().min_y();
-        self.chunks.get(&(x >> 4, z >> 4)).map_or(bottom, |chunk| {
-            chunk.world_surface(x, z, |v| air(BlockStateId(v)))
-        })
+        self.chunks
+            .get_chunk(x >> 4, z >> 4)
+            .map_or(bottom, |chunk| {
+                chunk.world_surface(x, z, |v| air(BlockStateId(v)))
+            })
     }
     /// `getHeight(Heightmap.Types.MOTION_BLOCKING, x, z)`: one above the
     /// highest block where `blocks` (motion blocking or holding a fluid),
     /// or the column's minimum Y (also where the chunk isn't loaded).
+    #[inline]
     pub fn motion_blocking(&self, x: i32, z: i32, blocks: impl Fn(BlockStateId) -> bool) -> i32 {
         let bottom = self.layout().min_y();
-        self.chunks.get(&(x >> 4, z >> 4)).map_or(bottom, |chunk| {
-            chunk.motion_blocking(x & 15, z & 15, |v| blocks(BlockStateId(v)))
-        })
-    }
-    #[inline]
-    pub fn block(&self, x: i32, y: i32, z: i32) -> BlockStateId {
         self.chunks
-            .get(&(x >> 4, z >> 4))
-            .map_or(self.air, |chunk| chunk.block(x & 15, y, z & 15))
+            .get_chunk(x >> 4, z >> 4)
+            .map_or(bottom, |chunk| {
+                chunk.motion_blocking(x & 15, z & 15, |v| blocks(BlockStateId(v)))
+            })
+    }
+    #[inline(always)]
+    pub fn block(&self, x: i32, y: i32, z: i32) -> BlockStateId {
+        match self.chunks.get_chunk(x >> 4, z >> 4) {
+            Some(chunk) => chunk.block(x & 15, y, z & 15),
+            None => self.air,
+        }
+    }
+    /// What a reader that looked at the blocks of the box `lo..=hi` (block coordinates) keeps to
+    /// know later that none of them was written: the identity and write count of each block
+    /// container the box reaches, and which chunk columns it found missing. `None` when the box
+    /// reaches more than [`RegionStamp::MOST`] sections. Equal stamps mean the same containers
+    /// with the same entries, so every read of the box answers as it did.
+    pub fn region_stamp(&self, lo: [i32; 3], hi: [i32; 3]) -> Option<RegionStamp> {
+        let mut stamp = RegionStamp {
+            n: 0,
+            items: [(0, 0, 0, 0, 0); RegionStamp::MOST],
+        };
+        for cx in lo[0] >> 4..=hi[0] >> 4 {
+            for cz in lo[2] >> 4..=hi[2] >> 4 {
+                let Some(chunk) = self.chunks.get_chunk(cx, cz) else {
+                    stamp.push((cx, cz, i32::MIN, 0, 0))?;
+                    continue;
+                };
+                for sy in lo[1] >> 4..=hi[1] >> 4 {
+                    if let Some(s) = chunk.section_index(sy << 4) {
+                        let (uid, edits) = chunk.sections[s].blocks.stamp();
+                        stamp.push((cx, cz, s as i32, uid, edits))?;
+                    }
+                }
+            }
+        }
+        Some(stamp)
     }
     /// Whether a block of the box `lo..=hi` may match, from the palettes of
     /// the sections it reaches (a palette of the whole registry may hold
@@ -462,7 +748,7 @@ impl World {
         let sections = (lo[1].max(bottom) - bottom) >> 4..=(hi[1].min(top) - bottom) >> 4;
         for cx in lo[0] >> 4..=hi[0] >> 4 {
             for cz in lo[2] >> 4..=hi[2] >> 4 {
-                let Some(chunk) = self.chunks.get(&(cx, cz)) else {
+                let Some(chunk) = self.chunks.get_chunk(cx, cz) else {
                     if matches(self.air) {
                         return true;
                     }
@@ -485,28 +771,80 @@ impl World {
         let (chunks, air) = (&self.chunks, self.air);
         self.block_entities.tickers(|(x, y, z)| {
             chunks
-                .get(&(x >> 4, z >> 4))
+                .get_chunk(x >> 4, z >> 4)
                 .map_or(air, |chunk| chunk.block(x & 15, y, z & 15))
                 .0
         })
     }
-    pub fn light(&self, x: i32, y: i32, z: i32) -> u8 {
-        self.chunks
-            .get(&(x >> 4, z >> 4))
-            .map_or(0xF0, |chunk| chunk.light(x & 15, y, z & 15))
+    /// Awake subset of [`Self::block_entity_tickers`], cached until tickers or sleep set changes.
+    pub fn awake_block_entity_tickers(
+        &mut self,
+    ) -> std::sync::Arc<Vec<(crate::block_entities::Pos, u32, u64)>> {
+        let (chunks, air) = (&self.chunks, self.air);
+        self.block_entities.awake_tickers(|(x, y, z)| {
+            chunks
+                .get_chunk(x >> 4, z >> 4)
+                .map_or(air, |chunk| chunk.block(x & 15, y, z & 15))
+                .0
+        })
     }
+    #[inline(always)]
+    pub fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        match self.chunks.get_chunk(x >> 4, z >> 4) {
+            Some(chunk) => chunk.light(x & 15, y, z & 15),
+            None => 0xF0,
+        }
+    }
+    #[inline(always)]
     pub fn is_air(&self, state: BlockStateId) -> bool {
         state == self.air
     }
+    #[inline(always)]
     pub fn loaded(&self, x: i32, z: i32) -> bool {
         self.chunks.contains_key(&(x >> 4, z >> 4))
+    }
+    /// Takes chunk `key` out of the level as it unloads, with the capability generations its
+    /// positions held.
+    pub fn unload_chunk(&mut self, key: (i32, i32)) -> Option<Arc<Chunk>> {
+        self.capability_generations.unload_chunk(key);
+        self.chunks.remove(&key)
+    }
+    /// `Level.isLoaded`: `y` is inside the build height and the chunk of `(x, z)` is loaded.
+    /// Never loads a chunk.
+    #[inline(always)]
+    pub fn is_loaded_at(&self, x: i32, y: i32, z: i32) -> bool {
+        self.shape.contains_y(y) && self.loaded(x, z)
+    }
+    /// Persisted container capacity override; absence preserves vanilla capacity.
+    pub fn container_stack_limit(&self, key: (i32, i32, i32)) -> Option<u32> {
+        self.chunks
+            .get_chunk(key.0 >> 4, key.2 >> 4)
+            .and_then(|c| c.container_stack_limits.get(&key).copied())
+    }
+    /// Store with the authoritative saved block entity fields.
+    pub fn set_container_stack_limit(&mut self, key: (i32, i32, i32), limit: u32) {
+        use horizon_core::nbt::{Compound, Tag};
+        self.with_chunk_extras(key, |extras| {
+            if !extras.block_entity_sources.iter().any(|(p, _)| *p == key) {
+                extras
+                    .block_entity_sources
+                    .push((key, Tag::Compound(Compound::new())));
+            }
+            if let Some((_, Tag::Compound(tag))) = extras
+                .block_entity_sources
+                .iter_mut()
+                .find(|(p, _)| *p == key)
+            {
+                tag.insert("horizon:stack_limit".into(), Tag::Int(limit as i32));
+            }
+        });
     }
     /// `LockCode`: the `lock` a container block entity refuses to open
     /// without, as the tag it was loaded or set with carries it (Horizon's
     /// model holds no field for it).
-    pub fn block_lock(&self, key: (i32, i32, i32)) -> Option<&horizon_world::nbt::Tag> {
+    pub fn block_lock(&self, key: (i32, i32, i32)) -> Option<&horizon_core::nbt::Tag> {
         self.chunks
-            .get(&(key.0 >> 4, key.2 >> 4))?
+            .get_chunk(key.0 >> 4, key.2 >> 4)?
             .saved
             .as_ref()?
             .block_entity_sources
@@ -515,15 +853,33 @@ impl World {
             .1
             .get("lock")
     }
+    /// The tag a modelled block entity was loaded or set with: the fields
+    /// Horizon keeps outside its model (`components`, `lock`, a container's
+    /// name) survive on it for a save or a loot roll.
+    pub fn block_entity_source(&self, key: (i32, i32, i32)) -> Option<&horizon_core::nbt::Tag> {
+        self.chunks
+            .get(&(key.0 >> 4, key.2 >> 4))?
+            .saved
+            .as_ref()?
+            .block_entity_sources
+            .iter()
+            .find(|(p, _)| *p == key)
+            .map(|(_, tag)| tag)
+    }
     /// `LockCode.addToTag` for a tag a command gives a container (`setblock`,
     /// `data merge`): the tag it was set with keeps the lock, so `data get`
     /// shows it, a player's open checks it and the save writes it.
-    pub fn set_block_lock(&mut self, key: (i32, i32, i32), tag: &horizon_world::nbt::Tag) {
-        use horizon_world::nbt::Tag;
+    pub fn set_block_lock(&mut self, key: (i32, i32, i32), tag: &horizon_core::nbt::Tag) {
+        use horizon_core::nbt::Tag;
         let lock = tag.get("lock").and_then(|lock| match lock {
             Tag::Compound(_) => Some(lock.clone()),
             _ => None,
         });
+        let mut tag = tag.clone();
+        if let Tag::Compound(map) = &mut tag {
+            map.remove(&"LootTable".into());
+            map.remove(&"LootTableSeed".into());
+        }
         self.with_chunk_extras(key, |extras| {
             let at = extras
                 .block_entity_sources
@@ -550,34 +906,86 @@ impl World {
             }
         });
     }
+    /// The fields Horizon keeps beside a block entity's model, for a journal: the tag it was
+    /// loaded or set with (its `lock`) and its pending loot metadata.
+    pub fn block_entity_extras(&self, key: (i32, i32, i32)) -> BlockEntityExtras {
+        let saved = self
+            .chunks
+            .get_chunk(key.0 >> 4, key.2 >> 4)
+            .and_then(|chunk| chunk.saved.as_ref());
+        BlockEntityExtras {
+            source: saved.and_then(|s| {
+                s.block_entity_sources
+                    .iter()
+                    .find(|(p, _)| *p == key)
+                    .map(|(_, tag)| tag.clone())
+            }),
+            pending_loot: saved.and_then(|s| s.pending_loot.get(&key).cloned()),
+        }
+    }
+    /// Puts back what [`World::block_entity_extras`] kept.
+    pub fn set_block_entity_extras(&mut self, key: (i32, i32, i32), kept: BlockEntityExtras) {
+        self.with_chunk_extras(key, |extras| {
+            extras.block_entity_sources.retain(|(p, _)| *p != key);
+            extras
+                .block_entity_sources
+                .extend(kept.source.map(|tag| (key, tag)));
+            extras.pending_loot.remove(&key);
+            extras
+                .pending_loot
+                .extend(kept.pending_loot.map(|loot| (key, loot)));
+        });
+    }
     /// `LevelChunk.removeBlockEntity`: the tag a block entity was loaded or set
     /// with goes with it, so a container placed there later starts unlocked.
     pub fn forget_block_entity_source(&mut self, key: (i32, i32, i32)) {
         self.with_chunk_extras(key, |extras| {
             extras.block_entity_sources.retain(|(p, _)| *p != key);
+            extras.pending_loot.remove(&key);
         });
     }
     /// Run `f` on the keep-as-loaded data of the chunk holding `key`, put back
     /// for the next save (`block_entity_sources` is where Horizon restores the
     /// block entity fields its model does not hold).
-    fn with_chunk_extras(
+    pub fn with_chunk_extras(
         &mut self,
         key: (i32, i32, i32),
         f: impl FnOnce(&mut crate::chunk::ChunkExtras),
     ) {
         let chunk_key = (key.0 >> 4, key.2 >> 4);
-        let Some(chunk) = self.chunks.get_mut(&chunk_key) else {
-            return;
-        };
-        let chunk = Arc::make_mut(chunk);
-        let mut extras = chunk
-            .saved
-            .take()
-            .map(Arc::unwrap_or_clone)
-            .unwrap_or_default();
-        f(&mut extras);
-        chunk.saved = Some(Arc::new(extras));
-        self.modified.insert(chunk_key);
+        if self
+            .chunks
+            .mutate_chunk(chunk_key, |chunk| {
+                let chunk = Arc::make_mut(chunk);
+                let mut extras = chunk
+                    .saved
+                    .take()
+                    .map(Arc::unwrap_or_clone)
+                    .unwrap_or_default();
+                f(&mut extras);
+                let limit = extras
+                    .block_entity_sources
+                    .iter()
+                    .find(|(p, _)| *p == key)
+                    .and_then(|(_, tag)| tag.get("horizon:stack_limit"))
+                    .and_then(|tag| match tag {
+                        horizon_core::nbt::Tag::Int(n) if (1..=99).contains(n) => Some(*n as u32),
+                        _ => None,
+                    });
+                match limit {
+                    Some(limit) => {
+                        chunk.container_stack_limits.insert(key, limit);
+                    }
+                    None => {
+                        chunk.container_stack_limits.remove(&key);
+                    }
+                }
+                chunk.saved = Some(Arc::new(extras));
+            })
+            .is_some()
+        {
+            self.modified.insert(chunk_key);
+        }
     }
 }
 
@@ -613,6 +1021,48 @@ mod tests {
     use crate::chunk::{Chunk, MIN_Y, SECTIONS};
     use horizon_world::registry::BlockStateId;
     use std::sync::Arc;
+
+    #[test]
+    fn block_entity_neighbor_far_read_keeps_chunk_unloaded() {
+        let mut world = World::new(BlockStateId(0), 0);
+        world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        let count = world.chunks.len();
+        assert!(world.loaded(15, 0));
+        assert!(!world.loaded(16, 0));
+        assert_eq!(world.block(16, 64, 0), BlockStateId(0));
+        assert_eq!(world.chunks.len(), count);
+        assert!(!world.loaded(16, 0));
+    }
+
+    #[test]
+    fn container_limit_index_tracks_load_rollback_removal_and_replacement() {
+        use crate::chunk::ChunkExtras;
+        use horizon_core::nbt::{Compound, Tag};
+        let key = (3, 70, 4);
+        let mut extras = ChunkExtras::default();
+        for (pos, n) in [(key, 10), ((4, 70, 4), 100), ((5, 70, 4), 0)] {
+            let mut tag = Compound::new();
+            tag.insert("horizon:stack_limit".into(), Tag::Int(n));
+            extras.block_entity_sources.push((pos, Tag::Compound(tag)));
+        }
+        let mut chunk = Chunk::empty(0, 0);
+        chunk.saved = Some(Arc::new(extras));
+        let mut world = World::new(BlockStateId(0), 0);
+        world.chunks.insert((0, 0), Arc::new(chunk));
+        assert_eq!(world.container_stack_limit(key), Some(10));
+        assert_eq!(world.container_stack_limit((4, 70, 4)), None);
+        assert_eq!(world.container_stack_limit((5, 70, 4)), None);
+        let kept = world.block_entity_extras(key);
+        world.set_container_stack_limit(key, 20);
+        assert_eq!(world.container_stack_limit(key), Some(20));
+        world.set_block_entity_extras(key, kept);
+        assert_eq!(world.container_stack_limit(key), Some(10));
+        world.forget_block_entity_source(key);
+        assert_eq!(world.container_stack_limit(key), None);
+        world.set_container_stack_limit(key, 30);
+        world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        assert_eq!(world.container_stack_limit(key), None);
+    }
 
     /// `/weather thunder` then `/weather clear` in a frozen world: the levels sit at their
     /// targets at every partial tick, where a tick of fading would have moved them 0.01.
@@ -742,5 +1192,73 @@ mod tests {
         // Past the top, and the palette of air below it.
         assert!(!world.may_hold([0, 400, 0], [0, 401, 0], nine));
         assert!(world.may_hold([0, 400, 0], [0, 401, 0], |s| s.0 == 0));
+    }
+}
+
+/// A block entity's fields kept beside its model ([`World::block_entity_extras`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlockEntityExtras {
+    pub source: Option<horizon_core::nbt::Tag>,
+    pub pending_loot: Option<crate::chunk::PendingContainerLoot>,
+}
+
+#[cfg(test)]
+mod region_stamp_tests {
+    use super::*;
+    use crate::chunk::Chunk;
+    use std::sync::Arc;
+
+    fn world() -> World {
+        let mut w = World::new(BlockStateId(0), 0);
+        for (x, z) in [(0, 0), (1, 0), (0, 1), (1, 1), (5, 5)] {
+            w.chunks.insert((x, z), Arc::new(Chunk::empty(x, z)));
+        }
+        w
+    }
+
+    /// A stamp changes when a block of the box is written (even to the same value's neighbour in
+    /// its section), when a chunk of the box is replaced or appears, and not for a write in a
+    /// section the box does not reach.
+    #[test]
+    fn a_region_stamp_follows_the_writes_of_its_sections() {
+        let mut w = world();
+        let (lo, hi) = ([10, 0, 10], [20, 3, 20]);
+        let a = w.region_stamp(lo, hi).unwrap();
+        assert_eq!(a, w.region_stamp(lo, hi).unwrap(), "nothing written");
+        w.set(80, 0, 80, BlockStateId(1)).unwrap();
+        assert_eq!(a, w.region_stamp(lo, hi).unwrap(), "a write in chunk 5,5");
+        w.set(12, 100, 12, BlockStateId(1)).unwrap();
+        assert_eq!(
+            a,
+            w.region_stamp(lo, hi).unwrap(),
+            "a write in another section of the column"
+        );
+        w.set(12, 1, 12, BlockStateId(1)).unwrap();
+        let b = w.region_stamp(lo, hi).unwrap();
+        assert_ne!(a, b, "a write in the box's section");
+        w.set(12, 1, 12, BlockStateId(0)).unwrap();
+        assert_ne!(
+            b,
+            w.region_stamp(lo, hi).unwrap(),
+            "written back is still a write"
+        );
+        // A chunk replaced by an equal copy is another container.
+        let before = w.region_stamp(lo, hi).unwrap();
+        let copy = Arc::new(Chunk::empty(0, 0));
+        w.chunks.insert((0, 0), copy);
+        assert_ne!(before, w.region_stamp(lo, hi).unwrap(), "a chunk replaced");
+        // A column that is missing, then loaded.
+        let far = ([200, 0, 200], [201, 3, 201]);
+        let missing = w.region_stamp(far.0, far.1).unwrap();
+        w.chunks.insert((12, 12), Arc::new(Chunk::empty(12, 12)));
+        assert_ne!(
+            missing,
+            w.region_stamp(far.0, far.1).unwrap(),
+            "a column loaded"
+        );
+        assert!(
+            w.region_stamp([0, -64, 0], [40, 300, 40]).is_none(),
+            "a box of too many sections"
+        );
     }
 }

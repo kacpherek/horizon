@@ -454,6 +454,8 @@ public final class VanillaDispenserOracle {
             used = wake(w, origin, f.getAsJsonObject("wake"));
         } else if (f.has("special_attack")) {
             used = specialAttack(w, f.getAsJsonObject("special_attack"));
+        } else if (f.has("use_entity")) {
+            used = useEntity(w, f.getAsJsonObject("use_entity"), targets);
         } else if (f.has("attack")) {
             used = attack(w, f.getAsJsonObject("attack"), targets);
         } else if (f.has("hopper")) {
@@ -1037,6 +1039,22 @@ public final class VanillaDispenserOracle {
         return out;
     }
 
+    /**
+     * A player right-clicks the first target holding the case's item, sneaking
+     * or not: the real `Player.interactOn` (`Entity.interact`'s shearing of
+     * equipment, then the mob's own `mobInteract`). The statistics, whether the
+     * click was taken and the held stack follow.
+     */
+    static List<String> useEntity(VanillaBlockUpdateOracle.World w, JsonObject op, List<Entity> targets) throws Exception {
+        Attacker player = attacker(w, op);
+        player.setShiftKeyDown(op.has("sneaking") && op.get("sneaking").getAsBoolean());
+        var result = player.interactOn(targets.get(0), net.minecraft.world.InteractionHand.MAIN_HAND, net.minecraft.world.phys.Vec3.ZERO);
+        w.entities.remove(player);
+        List<String> out = new ArrayList<>(player.stats);
+        out.add("use_entity " + (result.consumesAction() ? "consumed" : "pass") + " held " + ParityData.canon(player.hand));
+        return out;
+    }
+
     /** The level's block entity positions by x, y, z. */
     static List<BlockPos> sortedEntities(VanillaBlockUpdateOracle.World w) {
         List<BlockPos> out = new ArrayList<>(w.blockEntities == null ? List.of() : w.blockEntities.keySet());
@@ -1058,6 +1076,11 @@ public final class VanillaDispenserOracle {
     static String describe(int index, Entity e) {
         StringBuilder line = new StringBuilder("T " + index + " " + BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()));
         if (e.isRemoved()) line.append(" removed");
+        if (e instanceof Container container) {
+            for (int i = 0; i < container.getContainerSize(); i++) {
+                if (!container.getItem(i).isEmpty()) line.append(" slot").append(i).append('=').append(ParityData.canon(container.getItem(i)));
+            }
+        }
         if (e instanceof LivingEntity living) {
             for (EquipmentSlot slot : EquipmentSlot.values()) {
                 ItemStack s = living.getItemBySlot(slot);

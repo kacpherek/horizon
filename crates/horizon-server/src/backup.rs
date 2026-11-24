@@ -3,7 +3,7 @@
 //! (`save-off`, `save-all`), and writes again once the zip is done (`save-on`), so players stay online.
 //! A restore puts the backup's world in place of the current one, which is moved aside, never deleted.
 
-use crate::config::Config;
+use horizon_server_launch::config::Config;
 use std::{
     fs::File,
     io::{BufWriter, Write},
@@ -30,8 +30,7 @@ fn stamp(time: SystemTime) -> String {
     let secs = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let (y, m, d) =
-        horizon_platform::server_files::java_properties::civil_from_days(secs.div_euclid(86_400));
+    let (y, m, d) = horizon_platform::java_properties::civil_from_days(secs.div_euclid(86_400));
     let s = secs.rem_euclid(86_400);
     format!(
         "{y:04}-{m:02}-{d:02}_{:02}-{:02}-{:02}",
@@ -68,7 +67,10 @@ fn stamped(time: SystemTime, name: &str) -> Result<String, String> {
     Ok(format!("{}-{name}.zip", stamp(time)))
 }
 
-/// Adds a folder to the zip, under `prefix`, skipping the game's session lock.
+/// Adds a folder to the zip, under `prefix`, skipping the game's session lock. Only regular files and
+/// folders are taken, and links are not followed: vanilla worlds hold no symlinks (vanilla refuses a world
+/// with one unless allow-listed), while a link in an extracted archive could pull a file from outside the
+/// server folder into the zip, and a FIFO or device would make the copy never finish.
 fn add_dir(zip: &mut ZipWriter<BufWriter<File>>, dir: &Path, prefix: &str) -> Result<(), String> {
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
@@ -82,8 +84,16 @@ fn add_dir(zip: &mut ZipWriter<BufWriter<File>>, dir: &Path, prefix: &str) -> Re
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         let inner = format!("{prefix}/{name}");
-        if path.is_dir() {
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if kind.is_dir() {
             add_dir(zip, &path, &inner)?;
+        } else if !kind.is_file() {
+            eprintln!(
+                "horizon-server: backup skips {}: not a regular file or folder",
+                path.display()
+            );
         } else if name != "session.lock" {
             zip.start_file(inner.as_str(), options)
                 .map_err(|e| e.to_string())?;
@@ -406,37 +416,10 @@ pub fn restore_dimension(
     Ok(moved)
 }
 
-/// `every` from server.toml: `"6h"`, `"30m"`, `"1d"`, or `"0"` for no automatic backups.
-pub fn interval(every: &str) -> Result<Option<std::time::Duration>, String> {
-    let every = every.trim();
-    if every == "0" || every.is_empty() {
-        return Ok(None);
-    }
-    // The last character, whatever its width: `split_at(len - 1)` panicked on "6é".
-    let unit_at = every.char_indices().last().map_or(0, |(i, _)| i);
-    let (number, unit) = every.split_at(unit_at);
-    let n: u64 = number.trim().parse().map_err(|_| {
-        format!("backups.every is {every:?}: use a number and m, h or d, like \"6h\"")
-    })?;
-    let secs = match unit {
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        _ => {
-            return Err(format!(
-                "backups.every is {every:?}: use a number and m, h or d, like \"6h\""
-            ));
-        }
-    };
-    let total = n
-        .checked_mul(secs)
-        .ok_or_else(|| format!("backups.every is {every:?}: too long"))?;
-    Ok((n > 0).then(|| std::time::Duration::from_secs(total)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use horizon_server_launch::config;
 
     #[test]
     fn names_sort_by_time() {
@@ -449,56 +432,32 @@ mod tests {
         assert_eq!(auto_name(t), "2026-10-14_17-46-40-auto.zip");
     }
 
-    #[test]
-    fn intervals() {
-        assert_eq!(
-            interval("6h").unwrap(),
-            Some(std::time::Duration::from_secs(21_600))
-        );
-        assert_eq!(
-            interval("30m").unwrap(),
-            Some(std::time::Duration::from_secs(1800))
-        );
-        assert_eq!(interval("0").unwrap(), None);
-        assert!(interval("6 hours").is_err());
-        // Not a panic: a wide last character, and a number too large for the unit.
-        assert!(interval("6é").is_err());
-        assert!(interval("é").is_err());
-        assert!(interval(&format!("{}d", u64::MAX)).is_err());
-    }
-
-    #[test]
-    fn prune_keeps_backups_labelled_by_hand_whatever_their_label() {
-        let dir = std::env::temp_dir().join(format!("horizon-server-prune-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(DIR)).unwrap();
-        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let names = [
-            auto_name(t),
-            auto_name(t + std::time::Duration::from_secs(60)),
-            file_name(t, Some("nightly-auto")).unwrap(),
-        ];
-        for name in &names {
-            std::fs::write(dir.join(DIR).join(name), b"zip").unwrap();
-        }
-        assert_eq!(prune(&dir, 0).len(), 2);
-        assert!(dir.join(DIR).join(&names[2]).exists(), "kept: made by hand");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[cfg(unix)]
     #[test]
-    fn a_backup_is_readable_by_its_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("horizon-server-mode-{}", std::process::id()));
+    fn a_backup_skips_links_and_special_files() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-server-backup-links-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("world")).unwrap();
-        std::fs::write(dir.join("world/level.dat"), b"x").unwrap();
-        std::fs::write(dir.join("server.toml"), crate::config::TEMPLATE).unwrap();
-        let path = create(&dir, &Config::default(), "b.zip").unwrap();
-        let mode = std::fs::metadata(path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "{mode:o}");
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        let world = dir.join("world");
+        std::fs::create_dir(&world).unwrap();
+        std::fs::write(world.join("level.dat"), b"level").unwrap();
+        std::os::unix::fs::symlink(&outside, world.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(&dir, world.join("link-dir")).unwrap();
+        let fifo = CString::new(world.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let path = create(&dir, &Config::default(), "x.zip").unwrap();
+        let zip = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let mut names: Vec<_> = zip.file_names().map(|n| n.unwrap().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["world/level.dat"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -638,7 +597,7 @@ mod tests {
         std::fs::write(world.join("level.dat"), b"before").unwrap();
         std::fs::write(world.join("region/r.0.0.mca"), vec![7u8; 10_000]).unwrap();
         std::fs::write(world.join("session.lock"), b"x").unwrap();
-        std::fs::write(dir.join("server.toml"), crate::config::TEMPLATE).unwrap();
+        std::fs::write(dir.join("server.toml"), config::TEMPLATE).unwrap();
         let t = SystemTime::now();
         let name = file_name(t, None).unwrap();
         create(&dir, &config, &name).unwrap();
@@ -726,6 +685,38 @@ mod tests {
         );
         assert_eq!(std::fs::read(&nether).unwrap(), b"nether-before");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn prune_keeps_backups_labelled_by_hand_whatever_their_label() {
+        let dir = std::env::temp_dir().join(format!("horizon-server-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(DIR)).unwrap();
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let names = [
+            auto_name(t),
+            auto_name(t + std::time::Duration::from_secs(60)),
+            file_name(t, Some("nightly-auto")).unwrap(),
+        ];
+        for name in &names {
+            std::fs::write(dir.join(DIR).join(name), b"zip").unwrap();
+        }
+        assert_eq!(prune(&dir, 0).len(), 2);
+        assert!(dir.join(DIR).join(&names[2]).exists(), "kept: made by hand");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("horizon-server-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("world")).unwrap();
+        std::fs::write(dir.join("world/level.dat"), b"x").unwrap();
+        std::fs::write(dir.join("server.toml"), crate::config::TEMPLATE).unwrap();
+        let path = create(&dir, &Config::default(), "b.zip").unwrap();
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
     }
 
     /// `restore NAME` takes "the name given to `backup` (the newest with it)": the whole label after the

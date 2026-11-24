@@ -1,0 +1,12 @@
+[package]
+name = "wasm-test-dependent"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+horizon-mod-api = { path = "../../../../horizon-mod-api" }
+wasm-test-library = { path = "../library" }
+
+
+[workspace]

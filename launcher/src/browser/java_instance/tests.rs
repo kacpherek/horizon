@@ -63,6 +63,7 @@ impl Fake {
             kind,
             game_versions: Vec::new(),
             loaders: Vec::new(),
+            blocked: None,
         });
         let body = format!("{id} {number}").into_bytes();
         let url = format!("https://cdn.modrinth.com/data/{id}/versions/{number}/{id}-{number}.jar");
@@ -92,6 +93,7 @@ impl Fake {
                 loaders: strings(loaders),
                 files: vec![file],
                 required: strings(needs),
+                optional: Vec::new(),
                 blocked: None,
             },
         );

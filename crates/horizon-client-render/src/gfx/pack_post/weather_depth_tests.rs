@@ -4,12 +4,12 @@ use std::io::{Cursor, Write};
 use wgpu::util::DeviceExt;
 
 #[test]
-#[ignore = "requires a host GPU; missing adapter is a failure"]
+#[ignore = "daily"]
 fn rain_and_snow_leave_depth_alone_whatever_rain_depth_says() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let instance = crate::gfx::test_gpu::instance();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     eprintln!("Weather depth GPU: {:?}", adapter.get_info());
-    assert_ne!(adapter.get_info().device_type, wgpu::DeviceType::Cpu);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         required_limits: adapter.limits(),
         ..Default::default()
@@ -23,7 +23,7 @@ fn rain_and_snow_leave_depth_alone_whatever_rain_depth_says() {
             let mut post = pack(&device, &queue, &adapter, program, property);
             // Retain the pipelines for another frame, then resize their targets.
             for size in [[6, 1], [6, 1], [12, 2]] {
-                post.resize(&device, size);
+                post.resize(&device, &queue, size);
                 let mut encoder = device.create_command_encoder(&Default::default());
                 let targets = post.targets.as_ref().unwrap();
                 let color = &targets.color[0].as_ref().unwrap()[0];

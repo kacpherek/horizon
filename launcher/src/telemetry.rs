@@ -12,26 +12,33 @@ use horizon_telemetry::{outbox, Choices, Consent, Item, Kind, Payload, Source};
 
 use crate::{account::Accounts, backend};
 
-/// Each switch: its name, and in plain words exactly what it sends.
-pub const SWITCHES: [(Kind, &str, &str); 4] = [
+/// How the data question and Settings open: the switches are off, the ping is on.
+pub const OPENING: &str = "These reports are off until you turn them on. The \"I'm playing\" ping is on until you turn it off.";
+
+/// Each switch: its name, what it is for in one plain sentence, and exactly what it sends.
+pub const SWITCHES: [(Kind, &str, &str, &str); 4] = [
     (
         Kind::Perf,
         "Performance statistics",
+        "How smoothly Horizon runs on your computer, so slowdowns can be found and fixed.",
         "After each session: frame-time percentiles and a 14-bucket histogram, tick times, peak memory and startup times, with your machine (OS, CPU and its cores and clocks, memory size, GPU, its memory and driver, drive type, screen size and refresh rate, laptop or desktop, on battery or not) and the settings that change performance.",
     ),
     (
         Kind::Crash,
         "Crash reports",
+        "A short report when the game crashes, so the crash can be fixed.",
         "When the game crashes: the error, where in Horizon's code it happened, your graphics adapter and settings. No log, no world or server, no user name in paths.",
     ),
     (
         Kind::Bug,
         "Bug reports",
+        "Only the bug reports you write and send yourself.",
         "Only the reports you write and send yourself, with the game's log if you add it after reading it.",
     ),
     (
         Kind::Benchmark,
         "Benchmark uploads",
+        "Your benchmark results, for the community results page.",
         "The results of benchmarks you run, for the community results on playhorizon.dev.",
     ),
 ];
@@ -39,11 +46,21 @@ pub const SWITCHES: [(Kind, &str, &str); 4] = [
 /// Never sent, whatever the switches say.
 pub const NEVER: &str = "Never sent: your account name or UUID, world names, server addresses, chat, or your IP address. Each report is dated to the day, under a random install ID you can delete.";
 
-/// The anonymous "I'm playing" ping the game sends whatever the switches say (Ludovic's
-/// decision, 2026-10-22: count everyone, and tell them). Shown on the first-run question, in
-/// Settings, and once on the Play page to players who answered before it existed.
+/// The anonymous "I'm playing" ping the game sends (Ludovic's decision, 2026-10-22: count
+/// everyone, and tell them). On by default as upstream; this launcher also lets the player turn
+/// it off (`Settings::ping_off`), then starts the game with `HORIZON_NO_HEARTBEAT`. Shown on the
+/// first-run welcome and question, in Settings, and once on the Play page to players who
+/// answered before it existed.
 pub const PING_NAME: &str = "\"I'm playing\" ping";
-pub const PING: &str = "While you play, the game sends an anonymous \"I'm playing\" ping once a minute, so the launcher can show how many people play Horizon right now. It holds: a random number made when the game starts and forgotten when it closes, the Horizon version, your OS (Linux, macOS or Windows), and whether you have a world open to LAN or friends. It doesn't hold: your account, your install ID, world or server names, or anything you do in the game, and the server doesn't keep your IP address. It is sent whatever the switches say.";
+pub const PING_SUMMARY: &str = "Tells Horizon, anonymously, that you're playing, so the launcher can show how many people play right now.";
+pub const PING: &str = "While you play, the game sends an anonymous \"I'm playing\" ping once a minute, so the launcher can show how many people play Horizon right now. It holds: a random number made when the game starts and forgotten when it closes, the Horizon version, your OS (Linux, macOS or Windows), and whether you have a world open to LAN or friends. It doesn't hold: your account, your install ID, world or server names, or anything you do in the game, and the server doesn't keep your IP address. It is on unless you turn it off.";
+
+/// The game sends the [`PING`] unless the player turned it off (`Settings::ping_off`).
+pub fn ping_only_if_allowed(cmd: &mut std::process::Command, allowed: bool) {
+    if !allowed {
+        cmd.env("HORIZON_NO_HEARTBEAT", "1");
+    }
+}
 
 /// How many play Horizon now (exact), if the server says.
 pub fn playing_now() -> Option<u64> {
@@ -224,25 +241,43 @@ pub fn with_example_gpu(mut system: System) -> System {
 }
 
 /// "Delete my data": the server deletes everything sent under this install's ID, the waiting
-/// items go, and the install gets a new ID. If the server can't be reached the ID is kept, so
-/// the deletion can be asked again.
+/// items go, and the install gets a new ID. If the server can't be reached, or sending is turned
+/// off so it can't be asked, the ID is kept, so the deletion can be asked again.
 pub fn delete_my_data() -> Result<String, String> {
-    let home = home();
-    let mut consent = Consent::load(&home);
-    outbox::clear(&home).map_err(|e| e.to_string())?;
-    let remote = match horizon_telemetry::endpoint() {
+    delete_my_data_in(
+        &home(),
+        horizon_telemetry::endpoint(),
+        upload::delete_remote,
+    )
+}
+
+/// [`delete_my_data`] for the game folder `home`, asking the server at `endpoint` (None: sending
+/// is turned off) through `delete`.
+fn delete_my_data_in(
+    home: &Path,
+    endpoint: Option<String>,
+    delete: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<String, String> {
+    let mut consent = Consent::load(home);
+    outbox::clear(home).map_err(|e| e.to_string())?;
+    let remote = match endpoint {
         _ if consent.install_id.is_empty() => "Nothing was ever sent from here.",
         None => {
-            "Sending is turned off here (HORIZON_TELEMETRY_URL=off), so the server was not asked."
+            return Err(
+                "Sending is turned off here (HORIZON_TELEMETRY_URL=off), so the server \
+                can't be asked to delete what was sent. Nothing is waiting, and this install keeps \
+                its ID so you can ask again with sending on."
+                    .into(),
+            );
         }
         Some(url) => {
-            upload::delete_remote(&url, &consent.install_id)
+            delete(&url, &consent.install_id)
                 .map_err(|e| format!("The server could not be reached ({e}). Try again later."))?;
             "The server deleted everything sent from here."
         }
     };
     consent.reset_install_id();
-    consent.save(&home).map_err(|e| e.to_string())?;
+    consent.save(home).map_err(|e| e.to_string())?;
     Ok(format!(
         "{remote} Nothing is waiting, and this install has a new ID."
     ))
@@ -265,11 +300,55 @@ pub fn scrubber() -> Scrubber {
     s
 }
 
+/// What replaces a server's address in a log line.
+const SERVER: &str = "<server>";
+
+/// The game's log lines that print the address the player typed (a host name the scrubber's
+/// patterns don't know), as the text before it and after it: the address in between goes.
+const ADDRESS_LINES: [(&str, &str); 5] = [
+    ("Connecting to ", ", "),
+    ("Joining ", " as a "),
+    ("reconnecting to ", " in "),
+    ("Unknown host ", ": "),
+    // The refusal of an address that does not parse (a bad port), to the end of the line. The
+    // game logs `<server>` there itself; older games logged what was typed.
+    ("Invalid server address: ", ""),
+];
+
+/// `text` with the server addresses of [`ADDRESS_LINES`] replaced; the lines stay.
+fn hide_server_addresses(text: &str) -> String {
+    let mut out = text.to_owned();
+    for (before, after) in ADDRESS_LINES {
+        let mut from = 0;
+        while let Some(at) = out[from..].find(before) {
+            let start = from + at + before.len();
+            // The address ends where the text after it starts, else with the line.
+            let line_end = out[start..].find('\n').map_or(out.len(), |i| start + i);
+            let end = if after.is_empty() {
+                line_end
+            } else {
+                out[start..line_end]
+                    .find(after)
+                    .map_or(line_end, |i| start + i)
+            };
+            out.replace_range(start..end, SERVER);
+            from = start + SERVER.len();
+        }
+    }
+    out
+}
+
+/// A game log as a bug report carries it: without chat, the server addresses and everything
+/// `scrubber` knows hidden.
+pub fn report_log(text: &str, scrubber: &Scrubber) -> String {
+    let kept: Vec<&str> = text.lines().filter(|l| !l.contains("[CHAT]")).collect();
+    scrubber.scrub(&hide_server_addresses(&kept.join("\n")))
+}
+
 /// The end of the game's log as a bug report would carry it: scrubbed, without chat.
 pub fn log_for_report() -> Option<String> {
     let (_, text) = backend::read_logs(300, false).ok()?;
-    let kept: Vec<&str> = text.lines().filter(|l| !l.contains("[CHAT]")).collect();
-    let mut log = scrubber().scrub(&kept.join("\n"));
+    let mut log = report_log(&text, &scrubber());
     // Within the item's size, the newest lines first to stay.
     while log.len() > 64 * 1024 {
         let cut = log.find('\n').map_or(log.len(), |i| i + 1);
@@ -468,8 +547,62 @@ mod tests {
         }
     }
 
+    /// The lines the game writes when it joins a server, and a failed lookup, name the address
+    /// as the player typed it: a host name no pattern of the scrubber finds.
+    #[test]
+    fn a_report_log_keeps_the_lines_but_not_the_server_names() {
+        let log = "[10:00:00] [Server Connector #1/INFO]: Connecting to my-private-smp.example.com, 25565\n\
+            [10:00:01] [Render thread/INFO]: Joining my-private-smp.example.com:25565 as a 1.20.4 server\n\
+            [10:00:02] [Render thread/INFO]: Horizon: could not join server: Unknown host my-private-smp.example.com: failed to lookup\n\
+            [10:00:03] [Render thread/INFO]: Horizon: reconnecting to my-private-smp.example.com in 5 s\n\
+            [10:00:04] [Render thread/INFO]: [CHAT] <Ana> my-private-smp.example.com\n\
+            [10:00:05] [Render thread/INFO]: Horizon: disconnected: Invalid server address: my-private-smp.example.com:99999\n\
+            [10:00:06] [Render thread/INFO]: Reloading resource packs\n";
+        let kept = report_log(log, &Scrubber::bare());
+        assert!(!kept.contains("example.com"), "{kept}");
+        assert!(!kept.contains("CHAT"), "{kept}");
+        for line in [
+            "Connecting to <server>, 25565",
+            "Joining <server> as a 1.20.4 server",
+            "could not join server: Unknown host <server>: failed to lookup",
+            "reconnecting to <server> in 5 s",
+            "disconnected: Invalid server address: <server>",
+            "Reloading resource packs",
+        ] {
+            assert!(kept.contains(line), "{line} missing from {kept}");
+        }
+    }
+
     #[test]
     fn every_kind_has_a_switch() {
         assert!(Kind::ALL.iter().all(|&k| !label(k).is_empty()));
+    }
+
+    /// With sending turned off the server can't be asked, so "Delete my data" keeps the install's
+    /// ID, as when the server can't be reached: what was sent under it can still be deleted. Only
+    /// a deletion the server answered gives the install a new ID.
+    #[test]
+    fn deleting_with_sending_off_keeps_the_id_to_ask_again() {
+        let home = std::env::temp_dir().join(format!(
+            "horizon-launcher-delete-my-data-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut consent = Consent::load(&home);
+        consent.answer(Choices::ALL);
+        consent.save(&home).unwrap();
+        let id = consent.install_id.clone();
+        let off = delete_my_data_in(&home, None, |_, _| panic!("the server isn't asked"));
+        assert!(off.unwrap_err().contains("HORIZON_TELEMETRY_URL=off"));
+        assert_eq!(Consent::load(&home).install_id, id);
+        let asked = std::cell::Cell::new(false);
+        let said = delete_my_data_in(&home, Some("https://example.org".into()), |_, from| {
+            asked.set(from == id);
+            Ok(())
+        })
+        .unwrap();
+        assert!(asked.get() && said.contains("deleted everything"), "{said}");
+        assert_ne!(Consent::load(&home).install_id, id);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

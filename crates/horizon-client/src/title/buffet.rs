@@ -212,13 +212,18 @@ pub(super) fn buttons(w: f32, h: f32, state: &State) -> Vec<Button> {
         label: lang::get_or(key, fallback),
         enabled,
         id,
+        agent_id: None,
         icon: None,
         trailing: None,
         action: None,
     };
     vec![
-        b(x, "gui.done", "Done", state.selected().is_some(), 80).does(crate::widgets::Action::Done),
-        b(x + 158.0, "gui.cancel", "Cancel", true, 81).does(crate::widgets::Action::Cancel),
+        b(x, "gui.done", "Done", state.selected().is_some(), 80)
+            .identified("done")
+            .does(crate::widgets::Action::Done),
+        b(x + 158.0, "gui.cancel", "Cancel", true, 81)
+            .identified("cancel")
+            .does(crate::widgets::Action::Cancel),
     ]
 }
 /// The screen: the menu background, the title, the search box and the rows.
@@ -228,9 +233,11 @@ pub(super) fn draw(
     batch: &mut HudBatch,
     cursor: (f32, f32),
     state: &State,
+    phases: &mut dyn FnMut(crate::screen_draw::RenderPhase, &mut HudBatch),
 ) {
     let (w, h) = (batch.width.ceil(), batch.height.ceil());
     ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+    phases(crate::screen_draw::RenderPhase::Background, batch);
     super::centered(
         atlas,
         batch,

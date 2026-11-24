@@ -149,6 +149,7 @@ pub(super) fn parse_mod(m: &Value) -> Option<Project> {
         kind,
         game_versions,
         loaders,
+        blocked: None,
     })
 }
 
@@ -183,6 +184,7 @@ pub(super) fn parse_file(f: &Value) -> Option<Version> {
         game_versions,
         loaders,
         files,
+        optional: Vec::new(),
         required: f["dependencies"]
             .as_array()
             .into_iter()

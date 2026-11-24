@@ -74,16 +74,40 @@ pub const MAPPINGS: &[(&str, &str, &str)] = &[
     ("key.debug.lightmapTexture", "key.keyboard.4", "debug"),
     ("key.debug.improvedTransparency", "key.keyboard.x", "debug"),
 ];
-/// Horizon's own key mappings: bound in Controls like the vanilla ones, but kept in
-/// `horizon-extras.txt` (`emoteKey`), never in `options.txt`, which stays exactly vanilla's
-/// (`MAPPINGS` is what the options parity harness compares with the pinned client).
+/// Registered key mappings (docs/layers.md, "Platform registries"): crate-registered mappings,
+/// kept in `horizon-extras.txt`, never in `options.txt`.
+pub fn crate_mappings() -> &'static [&'static [(&'static str, &'static str, &'static str)]] {
+    horizon_hooks::actions::engine::all()
+}
+/// Horizon's own key mappings: kept with registered defaults so standalone tests and
+/// defaults without external crates registered retain their fallback bindings.
 pub const HORIZON_MAPPINGS: &[(&str, &str, &str)] = &[
     // The emote wheel (docs/cosmetics.md), on a key vanilla leaves free.
     ("key.emote", "key.keyboard.b", "multiplayer"),
+    // Fullbright (`extras.fullbright`), unbound until a player picks a key: vanilla has only the
+    // gamma slider.
+    ("key.fullbright", "key.keyboard.unknown", "misc"),
 ];
-/// Every mapping the game binds: vanilla's in `Options.keyMappings` order, then Horizon's.
+/// Active non-vanilla mappings: registered crate mappings, falling back to HORIZON_MAPPINGS if empty.
+fn non_vanilla_mappings()
+-> impl Iterator<Item = &'static (&'static str, &'static str, &'static str)> {
+    active_non_vanilla(crate_mappings())
+}
+fn active_non_vanilla(
+    registered: &'static [&'static [(&'static str, &'static str, &'static str)]],
+) -> impl Iterator<Item = &'static (&'static str, &'static str, &'static str)> {
+    let horizon: &[(&'static str, &'static str, &'static str)] = if registered.is_empty() {
+        HORIZON_MAPPINGS
+    } else {
+        &[]
+    };
+    horizon
+        .iter()
+        .chain(registered.iter().flat_map(|m| m.iter()))
+}
+/// Every mapping the game binds: vanilla's in `Options.keyMappings` order, then registered crate mappings (or fallback).
 pub fn all_mappings() -> impl Iterator<Item = &'static (&'static str, &'static str, &'static str)> {
-    MAPPINGS.iter().chain(HORIZON_MAPPINGS)
+    MAPPINGS.iter().chain(non_vanilla_mappings())
 }
 /// Mappings Options builds as `ToggleKeyMapping` (hold or toggle by option).
 pub fn is_toggle(name: &str) -> bool {
@@ -293,11 +317,15 @@ pub fn mouse_button(name: &str) -> Option<MouseButton> {
         _ => return None,
     })
 }
-pub use horizon_client_core::key_display::display_name;
+pub use horizon_client_core::key_display::{
+    clear_action_bindings, clear_action_resolver, display_name, replace_action_bindings,
+    reset_action_bindings, set_action_binding, set_action_resolver,
+};
 
 /// A key event: what the layout writes on its key, without modifiers, names
 /// that key from now on (`key_display::learn_layout`), so an AZERTY player's
 /// Q key shows A.
+#[cfg(not(target_os = "android"))]
 pub fn learn_layout(event: &winit::event::KeyEvent) {
     use winit::keyboard::{Key, PhysicalKey};
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -312,6 +340,65 @@ pub fn learn_layout(event: &winit::event::KeyEvent) {
         Key::Character(text) => learn(name, &text),
         Key::Dead(Some(c)) => learn(name, c.encode_utf8(&mut [0; 4])),
         _ => {}
+    }
+}
+
+// Android does not expose winit's unmodified key extension.
+#[cfg(target_os = "android")]
+pub fn learn_layout(_event: &winit::event::KeyEvent) {}
+
+/// Vanilla's name for the key the layout produced (`InputEvent.Key.getKeycode`):
+/// `layout` is the event's key without modifiers. A letter or digit names its
+/// own key, so AZERTY's key at QWERTY's W gives `key.keyboard.z`; a named key
+/// (Enter, arrows, Shift) keeps its place on every layout, so it gets the
+/// physical key's name. `None` for any other character and for a physical key
+/// vanilla doesn't name. A dead key arrives as its character (winit's key
+/// without modifiers), so an accent key gives `None`, not a dead-key value.
+pub fn layout_key_name(
+    physical: winit::keyboard::PhysicalKey,
+    layout: &winit::keyboard::Key,
+) -> Option<&'static str> {
+    use winit::keyboard::{Key, PhysicalKey};
+    match layout {
+        Key::Character(text) => {
+            let mut chars = text.chars();
+            let c = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
+            if chars.next().is_some() {
+                return None;
+            }
+            let c = c.to_ascii_lowercase();
+            KEYS.iter().map(|(n, _)| *n).find(|n| {
+                n.strip_prefix("key.keyboard.")
+                    .is_some_and(|rest| rest.chars().eq([c]))
+            })
+        }
+        Key::Named(_) => match physical {
+            PhysicalKey::Code(code) => key_name(code),
+            PhysicalKey::Unidentified(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// A code telling physical keys apart, named or not (`InputEvent.Key.getScanCode`):
+/// the platform scan code, or the native code winit reports for a key it
+/// doesn't identify; 0 when there is neither. Stable within a platform only.
+pub fn raw_key_code(physical: winit::keyboard::PhysicalKey) -> u32 {
+    use winit::keyboard::{NativeKeyCode, PhysicalKey};
+    match physical {
+        PhysicalKey::Unidentified(native) => match native {
+            NativeKeyCode::Android(c) | NativeKeyCode::Xkb(c) => c,
+            NativeKeyCode::MacOS(c) | NativeKeyCode::Windows(c) => c.into(),
+            NativeKeyCode::Unidentified => 0,
+        },
+        #[cfg(not(target_os = "android"))]
+        PhysicalKey::Code(_) => {
+            use winit::platform::scancode::PhysicalKeyExtScancode;
+            physical.to_scancode().unwrap_or(0)
+        }
+        // Android does not expose winit's platform scancode extension.
+        #[cfg(target_os = "android")]
+        PhysicalKey::Code(_) => 0,
     }
 }
 
@@ -367,6 +454,12 @@ impl KeyBinds {
             self.keys.insert(n, key.to_owned());
         }
     }
+    /// Publish these bindings as the ones `keybind` text components show
+    /// (`KeybindResolver`). Only the active set calls this: on load and after
+    /// the options change it.
+    pub fn sync_action_bindings(&self) {
+        replace_action_bindings(self.keys.iter().map(|(n, d)| (*n, d.as_str())));
+    }
     /// The bindings `options.txt` holds: vanilla's mappings only.
     pub fn saved(&self) -> Vec<(&'static str, String)> {
         MAPPINGS
@@ -376,8 +469,7 @@ impl KeyBinds {
     }
     /// Horizon's own bindings, for `horizon-extras.txt`.
     pub fn horizon_saved(&self) -> Vec<(&'static str, String)> {
-        HORIZON_MAPPINGS
-            .iter()
+        non_vanilla_mappings()
             .map(|(n, _, _)| (*n, self.get(n).to_owned()))
             .collect()
     }
@@ -413,7 +505,10 @@ impl KeyBinds {
     /// (`KeyboardHandler.handleDebugKeys`, `debug_keys.rs` reads the physical
     /// key and the binding itself); their defaults (A, S, D, T, L, 1 to 4...)
     /// would otherwise turn the key back into its old gameplay meaning.
-    fn translated_mappings<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'static str> + 'a {
+    pub fn translated_mappings<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> impl Iterator<Item = &'static str> + 'a {
         all_mappings()
             .filter(|m| m.2 != "debug")
             .map(|m| m.0)
@@ -671,5 +766,78 @@ mod tests {
     fn display_names() {
         assert_eq!(display_name("key.keyboard.w").plain(), "W");
         assert_eq!(display_name("key.keyboard.slash").plain(), "/");
+    }
+    #[test]
+    fn horizon_saved_falls_back_when_no_crates_registered() {
+        let mut keys = KeyBinds::default();
+        let saved = keys.horizon_saved();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0], ("key.emote", "key.keyboard.b".to_string()));
+        assert_eq!(
+            saved[1],
+            ("key.fullbright", "key.keyboard.unknown".to_string())
+        );
+        keys.set("key.emote", "key.keyboard.v");
+        let saved_rebound = keys.horizon_saved();
+        assert_eq!(
+            saved_rebound[0],
+            ("key.emote", "key.keyboard.v".to_string())
+        );
+    }
+    #[test]
+    fn active_non_vanilla_uses_registered_mappings_and_drops_fallback() {
+        static CUSTOM: &[(&str, &str, &str)] = &[
+            ("key.custom.test", "key.keyboard.k", "multiplayer"),
+            ("key.emote", "key.keyboard.x", "multiplayer"),
+        ];
+        static REGISTERED: &[&[(&str, &str, &str)]] = &[CUSTOM];
+        let active: Vec<_> = active_non_vanilla(REGISTERED).collect();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].0, "key.custom.test");
+        assert_eq!(active[1].0, "key.emote");
+        assert_eq!(active[1].1, "key.keyboard.x");
+        // Verify fallback is empty when registered is provided
+        let fallback_only: Vec<_> = active_non_vanilla(&[]).collect();
+        assert_eq!(fallback_only.len(), 2);
+        assert_eq!(fallback_only[0].0, "key.emote");
+        assert_eq!(fallback_only[0].1, "key.keyboard.b");
+        assert_eq!(fallback_only[1].0, "key.fullbright");
+        assert_eq!(fallback_only[1].1, "key.keyboard.unknown");
+    }
+    #[test]
+    fn only_a_synced_set_changes_keybind_display() {
+        let mut k = KeyBinds::default();
+        k.set("key.forward", "key.keyboard.up");
+        k.sync_action_bindings();
+        assert_eq!(display_name("key.forward").plain(), "key.keyboard.up");
+        let mut inactive = KeyBinds::default();
+        inactive.set("key.forward", "key.keyboard.x");
+        assert_eq!(display_name("key.forward").plain(), "key.keyboard.up");
+        clear_action_bindings();
+    }
+
+    #[test]
+    fn a_key_event_names_the_layout_key_and_tells_unnamed_keys_apart() {
+        use winit::keyboard::{Key, NamedKey, NativeKeyCode, PhysicalKey};
+        // AZERTY: the key at QWERTY's W writes z.
+        let w = PhysicalKey::Code(KeyCode::KeyW);
+        assert_eq!(key_name(KeyCode::KeyW), Some("key.keyboard.w"));
+        let z = layout_key_name(w, &Key::Character("Z".into()));
+        assert_eq!(z, Some("key.keyboard.z"));
+        let enter = PhysicalKey::Code(KeyCode::Enter);
+        let named = layout_key_name(enter, &Key::Named(NamedKey::Enter));
+        assert_eq!(named, Some("key.keyboard.enter"));
+        assert_eq!(layout_key_name(w, &Key::Character("é".into())), None);
+        assert_eq!(layout_key_name(w, &Key::Dead(Some('^'))), None);
+        // Two keys vanilla doesn't name share a name but not a code.
+        let a = PhysicalKey::Unidentified(NativeKeyCode::Windows(0x6a));
+        let b = PhysicalKey::Unidentified(NativeKeyCode::Windows(0x6b));
+        assert_eq!((raw_key_code(a), raw_key_code(b)), (0x6a, 0x6b));
+        assert_eq!(
+            raw_key_code(PhysicalKey::Unidentified(NativeKeyCode::Android(0x2a))),
+            0x2a
+        );
+        #[cfg(target_os = "android")]
+        assert_eq!(raw_key_code(w), 0);
     }
 }

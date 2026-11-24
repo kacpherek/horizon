@@ -5,31 +5,31 @@
 pub use horizon_optifine::cit::{Hand, Kind, Rule};
 
 use crate::cit_glint::{Global, StackGlint};
+use crate::resource_source::ResourceSource;
 use horizon_client_core::component::name_text;
 use horizon_client_core::scoreboard::comp_text;
+use horizon_core::nbt::{JavaString, Tag, parse_snbt};
 use horizon_items::item_data::{canon_tag, encode_components};
 use horizon_items::items::ItemStack;
 use horizon_optifine::cit::{ComponentTest, Source, ValueTest};
+use horizon_optifine::random::NbtTest;
 use horizon_optifine::{Properties, properties_files_in};
-use horizon_world::nbt::{JavaString, Tag, parse_snbt};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Every rule under the root's `optifine/cit/`, `mcpatcher/cit/` and CIT Resewn's
 /// `citresewn/cit/` folders, the one chosen first when several match first (`Rule::priority`).
 /// The pack's global `cit.properties` is not a rule.
-pub fn load_rules(root: &Path) -> Vec<Rule> {
+pub fn load_rules(root: &ResourceSource) -> Vec<Rule> {
     let tops = ["optifine", "mcpatcher", "citresewn"];
     let mut rules: Vec<Rule> = properties_files_in(root, &tops, "cit")
         .into_iter()
         .filter(|path| !path.ends_with("/cit.properties"))
         .filter_map(|path| {
-            let props = read_properties(&root.join(&path))?;
-            let rule = Rule::parse(&path, &props, |p| root.join(p).is_file());
+            let props = read_properties(root, &path)?;
+            let rule = Rule::parse(&path, &props, |p| root.contains(p));
             if rule.is_none() {
                 log::warn!("custom item textures: {path} is not a rule Horizon can read");
             }
@@ -43,8 +43,8 @@ pub fn load_rules(root: &Path) -> Vec<Rule> {
 /// A `.properties` file as CIT Resewn reads them (`Properties::parse_equals_first`): UTF-8,
 /// else Latin-1 as Java reads them, so a pack saved that way still loads. `None` when it can't
 /// be read.
-pub fn read_properties(path: &Path) -> Option<Properties> {
-    let bytes = fs::read(path).ok()?;
+pub fn read_properties(source: &ResourceSource, path: &str) -> Option<Properties> {
+    let bytes = source.read(path).ok()?;
     let text = String::from_utf8(bytes)
         .unwrap_or_else(|e| e.into_bytes().iter().map(|&b| char::from(b)).collect());
     Some(Properties::parse_equals_first(&text))
@@ -78,7 +78,7 @@ const CACHE_LIMIT: usize = 4096;
 
 impl CitRules {
     /// The enabled packs' rules under the overlay resource root.
-    pub fn load(root: &Path) -> Self {
+    pub fn load(root: &ResourceSource) -> Self {
         Self {
             global: crate::cit_glint::load_global(root),
             ..Self::new(load_rules(root))
@@ -287,7 +287,25 @@ fn cache_key(query: (u8, Kind, Hand), stack: &ItemStack, max: u32, comps: Option
 }
 
 fn prepare(test: &ComponentTest) -> Prepared {
-    let ValueTest::Literal(lit) = &test.value else {
+    prepare_value(&test.value)
+}
+
+/// Whether an OptiFine random entity rule's `nbt.<n>.<path>` test passes on `entity`, the
+/// entity's saved NBT, before the test's `!`. Its values read as Custom Item Textures' do;
+/// `CustomName` is a text component.
+pub fn entity_nbt_test(test: &NbtTest, entity: &Tag) -> bool {
+    if let ValueTest::Exists(want) = test.value {
+        return walk(entity, &test.path, 0, &mut |_, _| true) == want;
+    }
+    let lit = prepare_value(&test.value);
+    let is_text = test.path.first().is_some_and(|p| p == "CustomName");
+    walk(entity, &test.path, 0, &mut |tag, depth| {
+        value_test(&test.value, &lit, tag, is_text && depth == 1)
+    })
+}
+
+fn prepare_value(value: &ValueTest) -> Prepared {
+    let ValueTest::Literal(lit) = value else {
         return Prepared::default();
     };
     let text = lit.text.trim();
@@ -726,7 +744,12 @@ mod tests {
 
     /// `CitRules::glint` in the main hand, with the stack's own `has_foil` as callers pass it.
     fn glint(cit: &CitRules, stack: &ItemStack, item_glint: bool) -> Option<Arc<StackGlint>> {
-        cit.glint(stack, Hand::Main, 0, stack.has_foil(item_glint))
+        cit.glint(
+            stack,
+            Hand::Main,
+            0,
+            stack.has_foil(item_glint.then_some(true)),
+        )
     }
 
     /// `stack` with its `enchantment_glint_override` set to `on`.

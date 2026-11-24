@@ -178,23 +178,6 @@ pub fn jeb_wool_rgb(age: f32) -> u32 {
 pub const VILLAGER_TYPES: [&str; 7] = [
     "plains", "desert", "jungle", "savanna", "snow", "swamp", "taiga",
 ];
-pub const PROFESSIONS: [&str; 15] = [
-    "none",
-    "armorer",
-    "butcher",
-    "cartographer",
-    "cleric",
-    "farmer",
-    "fisherman",
-    "fletcher",
-    "leatherworker",
-    "librarian",
-    "mason",
-    "nitwit",
-    "shepherd",
-    "toolsmith",
-    "weaponsmith",
-];
 fn baby_or<'a>(
     m: &Mob,
     adult: impl Into<Cow<'a, str>>,
@@ -207,42 +190,13 @@ fn baby_or<'a>(
         adult.into()
     }
 }
-/// A name built from parts (`entity/villager/profession/farmer`), kept for the
-/// process so that drawing a mob allocates no names each frame: they come from
-/// a few tables (types, professions, levels, materials, variants). Past 4096
-/// names on a thread (an unknown item's material from a server) a new one comes
-/// back owned.
-fn interned(args: std::fmt::Arguments) -> Cow<'static, str> {
-    use std::fmt::Write;
-    thread_local! {
-        static NAMES: std::cell::RefCell<(String, crate::fast_hash::FxHashSet<&'static str>)> =
-            std::cell::RefCell::default();
-    }
-    NAMES.with(|names| {
-        let (buffer, set) = &mut *names.borrow_mut();
-        buffer.clear();
-        let _ = buffer.write_fmt(args);
-        if let Some(name) = set.get(buffer.as_str()) {
-            return Cow::Borrowed(*name);
-        }
-        if set.len() >= 4096 {
-            return Cow::Owned(buffer.clone());
-        }
-        let name: &'static str = Box::leak(buffer.as_str().into());
-        set.insert(name);
-        Cow::Borrowed(name)
-    })
-}
-fn climate(m: &Mob) -> &'static str {
-    match m.extra.variant {
-        1 => "warm",
-        2 => "cold",
-        _ => "temperate",
-    }
-}
+#[path = "villager_client.rs"]
+pub mod villager_client;
+use villager_client::interned;
+
 /// `AvatarRenderer` entities: a mannequin draws exactly like a player —
 /// the player model, its resolved skin and the same scale.
-fn avatar(m: &Mob) -> bool {
+pub fn avatar(m: &Mob) -> bool {
     matches!(&*m.kind.id, "minecraft:player" | "minecraft:mannequin")
 }
 /// `AvatarRenderer.shouldRenderLayers`: a spectating player or mannequin
@@ -252,14 +206,21 @@ pub fn layers_shown(m: &Mob) -> bool {
     !(avatar(m) && m.extra.spectator)
 }
 /// The model layer key and texture for the mob's body.
-pub fn body(m: &Mob) -> (Cow<'static, str>, Cow<'_, str>) {
+pub fn body<'a>(m: &'a Mob) -> (Cow<'static, str>, Cow<'a, str>) {
     use Species as S;
     let baby = m.is_baby();
-    let b = |s: &str| -> Cow<'static, str> {
+    let b = |s: &'static str| -> Cow<'static, str> {
         if baby {
             interned(format_args!("{s}_baby"))
         } else {
-            interned(format_args!("{s}"))
+            Cow::Borrowed(s)
+        }
+    };
+    let b_ref = |s: &'a str| -> Cow<'a, str> {
+        if baby {
+            interned(format_args!("{s}_baby"))
+        } else {
+            Cow::Borrowed(s)
         }
     };
     if avatar(m) {
@@ -270,31 +231,24 @@ pub fn body(m: &Mob) -> (Cow<'static, str>, Cow<'_, str>) {
         );
     }
     match m.species() {
-        S::Llama | S::TraderLlama => {
-            let name = if m.species() == S::Llama {
-                "llama"
-            } else {
-                "trader_llama"
-            };
-            (
-                baby_or(
-                    m,
-                    interned(format_args!("{name}#main")),
-                    interned(format_args!("{name}_baby#main")),
-                ),
-                super::llama::texture(m).into(),
-            )
-        }
+        S::Llama => (
+            baby_or(m, "llama#main", "llama_baby#main"),
+            super::llama::texture(m).into(),
+        ),
+        S::TraderLlama => (
+            baby_or(m, "trader_llama#main", "trader_llama_baby#main"),
+            super::llama::texture(m).into(),
+        ),
         s if super::equine::is_equine(s) => {
-            let name = super::equine::model_name(s);
-            (
-                baby_or(
-                    m,
-                    interned(format_args!("{name}#main")),
-                    interned(format_args!("{name}_baby#main")),
-                ),
-                super::equine::texture(m).into(),
-            )
+            let (adult, child) = match s {
+                S::Horse => ("horse#main", "horse_baby#main"),
+                S::Donkey => ("donkey#main", "donkey_baby#main"),
+                S::Mule => ("mule#main", "mule_baby#main"),
+                S::SkeletonHorse => ("skeleton_horse#main", "skeleton_horse_baby#main"),
+                S::Camel | S::CamelHusk => ("camel#main", "camel_baby#main"),
+                _ => ("zombie_horse#main", "zombie_horse_baby#main"),
+            };
+            (baby_or(m, adult, child), super::equine::texture(m).into())
         }
         S::Wolf => (
             baby_or(m, "wolf#main", "wolf_baby#main"),
@@ -345,45 +299,76 @@ pub fn body(m: &Mob) -> (Cow<'static, str>, Cow<'_, str>) {
         ),
         S::Frog => (
             "frog#main".into(),
-            interned(format_args!("entity/frog/frog_{}", climate(m))),
+            match m.extra.variant {
+                1 => "entity/frog/frog_warm",
+                2 => "entity/frog/frog_cold",
+                _ => "entity/frog/frog_temperate",
+            }
+            .into(),
         ),
         // RabbitRenderer.getTextureLocation: the Toast name tag, else the
         // variant (the killer bunny's id is 99).
         S::Rabbit => {
-            let name = if m.custom_name.as_deref() == Some("Toast") {
-                "toast"
+            let tex = if m.custom_name.as_deref() == Some("Toast") {
+                if baby {
+                    "entity/rabbit/rabbit_toast_baby"
+                } else {
+                    "entity/rabbit/rabbit_toast"
+                }
             } else {
-                match m.extra.variant {
-                    1 => "white",
-                    2 => "black",
-                    3 => "white_splotched",
-                    4 => "gold",
-                    5 => "salt",
-                    99 => "caerbannog",
-                    _ => "brown",
+                match (m.extra.variant, baby) {
+                    (1, true) => "entity/rabbit/rabbit_white_baby",
+                    (1, false) => "entity/rabbit/rabbit_white",
+                    (2, true) => "entity/rabbit/rabbit_black_baby",
+                    (2, false) => "entity/rabbit/rabbit_black",
+                    (3, true) => "entity/rabbit/rabbit_white_splotched_baby",
+                    (3, false) => "entity/rabbit/rabbit_white_splotched",
+                    (4, true) => "entity/rabbit/rabbit_gold_baby",
+                    (4, false) => "entity/rabbit/rabbit_gold",
+                    (5, true) => "entity/rabbit/rabbit_salt_baby",
+                    (5, false) => "entity/rabbit/rabbit_salt",
+                    (99, true) => "entity/rabbit/rabbit_caerbannog_baby",
+                    (99, false) => "entity/rabbit/rabbit_caerbannog",
+                    (_, true) => "entity/rabbit/rabbit_brown_baby",
+                    (_, false) => "entity/rabbit/rabbit_brown",
                 }
             };
-            (
-                baby_or(m, "rabbit#main", "rabbit_baby#main"),
-                b(&interned(format_args!("entity/rabbit/rabbit_{name}"))),
-            )
+            (baby_or(m, "rabbit#main", "rabbit_baby#main"), tex.into())
         }
         // ParrotRenderer.getVariantTexture.
         S::Parrot => {
-            let name = ["red_blue", "blue", "green", "yellow_blue", "grey"]
-                [usize::from(m.extra.variant).min(4)];
+            const PARROTS: [&str; 5] = [
+                "entity/parrot/parrot_red_blue",
+                "entity/parrot/parrot_blue",
+                "entity/parrot/parrot_green",
+                "entity/parrot/parrot_yellow_blue",
+                "entity/parrot/parrot_grey",
+            ];
             (
                 m.kind.model_name().into(),
-                interned(format_args!("entity/parrot/parrot_{name}")),
+                PARROTS[usize::from(m.extra.variant).min(4)].into(),
             )
         }
         // AxolotlRenderer.getTextureLocation.
         S::Axolotl => {
-            let name =
-                ["lucy", "wild", "gold", "cyan", "blue"][usize::from(m.extra.variant).min(4)];
+            const ADULT: [&str; 5] = [
+                "entity/axolotl/axolotl_lucy",
+                "entity/axolotl/axolotl_wild",
+                "entity/axolotl/axolotl_gold",
+                "entity/axolotl/axolotl_cyan",
+                "entity/axolotl/axolotl_blue",
+            ];
+            const BABY: [&str; 5] = [
+                "entity/axolotl/axolotl_lucy_baby",
+                "entity/axolotl/axolotl_wild_baby",
+                "entity/axolotl/axolotl_gold_baby",
+                "entity/axolotl/axolotl_cyan_baby",
+                "entity/axolotl/axolotl_blue_baby",
+            ];
+            let i = usize::from(m.extra.variant).min(4);
             (
                 baby_or(m, "axolotl#main", "axolotl_baby#main"),
-                b(&interned(format_args!("entity/axolotl/axolotl_{name}"))),
+                if baby { BABY[i] } else { ADULT[i] }.into(),
             )
         }
         // SalmonRenderer.submit: the model of the salmon's size.
@@ -399,37 +384,42 @@ pub fn body(m: &Mob) -> (Cow<'static, str>, Cow<'_, str>) {
         // subclasses.
         S::Goat => (
             baby_or(m, "goat#main", "goat_baby#main"),
-            b(&m.kind.texture),
+            b_ref(&m.kind.texture),
         ),
         S::PolarBear => (
             baby_or(m, "polar_bear#main", "polar_bear_baby#main"),
-            b(&m.kind.texture),
+            b_ref(&m.kind.texture),
         ),
         S::Ocelot => (
             baby_or(m, "ocelot#main", "ocelot_baby#main"),
-            b(&m.kind.texture),
+            b_ref(&m.kind.texture),
         ),
         S::Turtle => (
             baby_or(m, "turtle#main", "turtle_baby#main"),
-            b(&m.kind.texture),
+            b_ref(&m.kind.texture),
         ),
         S::Armadillo => (
             baby_or(m, "armadillo#main", "armadillo_baby#main"),
-            b(&m.kind.texture),
+            b_ref(&m.kind.texture),
         ),
         // FoxRenderer.getTextureLocation: snow variant, sleeping, baby.
         S::Fox => (
             baby_or(m, "fox#main", "fox_baby#main"),
-            interned(format_args!(
-                "entity/fox/fox{}{}{}",
-                if m.extra.variant == 0 { "" } else { "_snow" },
-                if super::fox::flag(m, super::fox::SLEEPING) {
-                    "_sleep"
-                } else {
-                    ""
-                },
-                if baby { "_baby" } else { "" },
-            )),
+            match (
+                m.extra.variant != 0,
+                super::fox::flag(m, super::fox::SLEEPING),
+                baby,
+            ) {
+                (false, false, false) => "entity/fox/fox",
+                (false, false, true) => "entity/fox/fox_baby",
+                (false, true, false) => "entity/fox/fox_sleep",
+                (false, true, true) => "entity/fox/fox_sleep_baby",
+                (true, false, false) => "entity/fox/fox_snow",
+                (true, false, true) => "entity/fox/fox_snow_baby",
+                (true, true, false) => "entity/fox/fox_snow_sleep",
+                (true, true, true) => "entity/fox/fox_snow_sleep_baby",
+            }
+            .into(),
         ),
         S::Pig => {
             let model = if baby {
@@ -439,10 +429,15 @@ pub fn body(m: &Mob) -> (Cow<'static, str>, Cow<'_, str>) {
             } else {
                 "pig#main".into()
             };
-            (
-                model,
-                b(&interned(format_args!("entity/pig/pig_{}", climate(m)))),
-            )
+            let tex = match (m.extra.variant, baby) {
+                (1, true) => "entity/pig/pig_warm_baby",
+                (1, false) => "entity/pig/pig_warm",
+                (2, true) => "entity/pig/pig_cold_baby",
+                (2, false) => "entity/pig/pig_cold",
+                (_, true) => "entity/pig/pig_temperate_baby",
+                (_, false) => "entity/pig/pig_temperate",
+            };
+            (model, tex.into())
         }
         S::Cow => {
             let model = match (m.extra.variant, baby) {
@@ -453,10 +448,15 @@ pub fn body(m: &Mob) -> (Cow<'static, str>, Cow<'_, str>) {
                 (_, true) => "cow_baby#main",
                 _ => "cow#main",
             };
-            (
-                model.into(),
-                b(&interned(format_args!("entity/cow/cow_{}", climate(m)))),
-            )
+            let tex = match (m.extra.variant, baby) {
+                (1, true) => "entity/cow/cow_warm_baby",
+                (1, false) => "entity/cow/cow_warm",
+                (2, true) => "entity/cow/cow_cold_baby",
+                (2, false) => "entity/cow/cow_cold",
+                (_, true) => "entity/cow/cow_temperate_baby",
+                (_, false) => "entity/cow/cow_temperate",
+            };
+            (model.into(), tex.into())
         }
         S::Mooshroom => (
             baby_or(m, "mooshroom#main", "mooshroom_baby#main"),
@@ -474,13 +474,15 @@ pub fn body(m: &Mob) -> (Cow<'static, str>, Cow<'_, str>) {
             } else {
                 "chicken#main"
             };
-            (
-                model.into(),
-                b(&interned(format_args!(
-                    "entity/chicken/chicken_{}",
-                    climate(m)
-                ))),
-            )
+            let tex = match (m.extra.variant, baby) {
+                (1, true) => "entity/chicken/chicken_warm_baby",
+                (1, false) => "entity/chicken/chicken_warm",
+                (2, true) => "entity/chicken/chicken_cold_baby",
+                (2, false) => "entity/chicken/chicken_cold",
+                (_, true) => "entity/chicken/chicken_temperate_baby",
+                (_, false) => "entity/chicken/chicken_temperate",
+            };
+            (model.into(), tex.into())
         }
         S::Sheep => (
             baby_or(m, "sheep#main", "sheep_baby#main"),
@@ -602,8 +604,9 @@ pub fn body_color(m: &Mob, alpha: f32) -> u32 {
     }
 }
 /// Extra render layers drawn over the body with the same pose. `age` is the
-/// render state's `ageInTicks` (`Mob.age` plus the partial tick).
-pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
+/// render state's `ageInTicks` (`Mob.age` plus the partial tick); `worn` the
+/// game's [`WornArmor`] for the mob ([`humanoid_armor`]).
+pub fn layers(m: &Mob, age: f32, worn: &WornArmor) -> Vec<Layer> {
     use Species as S;
     let mut v = Vec::new();
     if avatar(m) {
@@ -634,8 +637,8 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 ("wolf#main", "entity/wolf/wolf_collar")
             };
             // The armor, then the cracks of its damage (`Crackiness.WOLF_ARMOR`).
-            if !m.is_baby() && m.extra.body.as_deref() == Some("minecraft:wolf_armor") {
-                let left = (super::WOLF_ARMOR_DURABILITY - m.extra.body_damage) as f32
+            if !m.is_baby() && m.extra.body_id() == Some("minecraft:wolf_armor") {
+                let left = (super::WOLF_ARMOR_DURABILITY - m.extra.body_damage()) as f32
                     / super::WOLF_ARMOR_DURABILITY as f32;
                 push(
                     &mut v,
@@ -669,8 +672,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
         S::HappyGhast => {
             let harness = m
                 .extra
-                .body
-                .as_deref()
+                .body_id()
                 .and_then(super::happy_ghast::harness_texture);
             if !m.is_baby()
                 && let Some(texture) = &harness
@@ -728,15 +730,15 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
         // HorseMarkingLayer, the saddle and the horse armour.
         s if super::equine::is_equine(s) => {
             let name = super::equine::model_name(s);
-            let body = if m.is_baby() {
-                interned(format_args!("{name}_baby#main"))
-            } else {
-                interned(format_args!("{name}#main"))
-            };
             if let Some(tex) = super::equine::markings(m) {
+                let body = if m.is_baby() {
+                    interned(format_args!("{name}_baby#main"))
+                } else {
+                    interned(format_args!("{name}#main"))
+                };
                 push(&mut v, body, tex, white, false);
             }
-            if m.extra.saddled && !m.is_baby() {
+            if m.extra.saddled() && !m.is_baby() {
                 push(
                     &mut v,
                     interned(format_args!("{name}#saddle")),
@@ -745,7 +747,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                     false,
                 );
             }
-            if let Some(armor) = m.extra.body.as_deref()
+            if let Some(armor) = m.extra.body_id()
                 && let Some(material) = armor
                     .strip_prefix("minecraft:")
                     .and_then(super::equine::horse_armor_asset)
@@ -766,14 +768,14 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
             }
         }
         // SimpleEquipmentLayer: pig and strider saddles.
-        S::Pig if m.extra.saddled && !m.is_baby() => push(
+        S::Pig if m.extra.saddled() && !m.is_baby() => push(
             &mut v,
             "pig#saddle",
             "entity/equipment/pig_saddle/saddle",
             white,
             false,
         ),
-        S::Strider if m.extra.saddled && !m.is_baby() => push(
+        S::Strider if m.extra.saddled() && !m.is_baby() => push(
             &mut v,
             "strider#saddle",
             "entity/equipment/strider_saddle/saddle",
@@ -803,15 +805,10 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
         }
         // NautilusRenderer: the armour and saddle SimpleEquipmentLayers.
         S::Nautilus | S::ZombieNautilus if !m.is_baby() => {
-            if let Some(texture) = m
-                .extra
-                .body
-                .as_deref()
-                .and_then(super::nautilus::armor_texture)
-            {
+            if let Some(texture) = m.extra.body_id().and_then(super::nautilus::armor_texture) {
                 push(&mut v, "nautilus_armor#main", texture, white, false);
             }
-            if m.extra.saddled {
+            if m.extra.saddled() {
                 push(
                     &mut v,
                     "nautilus#saddle",
@@ -942,125 +939,132 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
             );
         }
         S::Villager | S::ZombieVillager => {
-            let base = if m.species() == S::Villager {
-                "villager"
-            } else {
-                "zombie_villager"
+            const VILLAGER_TYPE_ADULT: [&str; 7] = [
+                "entity/villager/type/plains",
+                "entity/villager/type/desert",
+                "entity/villager/type/jungle",
+                "entity/villager/type/savanna",
+                "entity/villager/type/snow",
+                "entity/villager/type/swamp",
+                "entity/villager/type/taiga",
+            ];
+            const VILLAGER_TYPE_BABY: [&str; 7] = [
+                "entity/villager/baby/plains",
+                "entity/villager/baby/desert",
+                "entity/villager/baby/jungle",
+                "entity/villager/baby/savanna",
+                "entity/villager/baby/snow",
+                "entity/villager/baby/swamp",
+                "entity/villager/baby/taiga",
+            ];
+            const ZOMBIE_TYPE_ADULT: [&str; 7] = [
+                "entity/zombie_villager/type/plains",
+                "entity/zombie_villager/type/desert",
+                "entity/zombie_villager/type/jungle",
+                "entity/zombie_villager/type/savanna",
+                "entity/zombie_villager/type/snow",
+                "entity/zombie_villager/type/swamp",
+                "entity/zombie_villager/type/taiga",
+            ];
+            const ZOMBIE_TYPE_BABY: [&str; 7] = [
+                "entity/zombie_villager/baby/plains",
+                "entity/zombie_villager/baby/desert",
+                "entity/zombie_villager/baby/jungle",
+                "entity/zombie_villager/baby/savanna",
+                "entity/zombie_villager/baby/snow",
+                "entity/zombie_villager/baby/swamp",
+                "entity/zombie_villager/baby/taiga",
+            ];
+            const VILLAGER_LEVELS: [&str; 5] = [
+                "entity/villager/profession_level/stone",
+                "entity/villager/profession_level/iron",
+                "entity/villager/profession_level/gold",
+                "entity/villager/profession_level/emerald",
+                "entity/villager/profession_level/diamond",
+            ];
+            const ZOMBIE_LEVELS: [&str; 5] = [
+                "entity/zombie_villager/profession_level/stone",
+                "entity/zombie_villager/profession_level/iron",
+                "entity/zombie_villager/profession_level/gold",
+                "entity/zombie_villager/profession_level/emerald",
+                "entity/zombie_villager/profession_level/diamond",
+            ];
+            let zombie = m.species() == S::ZombieVillager;
+            let baby = m.is_baby();
+            let model = match (zombie, baby) {
+                (false, false) => "villager#main",
+                (false, true) => "villager_baby#main",
+                (true, false) => "zombie_villager#main",
+                (true, true) => "zombie_villager_baby#main",
             };
-            let model = if m.is_baby() {
-                interned(format_args!("{base}_baby#main"))
-            } else {
-                interned(format_args!("{base}#main"))
-            };
-            let t = VILLAGER_TYPES[m.extra.variant as usize % VILLAGER_TYPES.len()];
-            let folder = if m.species() == S::Villager {
-                "entity/villager"
-            } else {
-                "entity/zombie_villager"
-            };
+            let ti = m.extra.variant as usize % VILLAGER_TYPE_ADULT.len();
             // VillagerProfessionLayer: a baby's type texture is in `baby/`.
-            let group = if m.is_baby() { "baby" } else { "type" };
-            push(
-                &mut v,
-                model.clone(),
-                interned(format_args!("{folder}/{group}/{t}")),
-                white,
-                false,
-            );
-            let prof = PROFESSIONS[m.extra.variant2 as usize % PROFESSIONS.len()];
-            if !m.is_baby() && prof != "none" {
-                push(
-                    &mut v,
-                    model.clone(),
-                    interned(format_args!("{folder}/profession/{prof}")),
-                    white,
-                    false,
-                );
-                if prof != "nitwit" {
+            let type_tex = match (zombie, baby) {
+                (false, false) => VILLAGER_TYPE_ADULT[ti],
+                (false, true) => VILLAGER_TYPE_BABY[ti],
+                (true, false) => ZOMBIE_TYPE_ADULT[ti],
+                (true, true) => ZOMBIE_TYPE_BABY[ti],
+            };
+            push(&mut v, model, type_tex, white, false);
+            let nitwit = m.extra.profession.index() == Some(11);
+            if !baby && let Some(texture) = villager_client::texture(&m.extra.profession, zombie) {
+                push(&mut v, model, texture, white, false);
+                if !nitwit {
                     // `LEVEL_LOCATIONS` clamps the level to 1..=5.
-                    let level = ["stone", "iron", "gold", "emerald", "diamond"]
-                        [(m.extra.variant3.max(1) as usize - 1).min(4)];
-                    push(
-                        &mut v,
-                        model,
-                        interned(format_args!("{folder}/profession_level/{level}")),
-                        white,
-                        false,
-                    );
+                    let li = (m.extra.villager_level.max(1) as usize - 1).min(4);
+                    let level_tex = if zombie {
+                        ZOMBIE_LEVELS[li]
+                    } else {
+                        VILLAGER_LEVELS[li]
+                    };
+                    push(&mut v, model, level_tex, white, false);
                 }
             }
         }
         _ => {}
     }
-    humanoid_armor(m, &mut v);
+    humanoid_armor(m, worn, &mut v);
     v
 }
-/// `HumanoidArmorLayer.renderArmorPiece`: a baby wears the `humanoid_baby`
-/// layer type for every slot (leggings included), an adult the leggings layer
-/// for its legs and the `humanoid` one otherwise.
-fn humanoid_layer_folder(baby: bool, layer: &str) -> &'static str {
-    if baby {
-        "humanoid_baby"
-    } else if layer == "leggings" {
-        "humanoid_leggings"
-    } else {
-        "humanoid"
-    }
-}
+/// A mob's worn armour, resolved by the game from each stack's `equippable`
+/// asset and the equipment table: per slot (`equipment::ARMOR`'s order: head,
+/// chest, legs, feet) the asset's layers in vanilla's layer type for that mob,
+/// each (texture, the colour it has when undyed) — the table's own lists, lent
+/// for the frame. A stack without an asset wears no layer at all.
+pub type WornArmor<'a> = [Option<&'a [(String, Option<u32>)]>; 4];
 /// `HumanoidArmorLayer`: the armour models of the mob's main model with the
-/// equipment textures (leather tinted, with its overlay).
-fn humanoid_armor(m: &Mob, v: &mut Vec<Layer>) {
+/// equipment layers `worn` resolved (`EquipmentLayerRenderer.renderLayers`):
+/// a dyeable layer takes the stack's dye colour, the colour it has when undyed
+/// otherwise, and a layer keeps its place in the asset's own order (leather's
+/// overlay is its second layer).
+fn humanoid_armor(m: &Mob, worn: &WornArmor, v: &mut Vec<Layer>) {
     // A player's or mannequin's armour is drawn by the game's armour layers.
     if super::equine::is_equine(m.species()) || avatar(m) {
         return;
     }
-    let e = &m.extra;
-    if e.head.is_none() && e.chest.is_none() && e.legs.is_none() && e.feet.is_none() {
+    if worn.iter().all(Option::is_none) {
         return;
     }
     let (model, _) = body(m);
     let Some(base) = model.strip_suffix("#main") else {
         return;
     };
-    let slots = [
-        (&m.extra.head, &m.extra.armor[0], "helmet"),
-        (&m.extra.chest, &m.extra.armor[1], "chestplate"),
-        (&m.extra.legs, &m.extra.armor[2], "leggings"),
-        (&m.extra.feet, &m.extra.armor[3], "boots"),
-    ];
-    for (item, stack, layer) in slots {
-        let Some(name) = item.as_deref().and_then(|i| i.strip_prefix("minecraft:")) else {
+    let slots = ["helmet", "chestplate", "leggings", "boots"];
+    for (i, (slot, layer)) in horizon_items::equipment::ARMOR
+        .into_iter()
+        .zip(slots)
+        .enumerate()
+    {
+        let Some(layers) = worn[i] else {
             continue;
         };
-        let Some(material) = name.strip_suffix(layer).and_then(|n| n.strip_suffix('_')) else {
-            continue;
-        };
-        let asset = match material {
-            "golden" => "gold",
-            "turtle" => "turtle_scute",
-            other => other,
-        };
-        let folder = humanoid_layer_folder(m.is_baby(), layer);
+        let stack = m.extra.slot_stack(slot);
         let model = interned(format_args!("{base}#{layer}"));
-        // EquipmentLayerRenderer.getColorForLayer: the leather layer takes
-        // the stack's dye colour, the colour it has when undyed otherwise.
-        let tint = if asset == "leather" {
-            armor_tint(Some(0xA06540), stack.as_ref())
-        } else {
-            0xFFFF_FFFF
-        };
-        v.push(Layer {
-            model: model.clone(),
-            texture: interned(format_args!("entity/equipment/{folder}/{asset}")),
-            color: tint,
-            full_bright: false,
-            scroll: 0.0,
-        });
-        if asset == "leather" {
+        for (texture, undyed) in layers {
             v.push(Layer {
-                model,
-                texture: interned(format_args!("entity/equipment/{folder}/leather_overlay")),
-                color: 0xFFFF_FFFF,
+                model: model.clone(),
+                texture: interned(format_args!("{texture}")),
+                color: armor_tint(*undyed, stack),
                 full_bright: false,
                 scroll: 0.0,
             });
@@ -1171,7 +1175,7 @@ pub fn base_transform_at(m: &Mob, alpha: f32, origin: glam::Mat4) -> glam::Mat4 
         let pitch = m.previous_head_pitch + (m.head_pitch - m.previous_head_pitch) * alpha;
         base *= glam::Mat4::from_rotation_x((-90.0 - pitch).to_radians())
             * glam::Mat4::from_rotation_y(((m.age as f32 + alpha) * -75.0).to_radians());
-    } else if matches!(m.custom_name.as_deref(), Some("Dinnerbone" | "Grumm")) {
+    } else if anim::upside_down(m) {
         // isEntityUpsideDown
         base *= glam::Mat4::from_translation(glam::Vec3::new(0.0, m.height() + 0.1, 0.0))
             * glam::Mat4::from_rotation_z(PI);
@@ -1313,7 +1317,7 @@ fn body_overlay(m: &Mob, alpha: f32) -> u32 {
 }
 /// LivingEntityRenderState.hasRedOverlay: hurt or dying (not a creaking
 /// tearing down).
-fn red_overlay(m: &Mob) -> bool {
+pub fn red_overlay(m: &Mob) -> bool {
     m.hurt_time > 0 || (m.death_time > 0 && !super::creaking::tearing_down(m))
 }
 fn species_scale(m: &Mob, alpha: f32) -> glam::Mat4 {
@@ -1501,11 +1505,22 @@ pub fn render(
     data: &MobData,
     out: &mut Vec<Vertex>,
 ) {
-    render_with(m, alpha, camera, atlas, light, data, &[], out);
+    render_with(
+        m,
+        alpha,
+        camera,
+        atlas,
+        light,
+        data,
+        &Default::default(),
+        &[],
+        out,
+    );
 }
 /// `render` plus extra layers posed like the body (`HumanoidArmorLayer`:
 /// the armour model's parts copy the body's): (model, texture rect, colour,
 /// overlay: 0 or `ARMOR_GLINT`, as `EquipmentLayerRenderer` never tints them).
+/// `worn` is the mob's [`WornArmor`].
 #[allow(clippy::too_many_arguments)]
 pub fn render_with(
     m: &Mob,
@@ -1514,13 +1529,47 @@ pub fn render_with(
     atlas: Atlas,
     light: u32,
     data: &MobData,
+    worn: &WornArmor,
     extra: &[(&Part, [f32; 4], u32, u32, bool)],
+    out: &mut Vec<Vertex>,
+) {
+    render_with_hidden(
+        m,
+        alpha,
+        camera,
+        atlas,
+        light,
+        data,
+        worn,
+        extra,
+        Default::default(),
+        None,
+        out,
+    );
+}
+/// [`render_with`], with the parts a mod's `render_player_pre` hid left out of the body (after Skin
+/// Customization) and the layers on its own model; the armour in `extra` and the other layers keep
+/// every part. `parts`, given while the mods' post hooks want them, gets the humanoid parts as the
+/// body was drawn ([`PosedParts`](mod_api::PosedParts)); it stays None for a mob that isn't a
+/// humanoid or isn't drawn.
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_hidden(
+    m: &Mob,
+    alpha: f32,
+    camera: glam::DVec3,
+    atlas: Atlas,
+    light: u32,
+    data: &MobData,
+    worn: &WornArmor,
+    extra: &[(&Part, [f32; 4], u32, u32, bool)],
+    hidden: mod_api::HiddenParts,
+    mut parts: Option<&mut Option<mod_api::PosedParts>>,
     out: &mut Vec<Vertex>,
 ) {
     let paint = Some(body_color(m, alpha));
     // The invisibility effect hides the model (a drinking wandering trader);
     // an illusioner shows its four mirror images instead.
-    if super::trader::is_invisible(m) {
+    if m.is_invisible() {
         if m.species() == Species::Illusioner {
             let age = m.age as f32 + alpha;
             for (i, off) in super::illusioner::offsets(m, alpha).iter().enumerate() {
@@ -1528,29 +1577,23 @@ pub fn render_with(
                 let shifted =
                     camera - glam::DVec3::new(off[0] + w[0], off[1] + w[1], off[2] + w[2]);
                 let base = base_transform(m, alpha, shifted);
-                render_visible(m, alpha, base, atlas, light, data, extra, paint, out, None);
+                render_visible(
+                    m,
+                    alpha,
+                    base,
+                    atlas,
+                    light,
+                    data,
+                    worn,
+                    extra,
+                    paint,
+                    hidden,
+                    parts.as_deref_mut(),
+                    out,
+                    None,
+                );
             }
         }
-        return;
-    }
-    let base = base_transform(m, alpha, camera);
-    render_visible(m, alpha, base, atlas, light, data, extra, paint, out, None);
-}
-/// `render` with the model's ordinary draws posed on the GPU when the mob
-/// allows it (`super::skin`): the same picture, no vertices on the CPU.
-#[allow(clippy::too_many_arguments)]
-pub fn render_skinned(
-    m: &Mob,
-    alpha: f32,
-    camera: glam::DVec3,
-    atlas: Atlas,
-    light: u32,
-    data: &MobData,
-    out: &mut Vec<Vertex>,
-    skin: &mut super::skin::Skin,
-) {
-    if super::trader::is_invisible(m) {
-        render_with(m, alpha, camera, atlas, light, data, &[], out);
         return;
     }
     render_visible(
@@ -1560,8 +1603,60 @@ pub fn render_skinned(
         atlas,
         light,
         data,
+        worn,
+        extra,
+        paint,
+        hidden,
+        parts,
+        out,
+        None,
+    );
+}
+/// `render` with the model's ordinary draws posed on the GPU when the mob
+/// allows it (`super::skin`): the same picture, no vertices on the CPU.
+/// `hidden` and `parts` as for [`render_with_hidden`].
+#[allow(clippy::too_many_arguments)]
+pub fn render_skinned(
+    m: &Mob,
+    alpha: f32,
+    camera: glam::DVec3,
+    atlas: Atlas,
+    light: u32,
+    data: &MobData,
+    worn: &WornArmor,
+    hidden: mod_api::HiddenParts,
+    parts: Option<&mut Option<mod_api::PosedParts>>,
+    out: &mut Vec<Vertex>,
+    skin: &mut super::skin::Skin,
+) {
+    if m.is_invisible() {
+        render_with_hidden(
+            m,
+            alpha,
+            camera,
+            atlas,
+            light,
+            data,
+            worn,
+            &[],
+            hidden,
+            parts,
+            out,
+        );
+        return;
+    }
+    render_visible(
+        m,
+        alpha,
+        base_transform(m, alpha, camera),
+        atlas,
+        light,
+        data,
+        worn,
         &[],
         Some(body_color(m, alpha)),
+        hidden,
+        parts,
         out,
         Some(skin),
     );
@@ -1584,7 +1679,8 @@ pub fn cape(
         return;
     };
     let s = anim::state(m, alpha);
-    let mut poses = Poses::new(model);
+    let mut poses = Poses::pooled();
+    poses.reset(model);
     anim::setup(m, &s, &mut poses, &data.animations);
     let a = f64::from(alpha);
     let at = [
@@ -1622,14 +1718,15 @@ pub fn ears(
     data: &MobData,
     out: &mut Vec<Vertex>,
 ) {
-    if super::trader::is_invisible(m) {
+    if m.is_invisible() {
         return;
     }
     let Some(model) = m.kind.layer("player#ears") else {
         return;
     };
     let s = anim::state(m, alpha);
-    let mut poses = Poses::new(model);
+    let mut poses = Poses::pooled();
+    poses.reset(model);
     anim::setup(m, &s, &mut poses, &data.animations);
     // LivingEntityRenderer.getOverlayCoords(state, 0.0F).
     draw(
@@ -1681,6 +1778,53 @@ fn snap_to_face(value: f32) -> f32 {
     if value > 0.5 { 1.0 } else { 0.5 }
 }
 
+/// The most arrows or stingers drawn stuck in one body. Vanilla draws the
+/// whole count, which only grows by one per hit and drains over time, so a
+/// player rarely carries more than a few dozen; past that more copies look
+/// alike, while a count a server or mod sets (up to 2^31) would cost a frame
+/// that many models.
+pub const MAX_STUCK_DRAWN: i32 = 128;
+
+/// One copy `StuckInBodyLayer.submit` places: an index into `BODY_PARTS`, a
+/// cube of that part and the point in it (`snapToFace`d on the surface).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StuckPlacement {
+    part: usize,
+    cube: usize,
+    mid: [f32; 3],
+}
+
+/// `StuckInBodyLayer.submit`'s random draws for the first `count` copies
+/// (at most `MAX_STUCK_DRAWN`), from a random seeded by the entity id `id`:
+/// a body part, one of its `cubes(part)` cubes, a point in it. A part with no
+/// cube ends the copies.
+fn stuck_placements(
+    id: i32,
+    count: i32,
+    on_surface: bool,
+    cubes: impl Fn(usize) -> usize,
+) -> impl Iterator<Item = StuckPlacement> {
+    use horizon_core::random::{LegacyRandom, RandomSource};
+    let mut random = LegacyRandom::new(i64::from(id));
+    std::iter::from_fn(move || {
+        let part = random.next_int_bound(BODY_PARTS.len() as i32).unwrap_or(0) as usize;
+        let cube = random.next_int_bound(cubes(part) as i32).ok()? as usize;
+        let mut mid = [
+            random.next_float(),
+            random.next_float(),
+            random.next_float(),
+        ];
+        if on_surface {
+            let plane = random.next_int_bound(3).unwrap_or(0) as usize;
+            if plane < 3 {
+                mid[plane] = snap_to_face(mid[plane]);
+            }
+        }
+        Some(StuckPlacement { part, cube, mid })
+    })
+    .take(count.clamp(0, MAX_STUCK_DRAWN) as usize)
+}
+
 /// `StuckInBodyLayer.submit` (with `submitStuckItem`) for a player: `count`
 /// copies of `item` (`ArrowLayer`'s arrow model, `BeeStingerLayer`'s stinger)
 /// stuck in random cubes of the posed body, placed from a random source
@@ -1699,7 +1843,6 @@ pub fn stuck_in_body(
     light: u32,
     out: &mut Vec<Vertex>,
 ) {
-    use horizon_core::random::{LegacyRandom, RandomSource};
     if count <= 0 {
         return;
     }
@@ -1713,31 +1856,15 @@ pub fn stuck_in_body(
         .unwrap_or_else(|| m.kind.model.clone());
     let mut poses = Poses::new(&model);
     anim::setup(m, &s, &mut poses, &data.animations);
-    let mut random = LegacyRandom::new(i64::from(id));
-    for _ in 0..count {
-        let name = BODY_PARTS[random.next_int_bound(BODY_PARTS.len() as i32).unwrap_or(0) as usize];
-        let Some(part) = find_part(&model, name) else {
-            return;
-        };
-        let cubes = cube_bounds(part);
-        let Ok(index) = random.next_int_bound(cubes.len() as i32) else {
-            return;
-        };
-        let cube = cubes[index as usize];
+    // A part the model lacks has no cubes, which ends the copies as before.
+    let cubes = BODY_PARTS.map(|name| find_part(&model, name).map(cube_bounds).unwrap_or_default());
+    for stuck in stuck_placements(id, count, on_surface, |part| cubes[part].len()) {
+        let name = BODY_PARTS[stuck.part];
+        let cube = cubes[stuck.part][stuck.cube];
         let Some(mut t) = part_matrix(&model, base, &poses, name, 0.0) else {
             return;
         };
-        let mut mid = [
-            random.next_float(),
-            random.next_float(),
-            random.next_float(),
-        ];
-        if on_surface {
-            let plane = random.next_int_bound(3).unwrap_or(0) as usize;
-            if plane < 3 {
-                mid[plane] = snap_to_face(mid[plane]);
-            }
-        }
+        let mid = stuck.mid;
         let lerp = |k: usize| cube[k] + mid[k] * (cube[3 + k] - cube[k]);
         t *= glam::Mat4::from_translation(glam::Vec3::new(lerp(0), lerp(1), lerp(2)) / 16.0);
         let (dx, dy, dz) = (
@@ -1747,8 +1874,8 @@ pub fn stuck_in_body(
         );
         let dxz = f64::from(dx * dx + dz * dz).sqrt() as f32;
         let degrees = |y: f32, x: f32| {
-            (horizon_core::jmath::atan2(f64::from(y), f64::from(x)) * 180.0
-                / f64::from(std::f32::consts::PI)) as f32
+            (horizon_core::jmath::atan2(f64::from(y), f64::from(x))
+                * f64::from(horizon_core::geometry::trig::RAD_TO_DEG)) as f32
         };
         let y_rot = degrees(dx, dz);
         let x_rot = degrees(dy, dxz);
@@ -1808,7 +1935,8 @@ fn shoulder_parrot_texture(variant: i32) -> String {
 /// `render_with` without the body, for an avatar the viewer can't see:
 /// `LivingEntityRenderer.submit` gets no render type for an invisible body
 /// (`isBodyVisible`, `isInvisibleTo`), but its layers still draw
-/// (`HumanoidArmorLayer`: the armour in `extra`).
+/// (`HumanoidArmorLayer`: the armour in `extra`). `parts` as for [`render_with_hidden`], posed as
+/// the layers draw over the unseen body.
 #[allow(clippy::too_many_arguments)]
 pub fn render_layers(
     m: &Mob,
@@ -1817,11 +1945,27 @@ pub fn render_layers(
     atlas: Atlas,
     light: u32,
     data: &MobData,
+    worn: &WornArmor,
     extra: &[(&Part, [f32; 4], u32, u32, bool)],
+    parts: Option<&mut Option<mod_api::PosedParts>>,
     out: &mut Vec<Vertex>,
 ) {
     let base = base_transform(m, alpha, camera);
-    render_visible(m, alpha, base, atlas, light, data, extra, None, out, None);
+    render_visible(
+        m,
+        alpha,
+        base,
+        atlas,
+        light,
+        data,
+        worn,
+        extra,
+        None,
+        Default::default(),
+        parts,
+        out,
+        None,
+    );
 }
 /// A mob drawn under `origin` instead of at its position (the spinning mob
 /// of `SpawnerRenderer.submitEntityInSpawner`).
@@ -1832,11 +1976,25 @@ pub fn render_posed(
     atlas: Atlas,
     light: u32,
     data: &MobData,
+    worn: &WornArmor,
     out: &mut Vec<Vertex>,
 ) {
     let base = base_transform_at(m, alpha, origin);
-    let paint = Some(body_color(m, alpha));
-    render_visible(m, alpha, base, atlas, light, data, &[], paint, out, None);
+    render_visible(
+        m,
+        alpha,
+        base,
+        atlas,
+        light,
+        data,
+        worn,
+        &[],
+        Some(body_color(m, alpha)),
+        Default::default(),
+        None,
+        out,
+        None,
+    );
 }
 /// The custom model's key of a body model: `main` is the wide player model, `kind.model`.
 fn cem_key(model_key: &str) -> &str {
@@ -1852,7 +2010,7 @@ fn cem_key(model_key: &str) -> &str {
 /// the atlas lacks it, and only the layer a `.jem` was made for takes it, `paints_with_jem`),
 /// and the warden's glowing layers (whether they glow this frame or not). Random textures
 /// choose a variant for each.
-pub fn drawn_textures(m: &Mob, data: &MobData) -> Vec<String> {
+pub fn drawn_textures(m: &Mob, data: &MobData, worn: &WornArmor) -> Vec<String> {
     fn push(names: &mut Vec<String>, custom: Option<&super::cem::CemLayer>, vanilla: String) {
         if let Some(texture) = custom.and_then(|c| c.texture_for(&vanilla)) {
             names.push(texture.to_owned());
@@ -1866,8 +2024,9 @@ pub fn drawn_textures(m: &Mob, data: &MobData) -> Vec<String> {
     let (model_key, texture) = body(m);
     let cem_key = cem_key(&model_key);
     let mut names = Vec::new();
-    push(&mut names, cem.layer(cem_key), texture.into_owned());
-    let mut all_layers = layers(m, m.age as f32);
+    let custom_body = (!cem.is_empty()).then(|| cem.layer(cem_key)).flatten();
+    push(&mut names, custom_body, texture.into_owned());
+    let mut all_layers = layers(m, m.age as f32, worn);
     if m.species() == Species::Warden {
         for (model, texture, _) in super::warden::emissive_layers(m, 0.0) {
             all_layers.push(Layer {
@@ -1881,8 +2040,9 @@ pub fn drawn_textures(m: &Mob, data: &MobData) -> Vec<String> {
     }
     let body_keys = [&*model_key, cem_key];
     for (i, layer) in all_layers.iter().enumerate() {
-        let custom = cem
-            .layer(&layer.model)
+        let custom = (!cem.is_empty())
+            .then(|| cem.layer(&layer.model))
+            .flatten()
             .filter(|_| paints_with_jem(&all_layers, i, body_keys));
         push(&mut names, custom, layer.texture.to_string());
     }
@@ -1917,14 +2077,20 @@ fn posed_body(
     m: &Mob,
     alpha: f32,
     data: &MobData,
-) -> (std::sync::Arc<Part>, Poses, Vec<(String, String, [f32; 3])>) {
+) -> (
+    std::sync::Arc<Part>,
+    anim::PooledPoses,
+    Vec<(String, String, [f32; 3])>,
+) {
     let s = anim::state(m, alpha);
     let (model_key, _) = body(m);
     let cem = data
         .cem
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let custom = cem.layer(cem_key(&model_key));
+    let custom = (!cem.is_empty())
+        .then(|| cem.layer(cem_key(&model_key)))
+        .flatten();
     let model = match custom {
         Some(c) => c.model.clone(),
         None => m
@@ -1933,7 +2099,8 @@ fn posed_body(
             .cloned()
             .unwrap_or_else(|| m.kind.model.clone()),
     };
-    let mut poses = Poses::new(&model);
+    let mut poses = Poses::pooled();
+    poses.reset(&model);
     anim::setup(m, &s, &mut poses, &data.animations);
     if let Some(c) = custom
         && let Some(animation) = &c.animation
@@ -1943,6 +2110,71 @@ fn posed_body(
     let anchors = custom.map_or(Vec::new(), |c| c.anchors.clone());
     (model, poses, anchors)
 }
+/// The humanoid parts of a body drawn with `poses`, for the mods' post hooks and layers: read from the poses the
+/// draw already made, so nothing is posed twice; fixed-size, nothing allocated.
+fn posed_parts(poses: &Poses) -> Option<mod_api::PosedParts> {
+    mod_api::PosedParts::new(|part| {
+        let name = part.model_name();
+        Some((poses.pose_of(name)?, !poses.is_hidden_named(name)))
+    })
+}
+// Validate names against this frame's model before mutating its body poses.
+// Return the borrowed name so a repeated refusal never allocates an error string.
+fn hide_parts<'a>(poses: &mut Poses, hidden: &'a mod_api::HiddenParts) -> Result<(), &'a str> {
+    for name in hidden.names() {
+        if poses.pose_of(name).is_none() {
+            return Err(name);
+        }
+    }
+    for name in hidden.names() {
+        poses.visible(name, false);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct HiddenPartReports {
+    names: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    count: usize,
+}
+
+impl HiddenPartReports {
+    // Mods can change their eight hidden names between frames. Never evict an entry (which
+    // would report it again); after this process-wide budget, suppress new diagnostics too.
+    const LIMIT: usize = 4096;
+
+    fn first(&mut self, kind: &str, name: &str) -> bool {
+        if self.count >= Self::LIMIT
+            || self
+                .names
+                .get(kind)
+                .is_some_and(|names| names.contains(name))
+        {
+            return false;
+        }
+        self.names
+            .entry(kind.to_owned())
+            .or_default()
+            .insert(name.to_owned());
+        self.count += 1;
+        true
+    }
+}
+
+fn report_unknown_hidden_part(kind: &str, name: &str) {
+    // Shared by every renderer, including mirror views and different render threads.
+    static REPORTS: std::sync::Mutex<Option<HiddenPartReports>> = std::sync::Mutex::new(None);
+    let mut reports = REPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if reports
+        .get_or_insert_with(HiddenPartReports::default)
+        .first(kind, name)
+    {
+        eprintln!("mob {kind}: unknown hidden part {name}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_visible(
     m: &Mob,
@@ -1951,9 +2183,12 @@ fn render_visible(
     atlas: Atlas,
     light: u32,
     data: &MobData,
+    worn: &WornArmor,
     extra: &[(&Part, [f32; 4], u32, u32, bool)],
     // `submit`'s `tintedColor` to draw the body in, or `None` for its layers only.
     paint: Option<u32>,
+    hidden: mod_api::HiddenParts,
+    parts: Option<&mut Option<mod_api::PosedParts>>,
     out: &mut Vec<Vertex>,
     skin: Option<&mut super::skin::Skin>,
 ) {
@@ -1969,7 +2204,7 @@ fn render_visible(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let cem_key = cem_key(&model_key);
-    let custom_body = cem.layer(cem_key);
+    let custom_body = (!cem.is_empty()).then(|| cem.layer(cem_key)).flatten();
     let body_animation = custom_body.and_then(|c| c.animation.as_ref());
     let model = match custom_body {
         Some(custom) => custom.model.clone(),
@@ -2030,7 +2265,7 @@ fn render_visible(
     if let Some(animation) = body_animation {
         animation.run(m, &s, &mut poses);
     }
-    let mut all_layers = layers(m, s.age);
+    let mut all_layers = layers(m, s.age, worn);
     // WardenRenderer: the translucent emissive layers fade with the animations.
     if m.species() == Species::Warden {
         for (model, texture, a) in super::warden::emissive_layers(m, alpha) {
@@ -2055,7 +2290,8 @@ fn render_visible(
             custom_body.is_none()
                 && extra.is_empty()
                 && m.species() != Species::SulfurCube
-                && !translucent_body(m)
+                && (!translucent_body(m)
+                    || (skin.models.tagged && paint.is_none_or(|t| t >> 24 == 0xFF)))
                 && energy_swirl(m, s.age).is_none()
                 && skin.supports(&model)
                 && all_layers.iter().all(|layer| {
@@ -2063,7 +2299,7 @@ fn render_visible(
                     // is the only difference from a plain draw.
                     (skin.models.tagged && (eyes_layer(m, layer) || !layer.full_bright)
                         || !layer.full_bright && !translucent_layer(m, layer))
-                        && cem.layer(&layer.model).is_none()
+                        && (cem.is_empty() || cem.layer(&layer.model).is_none())
                         && m.kind
                             .layer(&layer.model)
                             .is_none_or(|part| skin.supports(part))
@@ -2073,6 +2309,28 @@ fn render_visible(
     };
     if !posable {
         skin = None;
+    }
+    // The parts a mod's `render_player_pre` or `render_living_pre` hid this frame: the body and the
+    // layers over its own model (`getParentModel`) draw without them, the armour and the other
+    // layers below with every part.
+    let mut hidden_poses = Option::<anim::PooledPoses>::None;
+    let body_poses: &Poses = if hidden.is_empty() {
+        &poses
+    } else {
+        let hp = hidden_poses.get_or_insert_with(Poses::pooled);
+        hp.copy_from(&poses);
+        if let Err(name) = hide_parts(hp, &hidden) {
+            report_unknown_hidden_part(&m.kind.id, name);
+            return;
+        }
+        &*hp
+    };
+    // The mods' post hooks' snapshot: the body's parts as drawn, for `HumanoidMobRenderer`'s families
+    // (`anim::extracts_humanoid`) only.
+    if let Some(parts) = parts
+        && anim::extracts_humanoid(m)
+    {
+        *parts = posed_parts(body_poses);
     }
     let draw_body = |out: &mut Vec<Vertex>, skin: &mut Option<&mut super::skin::Skin>| {
         // A player or mannequin whose skin has no atlas sprite (an evicted or
@@ -2087,11 +2345,12 @@ fn render_visible(
         });
         if let (Some(tint), Some(uv)) = (paint, uv) {
             let start = out.len();
+            let first_job = skin.as_deref().map(|skin| skin.frame.jobs.len());
             put(
                 skin,
                 &model,
                 base,
-                &poses,
+                body_poses,
                 uv,
                 0.0,
                 tint,
@@ -2104,7 +2363,7 @@ fn render_visible(
                     skin,
                     &model,
                     base,
-                    &poses,
+                    body_poses,
                     glow,
                     0.0,
                     tint,
@@ -2116,6 +2375,11 @@ fn render_visible(
             // A body below full alpha (`forceTransparent`'s 654311423) blends too.
             if translucent_body(m) || tint >> 24 != 0xFF {
                 mark_oit(&mut out[start..]);
+                if let (Some(skin), Some(first)) = (skin.as_deref_mut(), first_job) {
+                    for job in &mut skin.frame.jobs[first..] {
+                        job.overlay |= crate::gfx::OIT_ENTITY;
+                    }
+                }
             }
         }
     };
@@ -2130,11 +2394,11 @@ fn render_visible(
         draw(part, base, &poses, *uv, *color, light, *layer_overlay, out);
     }
     // One Poses refilled for every layer (armour draws up to seven): it keeps
-    // its maps' capacity.
-    let mut layer_poses = Poses::pooled();
+    // its maps' capacity. Only borrow from the pool when this mob actually has layers or swirl.
+    let mut layer_poses = Option::<anim::PooledPoses>::None;
     let body_keys = [&*model_key, cem_key];
     for (i, layer) in all_layers.iter().enumerate() {
-        let custom = cem.layer(&layer.model);
+        let custom = (!cem.is_empty()).then(|| cem.layer(&layer.model)).flatten();
         // `layer.texture` stays the vanilla name (the villager hats below look for its
         // `/type/` folder).
         let texture = cem_texture(
@@ -2152,29 +2416,44 @@ fn render_visible(
         let Some((drawn, uv)) = sprite(texture).or_else(|| Some((texture, atlas(texture)?))) else {
             continue;
         };
-        if custom.is_none() && custom_body.is_none() && std::sync::Arc::ptr_eq(&part, &model) {
-            // A layer over the body's own model (a villager's type, profession
-            // and level, a spider's eyes): `setupAnim` gives the body's poses.
-            layer_poses.copy_from(&poses);
-        } else {
-            layer_poses.reset(&part);
-            anim::setup(m, &s, &mut layer_poses, &data.animations);
-            if let Some(animation) = custom.and_then(|c| c.animation.as_ref()) {
-                animation.run(m, &s, &mut layer_poses);
-            }
-        }
-        if matches!(m.species(), Species::Villager | Species::ZombieVillager)
-            && let Some((folder, variant)) = layer
+        // VillagerProfessionLayer: the type layer under a profession's full hat draws on
+        // `noHatModel`, a model of its own, the others on the parent model.
+        let type_hat_shown = if matches!(m.species(), Species::Villager | Species::ZombieVillager)
+            && let Some((folder, _variant)) = layer
                 .texture
                 .split_once("/type/")
                 .or_else(|| layer.texture.split_once("/baby/"))
         {
-            let profession = PROFESSIONS[m.extra.variant2 as usize % PROFESSIONS.len()];
-            data.villager_hats
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .apply(folder, variant, profession, &mut layer_poses);
-        }
+            villager_client::type_hat_shown(
+                &m.extra.profession,
+                folder == "entity/zombie_villager",
+                m.extra.variant,
+            )
+        } else {
+            true
+        };
+        let reuse_body =
+            custom.is_none() && custom_body.is_none() && std::sync::Arc::ptr_eq(&part, &model);
+        let active_poses: &Poses = if reuse_body && type_hat_shown {
+            // A layer over the body's own model with its hat visible (spider eyes,
+            // villager profession/level, collars): reuse body_poses directly with zero copy.
+            body_poses
+        } else {
+            let lp = layer_poses.get_or_insert_with(Poses::pooled);
+            if reuse_body {
+                lp.copy_from(&poses);
+            } else {
+                lp.reset(&part);
+                anim::setup(m, &s, lp, &data.animations);
+                if let Some(animation) = custom.and_then(|c| c.animation.as_ref()) {
+                    animation.run(m, &s, lp);
+                }
+            }
+            if !type_hat_shown {
+                lp.visible("head", false);
+            }
+            &*lp
+        };
         let light = if layer.full_bright {
             FULL_BRIGHT
         } else {
@@ -2193,7 +2472,7 @@ fn render_visible(
             &mut skin,
             &part,
             base,
-            &layer_poses,
+            active_poses,
             uv,
             layer.scroll,
             layer.color,
@@ -2206,7 +2485,7 @@ fn render_visible(
                 &mut skin,
                 &part,
                 base,
-                &layer_poses,
+                active_poses,
                 glow,
                 layer.scroll,
                 layer.color,
@@ -2254,15 +2533,16 @@ fn render_visible(
         && let Some(part) = m.kind.layer(model)
         && let Some([u0, v0, u1, v1]) = atlas(texture)
     {
-        layer_poses.reset(part);
-        anim::setup(m, &s, &mut layer_poses, &data.animations);
+        let lp = layer_poses.get_or_insert_with(Poses::pooled);
+        lp.reset(part);
+        anim::setup(m, &s, lp, &data.animations);
         // `RenderTypes.energySwirl`'s texture offset, as the sprite-local UV.
         let (du, dv) = (x_offset % 1.0, s.age * 0.01 % 1.0);
         let start = out.len();
         draw(
             part,
             base,
-            &layer_poses,
+            lp,
             [du, dv, 1.0 + du, 1.0 + dv],
             crate::breaking::stage_light([u1 - u0, v1 - v0]),
             crate::breaking::stage_light([u0, v0]),
@@ -2366,6 +2646,9 @@ fn attachment_matrix(
     anchors: &[(String, String, [f32; 3])],
     key: &str,
 ) -> Option<glam::Mat4> {
+    if anchors.is_empty() {
+        return None;
+    }
     let p = poses.pose(part);
     let m = parent
         * glam::Mat4::from_translation(glam::Vec3::new(p[0], p[1], p[2]) / 16.0)
@@ -2613,7 +2896,7 @@ pub fn held_item_transform(
     // WitchItemLayer.applyTranslation: a potion is held at the nose, any other
     // item as CrossedArmsItemLayer holds it; only the main hand's item is drawn.
     if m.species() == Species::Witch {
-        let item = m.extra.main_hand.as_deref()?;
+        let item = m.extra.main_hand_id()?;
         if left != m.main_arm_left() {
             return None;
         }
@@ -2632,7 +2915,7 @@ pub fn held_item_transform(
     // CrossedArmsItemLayer (villagers and wandering traders): the main hand's
     // item over the folded arms.
     if matches!(m.species(), Species::Villager | Species::WanderingTrader) {
-        m.extra.main_hand.as_deref()?;
+        m.extra.main_hand_id()?;
         if left != m.main_arm_left() {
             return None;
         }
@@ -2647,8 +2930,7 @@ pub fn held_item_transform(
     if m.extra.swing_stab && swing_left == left {
         let forward = m
             .extra
-            .main_hand
-            .as_deref()
+            .main_hand_id()
             .and_then(crate::spear::Kinetic::of)
             .map_or(0.0, |k| k.forward_movement);
         t *= crate::spear::third_person_attack_item(s.swing, forward);
@@ -2657,11 +2939,10 @@ pub fn held_item_transform(
     if super::spear_use::is_using_item(m)
         && m.extra.using_off_hand == off_hand
         && let Some(kinetic) = (if off_hand {
-            &m.extra.off_hand
+            m.extra.off_hand_id()
         } else {
-            &m.extra.main_hand
+            m.extra.main_hand_id()
         })
-        .as_deref()
         .and_then(crate::spear::Kinetic::of)
     {
         let time_held = m.extra.using_item as f32 + s.partial;
@@ -2671,61 +2952,172 @@ pub fn held_item_transform(
 }
 
 /// `ArmedEntityRenderState.extractArmedEntityRenderState`: each arm's item
-/// model reads the stack held by that arm. Only the main hand currently
-/// retains a full stack; the off hand must not inherit its item or components.
+/// model reads the stack held by that arm: each hand has its own slot, so
+/// the off hand never inherits the main hand's item or components.
 pub fn held_item_stack(extra: &super::Extra, off_hand: bool) -> Option<crate::items::ItemStack> {
-    let item = if off_hand {
-        extra.off_hand.as_ref()?
-    } else {
-        if let Some(stack) = extra.main_hand_stack() {
-            return Some(stack.clone());
-        }
-        extra.main_hand.as_ref()?
-    };
-    Some(crate::items::ItemStack::new(item, 1))
+    use horizon_items::equipment::{MAINHAND, OFFHAND};
+    extra
+        .slot_stack(if off_hand { OFFHAND } else { MAINHAND })
+        .cloned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A baby zombie's armour reads the `humanoid_baby` textures for every
-    /// slot, not the adult `humanoid`/`humanoid_leggings` ones (#7302).
     #[test]
-    fn a_baby_zombies_armour_uses_the_humanoid_baby_textures() {
+    fn unknown_hidden_parts_report_once_per_kind_and_name() {
+        let mut reports = HiddenPartReports::default();
+        assert!(reports.first("minecraft:cow", "nose"));
+        for _ in 0..10 {
+            assert!(!reports.first("minecraft:cow", "nose"));
+        }
+        assert!(reports.first("minecraft:pig", "nose"));
+        assert!(reports.first("minecraft:cow", "hat_rim"));
+        assert!(!reports.first("minecraft:pig", "nose"));
+        assert!(!reports.first("minecraft:cow", "hat_rim"));
+        assert_eq!(reports.count, 3);
+
+        for i in 3..HiddenPartReports::LIMIT {
+            assert!(reports.first("minecraft:cow", &format!("part_{i}")));
+        }
+        assert!(!reports.first("minecraft:cow", "over_budget"));
+        assert!(!reports.first("minecraft:sheep", "nose"));
+        assert!(!reports.first("minecraft:cow", "nose"));
+        assert_eq!(reports.count, HiddenPartReports::LIMIT);
+        assert_eq!(reports.names.len(), 2);
+    }
+
+    #[test]
+    fn profession_texture_preserves_nested_namespaces() {
+        assert_eq!(
+            villager_client::profession_texture("entity/villager", "minecraft:farmer"),
+            "entity/villager/profession/farmer"
+        );
+        assert_eq!(
+            villager_client::profession_texture(
+                "entity/zombie_villager",
+                "example:nested/engineer"
+            ),
+            "example:entity/zombie_villager/profession/nested/engineer"
+        );
+    }
+
+    /// A zombie whose model is a humanoid built here (head with its hat, body, arms, legs: one
+    /// face each), and empty mob data: what the posed-parts tests draw, without `.local`.
+    fn humanoid_zombie() -> (Mob, MobData) {
+        let cube = |x: f32| serde_json::json!({ "pose": [x, 0.0, 0.0], "polygons": [[[x, 0.0, 0.0, 0.0, 0.0], [x + 1.0, 0.0, 0.0, 1.0, 0.0], [x + 1.0, 1.0, 0.0, 1.0, 1.0], [x, 1.0, 0.0, 0.0, 1.0]]] });
+        let mut head = cube(0.0);
+        head["children"] = serde_json::json!({ "hat": cube(0.0) });
+        let model = serde_json::json!({ "children": {
+            "head": head, "body": cube(0.0), "right_arm": cube(-5.0), "left_arm": cube(5.0),
+            "right_leg": cube(-2.0), "left_leg": cube(2.0),
+        }});
         let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
         kind.species = Species::Zombie;
-        let model = kind.model.clone();
-        kind.layers.insert("zombie_baby#main".into(), model);
+        kind.anim = super::super::Anim::Zombie;
+        kind.model = std::sync::Arc::new(Part::parse("root", &model));
         let mut mob = Mob::new(
             1,
             std::sync::Arc::new(kind),
             horizon_core::geometry::Vec3::ZERO,
             0.0,
         );
-        mob.extra.age = -24000;
-        mob.extra.head = Some("minecraft:iron_helmet".into());
-        mob.extra.legs = Some("minecraft:iron_leggings".into());
-        mob.extra.feet = Some("minecraft:leather_boots".into());
-        let mut layers = Vec::new();
-        humanoid_armor(&mob, &mut layers);
-        let textures: Vec<&str> = layers.iter().map(|l| &*l.texture).collect();
+        mob.age = 37;
+        let data = MobData {
+            states: Vec::new(),
+            placements: Default::default(),
+            heightmaps: Default::default(),
+            animations: Default::default(),
+            biome_tags: Default::default(),
+            entity_tags: Default::default(),
+            villager_hats: Default::default(),
+            cem: Default::default(),
+            random_textures: Default::default(),
+            emissive: Default::default(),
+            blinks: Default::default(),
+            pois: Default::default(),
+            species_placements: Default::default(),
+            resolved: Default::default(),
+            mod_spawns: Default::default(),
+        };
+        (mob, data)
+    }
+
+    // The mods' post hooks' posed parts are kept from the body's own draw, on every entry the game draws
+    // a mob or player through (CPU, GPU, layers only), and keeping them changes nothing drawn
+    // (arismoko/horizon#2060, arismoko/horizon#2464).
+    include!("render_pose_tests.rs");
+
+    /// A part `render_player_pre` hid leaves the body, after Skin Customization, while the armour
+    /// layered on it keeps the part (arismoko/horizon#2060, part 2).
+    #[test]
+    fn a_hidden_part_leaves_the_body_but_not_its_armour() {
+        let (mob, data) = humanoid_zombie();
+        let atlas = |_: &str| Some([0.0, 0.0, 1.0, 1.0]);
+        let armour = mob.kind.model.clone();
+        let extra = [(&*armour, [0.0, 0.0, 1.0, 1.0], 0xFFFF_FFFF, 0, false)];
+        let hide = |parts: &[mod_api::HumanoidPart]| {
+            let mut hidden = mod_api::HiddenParts::default();
+            parts.iter().for_each(|part| hidden.hide(*part));
+            hidden
+        };
+        let draw_parts = |hidden: mod_api::HiddenParts,
+                          extra: &[(&Part, [f32; 4], u32, u32, bool)]| {
+            let (mut out, mut parts) = (Vec::new(), None);
+            render_with_hidden(
+                &mob,
+                0.5,
+                glam::DVec3::ZERO,
+                &atlas,
+                0xf0f0,
+                &data,
+                &Default::default(),
+                extra,
+                hidden,
+                Some(&mut parts),
+                &mut out,
+            );
+            (out.len(), parts.expect("a humanoid"))
+        };
+        let draw =
+            |hidden, extra: &[(&Part, [f32; 4], u32, u32, bool)]| draw_parts(hidden, extra).0;
+        let whole = draw(hide(&[]), &[]);
+        let one_face = 4;
         assert_eq!(
-            textures,
-            [
-                "entity/equipment/humanoid_baby/iron",
-                "entity/equipment/humanoid_baby/iron",
-                "entity/equipment/humanoid_baby/leather",
-                "entity/equipment/humanoid_baby/leather_overlay",
-            ]
+            draw(hide(&[mod_api::HumanoidPart::RightArm]), &[]),
+            whole - one_face
         );
-        mob.extra.age = 0;
-        let mut adult = Vec::new();
-        humanoid_armor(&mob, &mut adult);
         assert_eq!(
-            &*adult[1].texture,
-            "entity/equipment/humanoid_leggings/iron"
+            draw(hide(&[mod_api::HumanoidPart::Head]), &[]),
+            whole - 2 * one_face,
+            "the head's child, the hat, goes with it"
         );
+        assert_eq!(
+            draw(hide(&[]), &extra),
+            2 * whole,
+            "the armour layer copies every part"
+        );
+        assert_eq!(
+            draw(hide(&[mod_api::HumanoidPart::RightArm]), &extra),
+            2 * whole - one_face,
+            "only the body loses the arm"
+        );
+
+        // `render_living_post` reads the parts as the body drew them: the hidden arm doesn't draw, and
+        // nothing else changed (arismoko/horizon#2464).
+        let (_, shown) = draw_parts(hide(&[]), &[]);
+        let (_, armless) = draw_parts(hide(&[mod_api::HumanoidPart::RightArm]), &[]);
+        for part in mod_api::HumanoidPart::ALL {
+            let (a, b) = (shown.get(part), armless.get(part));
+            if part == mod_api::HumanoidPart::RightArm {
+                let (a, b) = (a.unwrap(), b.unwrap());
+                assert!(a.visible && !b.visible, "the hidden arm doesn't draw");
+                assert_eq!(a.pose, b.pose, "still posed where vanilla posed it");
+            } else {
+                assert_eq!(a, b, "{part:?}");
+            }
+        }
     }
 
     #[test]
@@ -2753,9 +3145,12 @@ mod tests {
         use crate::items::ItemStack;
         let mut extra = super::super::Extra::default();
         let mut main = ItemStack::new("minecraft:crossbow", 1);
-        main.data_mut().custom_name = Some(horizon_world::nbt::Tag::String("Main hand".into()));
+        main.data_mut().custom_name = Some(horizon_core::nbt::Tag::String("Main hand".into()));
         extra.set_main_hand_stack(Some(main));
-        extra.off_hand = Some("minecraft:crossbow".into());
+        extra.set_slot_id(
+            horizon_items::equipment::OFFHAND,
+            Some("minecraft:crossbow".into()),
+        );
         assert_eq!(
             held_item_stack(&extra, false)
                 .unwrap()
@@ -2771,7 +3166,10 @@ mod tests {
         );
         // An admiring piglin holds gold beside its crossbow. Both the item
         // id and the model components must come from the appropriate hand.
-        extra.off_hand = Some("minecraft:gold_ingot".into());
+        extra.set_slot_id(
+            horizon_items::equipment::OFFHAND,
+            Some("minecraft:gold_ingot".into()),
+        );
         assert_eq!(
             &*held_item_stack(&extra, true).unwrap().item,
             "minecraft:gold_ingot"
@@ -2780,7 +3178,7 @@ mod tests {
             &*held_item_stack(&extra, false).unwrap().item,
             "minecraft:crossbow"
         );
-        extra.off_hand = None;
+        extra.set_slot_id(horizon_items::equipment::OFFHAND, None);
         assert!(held_item_stack(&extra, true).is_none());
     }
 
@@ -2796,6 +3194,7 @@ mod tests {
 
         let model = Arc::new(Part::parse("root", &json!({"children": {"head": {}}})));
         let kind = Arc::new(MobType {
+            shadow: None,
             id: "minecraft:player".into(),
             species: Species::Zombie,
             width: 0.6,
@@ -2815,6 +3214,7 @@ mod tests {
             jump_strength: 0.42,
             attributes: Arc::default(),
             item_stack_limits: Default::default(),
+            attribute_bounds: Default::default(),
             gravity: 0.08,
             safe_fall_distance: 3.0,
             fall_damage_multiplier: 1.0,
@@ -2833,9 +3233,10 @@ mod tests {
             brain: Brain::Passive,
             anim: Anim::Camel,
             sounds: [""; 3],
-            step_sound: None,
+            sound_overrides: Default::default(),
             food: Arc::default(),
             tempt: Arc::default(),
+            passenger_attachments: Vec::new(),
         });
         let gliding = |previous: Vec3, current: Vec3| {
             let mut m = Mob::new(1, kind.clone(), Vec3::ZERO, 0.0);
@@ -2877,6 +3278,51 @@ mod tests {
                 cull_back: false,
             })
             .collect()
+    }
+
+    /// `StuckInBodyLayer.submit`: the copies drawn are the old loop's first
+    /// ones, in its random order, and no more than `MAX_STUCK_DRAWN` however
+    /// large the count a server sends.
+    #[test]
+    fn stuck_arrows_draw_the_first_copies_up_to_a_bound() {
+        use horizon_core::random::{LegacyRandom, RandomSource};
+        // Cubes per part of `BODY_PARTS`; the legs' second cube is a test's.
+        let cubes = |part: usize| [1, 1, 1, 1, 2, 2][part];
+        // The draws as the loop over the whole count made them.
+        let unbounded = |id: i32, count: i32, on_surface: bool| {
+            let mut random = LegacyRandom::new(i64::from(id));
+            let mut out = Vec::new();
+            for _ in 0..count {
+                let part = random.next_int_bound(6).unwrap() as usize;
+                let cube = random.next_int_bound(cubes(part) as i32).unwrap() as usize;
+                let mut mid = [
+                    random.next_float(),
+                    random.next_float(),
+                    random.next_float(),
+                ];
+                if on_surface {
+                    let plane = random.next_int_bound(3).unwrap() as usize;
+                    mid[plane] = snap_to_face(mid[plane]);
+                }
+                out.push(StuckPlacement { part, cube, mid });
+            }
+            out
+        };
+        for (id, on_surface) in [(7, false), (7, true), (-123_456, false)] {
+            for count in [0, 1, 5, 40, MAX_STUCK_DRAWN] {
+                let drawn: Vec<_> = stuck_placements(id, count, on_surface, cubes).collect();
+                assert_eq!(drawn, unbounded(id, count, on_surface), "{id} {count}");
+            }
+            let at_most = unbounded(id, MAX_STUCK_DRAWN, on_surface);
+            for count in [MAX_STUCK_DRAWN + 1, i32::MAX] {
+                let drawn: Vec<_> = stuck_placements(id, count, on_surface, cubes).collect();
+                assert_eq!(drawn, at_most, "{id} {count}");
+            }
+        }
+        // A part with no cube ends the copies there.
+        let headless = stuck_placements(7, 40, false, |part| usize::from(part != 0)).count();
+        let first_head = unbounded(7, 40, false).iter().position(|s| s.part == 0);
+        assert_eq!(Some(headless), first_head);
     }
 
     /// `ModelPart.cubes`: the corners of each cube of a part, six faces apiece.
@@ -2931,13 +3377,14 @@ mod tests {
             let kind = std::sync::Arc::new(types.types[kind].clone());
             for baby in [false, true] {
                 for t in 0..VILLAGER_TYPES.len() {
-                    for p in 0..PROFESSIONS.len() {
+                    for p in 0..crate::mobs::villager::profession_table().entries().len() {
                         let mut m =
                             Mob::new(1, kind.clone(), horizon_core::geometry::Vec3::ZERO, 0.0);
                         m.extra.age = if baby { -24000 } else { 0 };
-                        (m.extra.variant, m.extra.variant2, m.extra.variant3) =
-                            (t as u8, p as u8, 5);
-                        let layers = layers(&m, m.age as f32);
+                        (m.extra.variant, m.extra.villager_level) = (t as u8, 5);
+                        m.extra.profession =
+                            super::super::villager::ProfessionState::from_index(p as u8);
+                        let layers = layers(&m, m.age as f32, &Default::default());
                         let group = if baby { "/baby/" } else { "/type/" };
                         assert!(
                             layers.iter().any(|l| l.texture.contains(group)),
@@ -2977,6 +3424,8 @@ mod tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            mod_spawns: Default::default(),
+            resolved: Default::default(),
         };
         let atlas = |name: &str| {
             Some(if name.contains("_inner") {
@@ -3000,6 +3449,7 @@ mod tests {
                         &atlas,
                         0xf0f0,
                         &data,
+                        &Default::default(),
                         &mut vertices,
                     );
                 } else {
@@ -3024,7 +3474,7 @@ mod tests {
                 );
                 assert!(vertices[24..].iter().all(|v| v.uv[0] >= 0.5));
             }
-            mob.extra.body = Some("minecraft:stone".into());
+            mob.extra.set_body(Some("minecraft:stone".into()));
             let mut vertices = Vec::new();
             render(
                 &mob,
@@ -3070,6 +3520,8 @@ mod tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            mod_spawns: Default::default(),
+            resolved: Default::default(),
         };
         let atlas = |name: &str| {
             Some(if name.contains("copper_golem_eyes") {
@@ -3127,6 +3579,8 @@ mod tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            mod_spawns: Default::default(),
+            resolved: Default::default(),
         };
         for left in [false, true] {
             let t = held_item_transform(&mob, 0.5, glam::DVec3::ZERO, &data, left).unwrap();
@@ -3154,7 +3608,10 @@ mod tests {
         let types = super::super::MobTypes::load(&root).unwrap();
         let assets = crate::assets::Assets::load(&root).unwrap();
         let facts = crate::blocks::BlockFacts::load(&root, assets.registry).unwrap();
-        let data = MobData::load(&root, &facts);
+        let data = MobData::load(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+            &facts,
+        );
         for id in ["minecraft:villager", "minecraft:wandering_trader"] {
             let kind = std::sync::Arc::new(types.types[id].clone());
             let mut mob = Mob::new(1, kind, horizon_core::geometry::Vec3::ZERO, 0.0);
@@ -3240,6 +3697,8 @@ mod tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            mod_spawns: Default::default(),
+            resolved: Default::default(),
         };
         let atlas = |_: &str| Some([0.0, 0.0, 0.25, 0.25]);
         let part = &kind.model;
@@ -3252,6 +3711,7 @@ mod tests {
                 &atlas,
                 0xf0f0,
                 &data,
+                &Default::default(),
                 &[(part, [0.5, 0.5, 0.75, 0.75], 0xFFFF_FFFF, overlay, false)],
                 &mut vertices,
             );
@@ -3287,10 +3747,7 @@ mod tests {
         // Undyed leather: the colour the leather layer has when undyed.
         assert_eq!(armor_tint(Some(0xA06540), Some(&stack)), abgr(0xA06540));
         // Dyed: the stack's own colour.
-        stack.extra = Some(Box::new(crate::item_data::StackData {
-            dyed_color: Some(0x0000FF),
-            ..Default::default()
-        }));
+        stack.data_mut().dyed_color = Some(0x0000FF);
         assert_eq!(armor_tint(Some(0xA06540), Some(&stack)), abgr(0x0000FF));
         // A layer that is not dyeable is not tinted.
         assert_eq!(armor_tint(None, Some(&stack)), 0xFFFF_FFFF);
@@ -3311,7 +3768,9 @@ mod tests {
     }
 
     fn sheep_layer(m: &Mob, model: &str, age: f32) -> Option<Layer> {
-        layers(m, age).into_iter().find(|l| l.model == model)
+        layers(m, age, &Default::default())
+            .into_iter()
+            .find(|l| l.model == model)
     }
 
     /// SheepRenderer.extractRenderState's `jeb_` magic name: the wool layer
@@ -3433,7 +3892,7 @@ mod scroll_tests {
         };
         // The sheep's wool layers, model, texture and colour, in submission order.
         let wool = |m: &Mob| -> Vec<(String, String, u32)> {
-            layers(m, 0.0)
+            layers(m, 0.0, &Default::default())
                 .into_iter()
                 .filter(|l| l.model.contains("#wool"))
                 .map(|l| (l.model.into_owned(), l.texture.into_owned(), l.color))
@@ -3549,6 +4008,8 @@ mod scroll_tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            mod_spawns: Default::default(),
+            resolved: Default::default(),
         };
         let atlas = |name: &str| {
             let h = name.len() as f32 / 64.0;
@@ -3559,7 +4020,17 @@ mod scroll_tests {
         let frame = |out: &mut Vec<Vertex>| {
             out.clear();
             for m in &mobs {
-                render_with(m, 0.5, camera, &atlas, 0xf0f0, &data, &[], out);
+                render_with(
+                    m,
+                    0.5,
+                    camera,
+                    &atlas,
+                    0xf0f0,
+                    &data,
+                    &Default::default(),
+                    &[],
+                    out,
+                );
             }
         };
         frame(&mut out);
@@ -3685,10 +4156,21 @@ mod emissive_tests {
             };
             std::fs::write(path, text).unwrap();
         }
-        let random = RandomTextures::scan(&root);
-        let blinks = Blinks::scan(&root, &random);
-        let mut emissive = Emissive::scan(&root, &random);
-        emissive.pair_beside(&root, blinks.files());
+        let random = RandomTextures::scan(
+            &horizon_assets::resource_source::ResourceSource::directory(root.to_owned()),
+        );
+        let blinks = Blinks::scan(
+            &horizon_assets::resource_source::ResourceSource::directory(root.to_owned()),
+            &random,
+        );
+        let mut emissive = Emissive::scan(
+            &horizon_assets::resource_source::ResourceSource::directory(root.to_owned()),
+            &random,
+        );
+        emissive.pair_beside(
+            &horizon_assets::resource_source::ResourceSource::directory(root.to_owned()),
+            blinks.files(),
+        );
         let _ = std::fs::remove_dir_all(&root);
         MobData {
             states: Vec::new(),
@@ -3704,6 +4186,8 @@ mod emissive_tests {
             blinks: RwLock::new(blinks),
             pois: Default::default(),
             species_placements: Default::default(),
+            mod_spawns: Default::default(),
+            resolved: Default::default(),
         }
     }
 
@@ -3723,7 +4207,17 @@ mod emissive_tests {
         let m = silverfish();
         let draw = |data: &MobData| {
             let mut out = Vec::new();
-            render_with(&m, 0.0, glam::DVec3::ZERO, &atlas, lit, data, &[], &mut out);
+            render_with(
+                &m,
+                0.0,
+                glam::DVec3::ZERO,
+                &atlas,
+                lit,
+                data,
+                &Default::default(),
+                &[],
+                &mut out,
+            );
             out
         };
         // No `_e` file: one quad, as vanilla.
@@ -3757,7 +4251,17 @@ mod emissive_tests {
             let mut m = silverfish();
             m.age = age;
             let mut out = Vec::new();
-            render_with(&m, 0.0, glam::DVec3::ZERO, &atlas, 0, &data, &[], &mut out);
+            render_with(
+                &m,
+                0.0,
+                glam::DVec3::ZERO,
+                &atlas,
+                0,
+                &data,
+                &Default::default(),
+                &[],
+                &mut out,
+            );
             out.iter().map(|v| v.uv).collect::<Vec<_>>()
         };
         // Entity 1's phase is 0x9E3779B1 % 150 = 61: of every 150 ticks, it blinks for the
@@ -3811,7 +4315,17 @@ mod emissive_tests {
     /// Draws `m` and returns each vertex's (uv, light).
     fn drawn(m: &Mob, data: &MobData, atlas: Atlas) -> Vec<([f32; 2], u32)> {
         let mut out = Vec::new();
-        render_with(m, 0.0, glam::DVec3::ZERO, atlas, 7, data, &[], &mut out);
+        render_with(
+            m,
+            0.0,
+            glam::DVec3::ZERO,
+            atlas,
+            7,
+            data,
+            &Default::default(),
+            &[],
+            &mut out,
+        );
         out.iter().map(|v| (v.uv, v.light)).collect()
     }
 
@@ -3886,7 +4400,15 @@ mod emissive_tests {
             let mut m = silverfish();
             {
                 let textures = data.random_textures.read().unwrap();
-                crate::mobs::random_textures::choose(&mut m, &textures, &data, Some(seen()), 0);
+                crate::mobs::random_textures::choose(
+                    &mut m,
+                    &textures,
+                    &data,
+                    &Default::default(),
+                    Some(seen()),
+                    0,
+                    &|_| None,
+                );
             }
             let v = drawn(&m, &data, &atlas);
             assert!(inside(&v[..4], 0.5), "the variant");
@@ -3917,6 +4439,7 @@ mod emissive_tests {
             &atlas,
             7,
             &data,
+            &Default::default(),
             &extra,
             &mut out,
         );
@@ -3966,7 +4489,9 @@ mod random_texture_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("silverfish.properties"), "textures.1=2").unwrap();
         std::fs::write(dir.join("silverfish2.png"), "").unwrap();
-        let random = RandomTextures::scan(&root);
+        let random = RandomTextures::scan(
+            &horizon_assets::resource_source::ResourceSource::directory(root.to_owned()),
+        );
         let _ = std::fs::remove_dir_all(&root);
         MobData {
             states: Vec::new(),
@@ -3982,12 +4507,24 @@ mod random_texture_tests {
             entity_tags: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            mod_spawns: Default::default(),
+            resolved: Default::default(),
         }
     }
 
     fn uvs(m: &Mob, data: &MobData, atlas: Atlas) -> Vec<[f32; 2]> {
         let mut out = Vec::new();
-        render_with(m, 0.0, glam::DVec3::ZERO, atlas, 0, data, &[], &mut out);
+        render_with(
+            m,
+            0.0,
+            glam::DVec3::ZERO,
+            atlas,
+            0,
+            data,
+            &Default::default(),
+            &[],
+            &mut out,
+        );
         out.iter().map(|v| v.uv).collect()
     }
 
@@ -4005,7 +4542,15 @@ mod random_texture_tests {
                 day_time: 0,
                 weather: horizon_optifine::random::Weather::Clear,
             };
-            crate::mobs::random_textures::choose(&mut m, &textures, &data, Some(seen), 0);
+            crate::mobs::random_textures::choose(
+                &mut m,
+                &textures,
+                &data,
+                &Default::default(),
+                Some(seen),
+                0,
+                &|_| None,
+            );
         }
         let both = |name: &str| match name {
             "entity/silverfish" => Some([0.0, 0.0, 0.5, 0.5]),
@@ -4134,5 +4679,458 @@ mod random_texture_tests {
                 "{axis:?} scales by {length}, not 2 * 0.9375"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod texture_table_tests {
+    use super::{VILLAGER_TYPES, body, layers};
+    use crate::mobs::{Mob, Species};
+    use std::sync::Arc;
+
+    fn mob_of_species(species: Species) -> Mob {
+        let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+        kind.species = species;
+        Mob::new(1, Arc::new(kind), horizon_core::geometry::Vec3::ZERO, 0.0)
+    }
+
+    #[test]
+    fn rabbit_texture_table_matches_every_variant_toast_and_age() {
+        let mut m = mob_of_species(Species::Rabbit);
+        for variant in [0u8, 1, 2, 3, 4, 5, 6, 99, 255] {
+            m.extra.variant = variant;
+            let name = match variant {
+                1 => "white",
+                2 => "black",
+                3 => "white_splotched",
+                4 => "gold",
+                5 => "salt",
+                99 => "caerbannog",
+                _ => "brown",
+            };
+            for baby in [false, true] {
+                m.extra.age = if baby { -24_000 } else { 0 };
+                assert_eq!(m.is_baby(), baby);
+                let suffix = if baby { "_baby" } else { "" };
+                let expected = format!("entity/rabbit/rabbit_{name}{suffix}");
+                assert_eq!(
+                    body(&m).1.as_ref(),
+                    expected.as_str(),
+                    "rabbit variant={variant} baby={baby}"
+                );
+            }
+        }
+        m.custom_name = Some("Toast".into());
+        for variant in [0u8, 1, 99] {
+            m.extra.variant = variant;
+            for baby in [false, true] {
+                m.extra.age = if baby { -24_000 } else { 0 };
+                let suffix = if baby { "_baby" } else { "" };
+                let expected = format!("entity/rabbit/rabbit_toast{suffix}");
+                assert_eq!(
+                    body(&m).1.as_ref(),
+                    expected.as_str(),
+                    "toast rabbit variant={variant} baby={baby}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fox_texture_table_matches_every_variant_sleep_and_age() {
+        let mut m = mob_of_species(Species::Fox);
+        for variant in [0u8, 1, 2, 255] {
+            m.extra.variant = variant;
+            let snow = if variant == 0 { "" } else { "_snow" };
+            for sleeping in [false, true] {
+                m.extra.ints[0] = if sleeping {
+                    crate::mobs::fox::SLEEPING
+                } else {
+                    0
+                };
+                let sleep = if sleeping { "_sleep" } else { "" };
+                for baby in [false, true] {
+                    m.extra.age = if baby { -24_000 } else { 0 };
+                    assert_eq!(m.is_baby(), baby);
+                    let suffix = if baby { "_baby" } else { "" };
+                    let expected = format!("entity/fox/fox{snow}{sleep}{suffix}");
+                    assert_eq!(
+                        body(&m).1.as_ref(),
+                        expected.as_str(),
+                        "fox variant={variant} sleeping={sleeping} baby={baby}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pig_cow_and_chicken_texture_tables_match_every_variant_and_age() {
+        for (species, stem) in [
+            (Species::Pig, "pig"),
+            (Species::Cow, "cow"),
+            (Species::Chicken, "chicken"),
+        ] {
+            let mut m = mob_of_species(species);
+            for variant in [0u8, 1, 2, 3, 255] {
+                m.extra.variant = variant;
+                let climate = match variant {
+                    1 => "warm",
+                    2 => "cold",
+                    _ => "temperate",
+                };
+                for baby in [false, true] {
+                    m.extra.age = if baby { -24_000 } else { 0 };
+                    assert_eq!(m.is_baby(), baby);
+                    let suffix = if baby { "_baby" } else { "" };
+                    let expected = format!("entity/{stem}/{stem}_{climate}{suffix}");
+                    assert_eq!(
+                        body(&m).1.as_ref(),
+                        expected.as_str(),
+                        "{stem} variant={variant} baby={baby}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn axolotl_parrot_and_frog_texture_tables_match_every_variant_and_age() {
+        const AXOLOTLS: [&str; 5] = ["lucy", "wild", "gold", "cyan", "blue"];
+        let mut axolotl = mob_of_species(Species::Axolotl);
+        for variant in (0u8..=6).chain([255]) {
+            axolotl.extra.variant = variant;
+            let name = AXOLOTLS[usize::from(variant).min(AXOLOTLS.len() - 1)];
+            for baby in [false, true] {
+                axolotl.extra.age = if baby { -24_000 } else { 0 };
+                assert_eq!(axolotl.is_baby(), baby);
+                let suffix = if baby { "_baby" } else { "" };
+                let expected = format!("entity/axolotl/axolotl_{name}{suffix}");
+                assert_eq!(
+                    body(&axolotl).1.as_ref(),
+                    expected.as_str(),
+                    "axolotl variant={variant} baby={baby}"
+                );
+            }
+        }
+
+        const PARROTS: [&str; 5] = ["red_blue", "blue", "green", "yellow_blue", "grey"];
+        let mut parrot = mob_of_species(Species::Parrot);
+        for variant in (0u8..=6).chain([255]) {
+            parrot.extra.variant = variant;
+            let name = PARROTS[usize::from(variant).min(PARROTS.len() - 1)];
+            let expected = format!("entity/parrot/parrot_{name}");
+            assert_eq!(
+                body(&parrot).1.as_ref(),
+                expected.as_str(),
+                "parrot variant={variant}"
+            );
+        }
+
+        let mut frog = mob_of_species(Species::Frog);
+        for variant in [0u8, 1, 2, 3, 255] {
+            frog.extra.variant = variant;
+            let name = match variant {
+                1 => "warm",
+                2 => "cold",
+                _ => "temperate",
+            };
+            let expected = format!("entity/frog/frog_{name}");
+            assert_eq!(
+                body(&frog).1.as_ref(),
+                expected.as_str(),
+                "frog variant={variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn villager_layer_texture_tables_match_every_type_level_and_age() {
+        const BIOMES: [&str; 7] = [
+            "plains", "desert", "jungle", "savanna", "snow", "swamp", "taiga",
+        ];
+        const LEVELS: [&str; 5] = ["stone", "iron", "gold", "emerald", "diamond"];
+        assert_eq!(VILLAGER_TYPES, BIOMES);
+        for (species, dir) in [
+            (Species::Villager, "villager"),
+            (Species::ZombieVillager, "zombie_villager"),
+        ] {
+            let mut m = mob_of_species(species);
+            for variant in 0u8..=14 {
+                m.extra.variant = variant;
+                let biome = BIOMES[usize::from(variant) % BIOMES.len()];
+                for baby in [false, true] {
+                    m.extra.age = if baby { -24_000 } else { 0 };
+                    assert_eq!(m.is_baby(), baby);
+                    let sub = if baby { "baby" } else { "type" };
+                    let expected = format!("entity/{dir}/{sub}/{biome}");
+                    let out = layers(&m, 0.0, &[None; 4]);
+                    assert_eq!(
+                        out[0].texture.as_ref(),
+                        expected.as_str(),
+                        "{dir} variant={variant} baby={baby}"
+                    );
+                }
+            }
+            m.extra.age = 0;
+            m.extra.variant = 2;
+            m.extra.profession =
+                crate::mobs::villager::ProfessionState::from_id("minecraft:librarian");
+            for level in [-1i32, 0, 1, 2, 3, 4, 5, 6, 99] {
+                m.extra.villager_level = level;
+                let tier = LEVELS[(level.clamp(1, 5) - 1) as usize];
+                let expected = format!("entity/{dir}/profession_level/{tier}");
+                let out = layers(&m, 0.0, &[None; 4]);
+                assert_eq!(out.len(), 3, "{dir} level={level}");
+                assert_eq!(
+                    out[2].texture.as_ref(),
+                    expected.as_str(),
+                    "{dir} level={level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn companion_mob_texture_tables_match_expected_paths() {
+        const DYE_COLORS: [&str; 16] = [
+            "white",
+            "orange",
+            "magenta",
+            "light_blue",
+            "yellow",
+            "lime",
+            "pink",
+            "gray",
+            "light_gray",
+            "cyan",
+            "purple",
+            "blue",
+            "brown",
+            "green",
+            "red",
+            "black",
+        ];
+
+        // Copper golem body & eyes.
+        let mut golem = mob_of_species(Species::CopperGolem);
+        for (variant, suffix) in [
+            (0u8, ""),
+            (1, "_exposed"),
+            (2, "_weathered"),
+            (3, "_oxidized"),
+            (4, "_oxidized"),
+            (255, "_oxidized"),
+        ] {
+            golem.extra.variant = variant;
+            let expected_body = format!("entity/copper_golem/copper_golem{suffix}");
+            let expected_eyes = format!("entity/copper_golem/copper_golem_eyes{suffix}");
+            assert_eq!(
+                crate::mobs::copper_golem::texture(&golem),
+                expected_body.as_str()
+            );
+            assert_eq!(
+                crate::mobs::copper_golem::eye_texture(&golem),
+                expected_eyes.as_str()
+            );
+        }
+
+        // Equine body & markings.
+        const HORSE_COLORS: [&str; 7] = [
+            "white",
+            "creamy",
+            "chestnut",
+            "brown",
+            "black",
+            "gray",
+            "darkbrown",
+        ];
+        const HORSE_MARKINGS: [&str; 5] = ["", "white", "whitefield", "whitedots", "blackdots"];
+        assert_eq!(crate::mobs::equine::COLORS, HORSE_COLORS);
+        assert_eq!(crate::mobs::equine::MARKINGS, HORSE_MARKINGS);
+        let mut horse = mob_of_species(Species::Horse);
+        for variant in (0u8..=8).chain([255]) {
+            horse.extra.variant = variant;
+            let color = HORSE_COLORS[usize::from(variant).min(HORSE_COLORS.len() - 1)];
+            for baby in [false, true] {
+                horse.extra.age = if baby { -24_000 } else { 0 };
+                let suffix = if baby { "_baby" } else { "" };
+                let expected = format!("entity/horse/horse_{color}{suffix}");
+                assert_eq!(crate::mobs::equine::texture(&horse), expected.as_str());
+            }
+        }
+        for variant2 in (0u8..=6).chain([255]) {
+            horse.extra.variant2 = variant2;
+            let mk = HORSE_MARKINGS[usize::from(variant2).min(HORSE_MARKINGS.len() - 1)];
+            for baby in [false, true] {
+                horse.extra.age = if baby { -24_000 } else { 0 };
+                let suffix = if baby { "_baby" } else { "" };
+                let expected =
+                    (!mk.is_empty()).then(|| format!("entity/horse/horse_markings_{mk}{suffix}"));
+                assert_eq!(crate::mobs::equine::markings(&horse), expected.as_deref());
+            }
+        }
+        for (species, stem) in [
+            (Species::Donkey, "entity/horse/donkey"),
+            (Species::Mule, "entity/horse/mule"),
+            (Species::SkeletonHorse, "entity/horse/horse_skeleton"),
+            (Species::Camel, "entity/camel/camel"),
+            (Species::ZombieHorse, "entity/horse/horse_zombie"),
+        ] {
+            let mut m = mob_of_species(species);
+            for baby in [false, true] {
+                m.extra.age = if baby { -24_000 } else { 0 };
+                assert_eq!(m.is_baby(), baby);
+                let suffix = if baby { "_baby" } else { "" };
+                let expected = format!("{stem}{suffix}");
+                assert_eq!(crate::mobs::equine::texture(&m), expected.as_str());
+            }
+        }
+        assert_eq!(
+            crate::mobs::equine::texture(&mob_of_species(Species::CamelHusk)),
+            "entity/camel/camel_husk"
+        );
+
+        // Llama coat & decor.
+        const LLAMA_COATS: [&str; 4] = ["creamy", "white", "brown", "gray"];
+        assert_eq!(crate::mobs::llama::VARIANTS, LLAMA_COATS);
+        let mut llama = mob_of_species(Species::Llama);
+        for variant in (0u8..=5).chain([255]) {
+            llama.extra.variant = variant;
+            let coat = LLAMA_COATS[usize::from(variant).min(LLAMA_COATS.len() - 1)];
+            for baby in [false, true] {
+                llama.extra.age = if baby { -24_000 } else { 0 };
+                let suffix = if baby { "_baby" } else { "" };
+                let expected = format!("entity/llama/llama_{coat}{suffix}");
+                assert_eq!(crate::mobs::llama::texture(&llama), expected.as_str());
+            }
+        }
+        llama.extra.age = 0;
+        for color in DYE_COLORS.iter().copied().chain(["custom"]) {
+            llama
+                .extra
+                .set_body(Some(format!("minecraft:{color}_carpet").into()));
+            let decor = crate::mobs::llama::decor(&llama).expect("carpet decor");
+            let expected = format!("entity/equipment/llama_body/{color}");
+            assert_eq!(decor.0, "llama#decor");
+            assert_eq!(decor.1.as_ref(), expected.as_str());
+        }
+        llama.extra.age = -24_000;
+        assert!(crate::mobs::llama::decor(&llama).is_none());
+        let mut trader = mob_of_species(Species::TraderLlama);
+        for (baby, model, tex) in [
+            (
+                false,
+                "llama#decor",
+                "entity/equipment/llama_body/trader_llama",
+            ),
+            (
+                true,
+                "llama_baby#decor",
+                "entity/equipment/llama_body/trader_llama_baby",
+            ),
+        ] {
+            trader.extra.age = if baby { -24_000 } else { 0 };
+            let decor = crate::mobs::llama::decor(&trader).expect("trader decor");
+            assert_eq!(decor.0, model);
+            assert_eq!(decor.1.as_ref(), tex);
+        }
+
+        // Panda adult & baby genes.
+        const PANDA_GENES: [&str; 7] = [
+            "normal",
+            "lazy",
+            "worried",
+            "playful",
+            "brown",
+            "weak",
+            "aggressive",
+        ];
+        assert_eq!(crate::mobs::panda::GENES, PANDA_GENES);
+        let mut panda = mob_of_species(Species::Panda);
+        for gene in (0u8..=8).chain([255]) {
+            panda.extra.variant = gene;
+            panda.extra.variant2 = gene;
+            let name = PANDA_GENES[usize::from(gene).min(PANDA_GENES.len() - 1)];
+            for baby in [false, true] {
+                panda.extra.age = if baby { -24_000 } else { 0 };
+                assert_eq!(panda.is_baby(), baby);
+                let expected = match (baby, name) {
+                    (false, "normal") => "entity/panda/panda".to_string(),
+                    (false, g) => format!("entity/panda/panda_{g}"),
+                    (true, "normal") => "entity/panda/panda_baby".to_string(),
+                    (true, g) => format!("entity/panda/{g}_panda_baby"),
+                };
+                assert_eq!(
+                    crate::mobs::panda::texture(&panda),
+                    expected.as_str(),
+                    "panda gene={gene} baby={baby}"
+                );
+            }
+        }
+
+        // Shulker shell colors (0..=15 dyed, 16..=127 undyed, negative i8 -> white).
+        let mut shulker = mob_of_species(Species::Shulker);
+        for (i, color) in DYE_COLORS.iter().enumerate() {
+            shulker.extra.color = i as u8;
+            let expected = format!("entity/shulker/shulker_{color}");
+            assert_eq!(crate::mobs::shulker::texture(&shulker), expected.as_str());
+        }
+        for undyed in [16u8, 17, 127] {
+            shulker.extra.color = undyed;
+            assert_eq!(
+                crate::mobs::shulker::texture(&shulker),
+                "entity/shulker/shulker"
+            );
+        }
+        for neg in [128u8, 255] {
+            shulker.extra.color = neg;
+            assert_eq!(
+                crate::mobs::shulker::texture(&shulker),
+                "entity/shulker/shulker_white"
+            );
+        }
+
+        // Happy ghast harnesses.
+        for color in DYE_COLORS.iter().copied().chain(["custom"]) {
+            let item = format!("minecraft:{color}_harness");
+            let tex = crate::mobs::happy_ghast::harness_texture(&item).expect("harness");
+            let expected = format!("entity/equipment/happy_ghast_body/{color}_harness");
+            assert_eq!(tex.as_ref(), expected.as_str());
+        }
+        assert!(crate::mobs::happy_ghast::harness_texture("minecraft:saddle").is_none());
+
+        // Nautilus body & armour.
+        let mut nautilus = mob_of_species(Species::Nautilus);
+        for (baby, expected) in [
+            (false, "entity/nautilus/nautilus"),
+            (true, "entity/nautilus/nautilus_baby"),
+        ] {
+            nautilus.extra.age = if baby { -24_000 } else { 0 };
+            assert_eq!(crate::mobs::nautilus::texture(&nautilus), expected);
+        }
+        let mut zombie_nautilus = mob_of_species(Species::ZombieNautilus);
+        for (variant, expected) in [
+            (0u8, "entity/nautilus/zombie_nautilus"),
+            (1, "entity/nautilus/zombie_nautilus_coral"),
+            (2, "entity/nautilus/zombie_nautilus"),
+        ] {
+            zombie_nautilus.extra.variant = variant;
+            assert_eq!(crate::mobs::nautilus::texture(&zombie_nautilus), expected);
+        }
+        for (material, tex_name) in [
+            ("copper", "copper"),
+            ("iron", "iron"),
+            ("golden", "gold"),
+            ("diamond", "diamond"),
+            ("netherite", "netherite"),
+            ("custom", "custom"),
+        ] {
+            let item = format!("minecraft:{material}_nautilus_armor");
+            let tex = crate::mobs::nautilus::armor_texture(&item).expect("nautilus armor");
+            let expected = format!("entity/equipment/nautilus_body/{tex_name}");
+            assert_eq!(tex.as_ref(), expected.as_str());
+        }
+        assert!(crate::mobs::nautilus::armor_texture("minecraft:iron_horse_armor").is_none());
     }
 }
