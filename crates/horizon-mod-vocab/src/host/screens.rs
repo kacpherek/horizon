@@ -121,6 +121,11 @@ pub trait ScreensClientHost {
     #[access(ClientSetup)]
     fn mod_screen(&self) -> Option<&str>;
     /// Side: client.
+    /// Name of the active Options page (`"key_binds"`, `"controls"`, `"main"`, etc.)
+    /// when `Screen::Options` is open, or `None` when another screen is active.
+    #[access(ClientSetup)]
+    fn options_page(&self) -> Option<String>;
+    /// Side: client.
     /// The open menu's title (the block's name, or the one it was given),
     /// as plain text.
     #[access(ClientSetup)]
@@ -133,6 +138,15 @@ pub trait ScreensClientHost {
     /// The same screen identifier provided to screen hooks.
     #[access(ClientSetup)]
     fn observed_screen_id(&self) -> Option<ScreenId>;
+    /// The topmost open screen, including dialogs and prompts, without needing a rendered view.
+    /// `None` during normal play or when no screen represented by the screen hooks is open.
+    /// A covering screen does not report an underlying screen's menu.
+    ///
+    /// Available in read-only client hooks, including `Hooks::item_tooltip`. The enchanting
+    /// table reports `id == "inventory"` and `menu.as_deref() == Some("minecraft:enchantment")`
+    /// on native and wasm alike.
+    #[access(ClientSetup)]
+    fn current_screen(&self) -> Option<ScreenIdentity>;
     /// Side: client.
     /// Whether a specific key is currently held down.
     /// `key` is the vanilla physical key name (`key.keyboard.left.shift`, for example).
@@ -160,4 +174,11 @@ pub trait ScreensClientHost {
     /// wasm alike.
     #[access(ClientSetup)]
     fn request_screenshot(&mut self) -> Result<(), ScreenshotError>;
+    /// Side: client.
+    /// The already selected splash text on the main title screen. None on other
+    /// screens, when Hide Splash Texts is enabled, or if no splash was selected.
+    /// Still available in the title's render hooks if Pre cancels stock drawing.
+    #[access(ClientSetup)]
+    #[default_on_unavailable]
+    fn title_splash(&self) -> Option<String>;
 }

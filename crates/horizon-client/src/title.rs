@@ -113,13 +113,14 @@ fn recover_issues(dir: &Path) -> [Option<crate::save::DatIssue>; 2] {
 /// `LogoRenderer.extractRenderState`: the logo's top 44 of 64 rows, then the
 /// edition banner's top 14 of 16 rows overlapping its bottom by 7.
 fn draw_logo(atlas: &HudAtlas, batch: &mut HudBatch, w: f32) {
-    batch.sprite_region(
+    batch.texture_blit(
         atlas,
         "gui/title/minecraft",
         [(w / 2.0).floor() - 128.0, 30.0, 256.0, 44.0],
-        256.0,
-        64.0,
+        [0.0; 2],
+        [256.0, 64.0],
     );
+    // The edition banner is generated in the atlas for Horizon's branding.
     batch.sprite_region(
         atlas,
         crate::title_edition::SPRITE,
@@ -885,6 +886,27 @@ impl Title {
         }
         self
     }
+    /// The selected splash, if the main title is showing and splash text is enabled.
+    pub fn visible_splash(&self, hide_splash: bool) -> Option<&str> {
+        let splash = self.splash_text(hide_splash)?;
+        if !matches!(self.mode, Mode::Main)
+            || self.preparing
+            || self.rules.borrow().is_some()
+            || self.confirm_experiments.borrow().is_some()
+            || self.experiments.borrow().is_some()
+        {
+            return None;
+        }
+        Some(splash)
+    }
+
+    fn splash_text(&self, hide_splash: bool) -> Option<&str> {
+        if hide_splash {
+            return None;
+        }
+        self.splash.as_deref()
+    }
+
     /// `splashes` is the pool `crate::splashes::pool` built for the current resources.
     pub fn new(saves: PathBuf, resources: &Path, splashes: &str) -> Self {
         use chrono::Datelike;
